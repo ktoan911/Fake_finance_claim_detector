@@ -1,6 +1,5 @@
 # Data files
 data/
-*.txt
 
 # Python
 __pycache__/
