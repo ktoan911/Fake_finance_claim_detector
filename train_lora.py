@@ -7,9 +7,13 @@ Required CSV columns: text/claim, evidence, label
 import os
 import argparse
 from loguru import logger
+from dotenv import load_dotenv
 
 from src.csv_loader import CSVLabeledLoader
 from src.lora_trainer import train_lora_classification, LoRATrainingConfig
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def parse_args():
