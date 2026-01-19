@@ -46,6 +46,7 @@ def main():
     claims = labeled_df["text"].tolist()
     labels = labeled_df["label"].tolist()
     evidences = labeled_df["evidence"].tolist()
+    print(evidences)
 
     output_dir = args.output or os.getenv("LORA_OUTPUT_DIR", "artifacts/lora_llm")
     lora_config = LoRATrainingConfig(

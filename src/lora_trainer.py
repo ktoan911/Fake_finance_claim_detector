@@ -277,7 +277,7 @@ def train_lora_classification(
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=config.batch_size,
+        per_device_eval_batch_size=1,             
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
         logging_steps=10,
@@ -288,13 +288,16 @@ def train_lora_classification(
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
         weight_decay=0.01,
-        # F1 optimization settings
-        eval_strategy="steps",
-        eval_steps=50,
+
+        evaluation_strategy="steps",
+        eval_steps=100,
         load_best_model_at_end=True,
         metric_for_best_model="f1_macro",
         greater_is_better=True,
         save_strategy="steps",
+
+        prediction_loss_only=True,           
+        eval_accumulation_steps=1,             
     )
 
     # Data collator
