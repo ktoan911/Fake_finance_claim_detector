@@ -22,6 +22,8 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     parser.add_argument("--max-length", type=int, default=None, help="Max sequence length")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
+    parser.add_argument("--eval-ratio", type=float, default=None, help="Ratio of data for evaluation (default: 0.1)")
+    parser.add_argument("--early-stopping", type=int, default=None, help="Early stopping patience (default: 3)")
     return parser.parse_args()
 
 
@@ -49,6 +51,8 @@ def main():
         batch_size=args.batch_size or int(os.getenv("LORA_BATCH_SIZE", "1")),
         learning_rate=args.lr or float(os.getenv("LORA_LR", "2e-4")),
         max_length=args.max_length or int(os.getenv("LORA_MAX_LENGTH", "256")),
+        eval_ratio=args.eval_ratio or float(os.getenv("LORA_EVAL_RATIO", "0.1")),
+        early_stopping_patience=args.early_stopping or int(os.getenv("LORA_EARLY_STOPPING", "3")),
     )
 
     lora_path = train_lora_classification(
