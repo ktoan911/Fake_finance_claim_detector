@@ -289,7 +289,7 @@ def train_lora_classification(
         warmup_ratio=0.1,
         weight_decay=0.01,
 
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=100,
         load_best_model_at_end=True,
         metric_for_best_model="f1_macro",
