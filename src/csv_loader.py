@@ -1,0 +1,69 @@
+"""
+CSV Labeled Data Loader
+
+Expected CSV columns (minimum):
+  - text (string) OR claim (string)
+  - evidence (string)
+  - label (int or string: SUPPORTED/REFUTED/NEI/true/false/neutral)
+
+Optional:
+  - timestamp (ISO string or unix seconds)
+"""
+
+from typing import Optional
+import pandas as pd
+from loguru import logger
+from datetime import datetime, timezone
+
+
+class CSVLabeledLoader:
+    def __init__(self, csv_path: str):
+        self.csv_path = csv_path
+
+    def load(self) -> pd.DataFrame:
+        df = pd.read_csv(self.csv_path)
+        if "text" not in df.columns and "claim" in df.columns:
+            df = df.rename(columns={"claim": "text"})
+
+        required_cols = {"text", "evidence", "label"}
+        if not required_cols.issubset(df.columns):
+            missing = ", ".join(sorted(required_cols - set(df.columns)))
+            raise ValueError(
+                f"CSV must contain columns: text (or claim), evidence, label. Missing: {missing}"
+            )
+
+        df = df.copy()
+        df["evidence"] = df["evidence"].fillna("").astype(str)
+        # Allow string/boolean labels
+        if df["label"].dtype == object or df["label"].dtype == bool:
+            label_map = {
+                "SUPPORTED": 0,
+                "REFUTED": 1,
+                "NEI": 2,
+                "TRUE": 0,
+                "FALSE": 1,
+                "NEUTRAL": 2,
+            }
+            df["label"] = df["label"].astype(str).str.upper().map(label_map)
+
+        unmapped = df["label"].isna().sum()
+        if unmapped:
+            logger.warning(f"{unmapped} labels could not be mapped. Defaulting to NEI.")
+            df["label"] = df["label"].fillna(2)
+
+        df["label"] = df["label"].astype(int)
+
+        if "timestamp" in df.columns:
+            df["timestamp"] = df["timestamp"].apply(self._parse_timestamp)
+
+        return df
+
+    def _parse_timestamp(self, value):
+        if pd.isna(value):
+            return datetime.now(timezone.utc)
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            return datetime.fromisoformat(str(value))
+        except Exception:
+            return datetime.now(timezone.utc)

@@ -1,0 +1,38 @@
+# Data files
+data/
+*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Model files (large files)
+*.pt
+*.pth
+*.bin
+*.safetensors
+models/lora_llm/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
