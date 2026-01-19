@@ -295,8 +295,7 @@ def train_lora_classification(
         metric_for_best_model="f1_macro",
         greater_is_better=True,
         save_strategy="steps",        
-        eval_accumulation_steps=1,    
-        predict_with_generate=True         
+        eval_accumulation_steps=1,        
     )
 
     # Data collator
