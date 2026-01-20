@@ -23,7 +23,8 @@ try:
         TrainingArguments,
         Trainer,
         DataCollatorForSeq2Seq,
-        EarlyStoppingCallback
+        EarlyStoppingCallback,
+        BitsAndBytesConfig
     )
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
@@ -42,7 +43,7 @@ class LoRATrainingConfig:
     epochs: int = 3
     learning_rate: float = 2e-4
     max_length: int = 256
-    lora_r: int = 8
+    lora_r: int = 4  # Reduced from 8 to save memory
     lora_alpha: int = 16
     lora_dropout: float = 0.1
     eval_ratio: float = 0.1  # 10% data for evaluation
@@ -220,7 +221,7 @@ def train_lora_classification(
         config: Training configuration
         gradient_accumulation_steps: Number of gradient accumulation steps
     
-    Returns:
+    Returns: 
         Path to saved LoRA model
     """
     if not TORCH_AVAILABLE:
@@ -233,11 +234,18 @@ def train_lora_classification(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 8-bit quantization config to reduce memory
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+    )
+    
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        low_cpu_mem_usage=True
+        quantization_config=quantization_config,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
     )
     # Enable gradient checkpointing to save VRAM
     model.gradient_checkpointing_enable()
