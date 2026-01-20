@@ -174,6 +174,14 @@ def _prepare_classification_dataset(
     
     # Tokenize
     def tokenize_function(examples):
+        # Tokenize prompts and targets separately to get accurate lengths
+        prompts_only = tokenizer(
+            examples["prompt"],
+            truncation=True,
+            max_length=max_length,
+            add_special_tokens=True,
+        )
+        
         # Combine prompt + target for causal LM training
         full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"])]
         
@@ -181,22 +189,33 @@ def _prepare_classification_dataset(
             full_texts,
             truncation=True,
             max_length=max_length,
-            padding="max_length"
+            padding="max_length",
+            add_special_tokens=True,
         )
         
-        # For causal LM, labels = input_ids (shifted internally by model)
-        # Deep copy to avoid modifying input_ids
-        model_inputs["labels"] = [ids.copy() if isinstance(ids, list) else list(ids) for ids in model_inputs["input_ids"]]
+        # Create labels by masking prompt tokens
+        labels = []
+        for i, (input_ids, prompt_ids) in enumerate(zip(model_inputs["input_ids"], prompts_only["input_ids"])):
+            # Find the actual prompt length in the full sequence
+            prompt_len = len(prompt_ids)
+            
+            # Create label sequence: mask prompt, keep target
+            label = [-100] * prompt_len + input_ids[prompt_len:]
+            
+            # Ensure label has same length as input_ids
+            if len(label) > len(input_ids):
+                label = label[:len(input_ids)]
+            elif len(label) < len(input_ids):
+                # Pad with -100 if needed
+                label = label + [-100] * (len(input_ids) - len(label))
+            
+            # Also mask padding tokens
+            attention_mask = model_inputs["attention_mask"][i]
+            label = [l if attention_mask[j] == 1 else -100 for j, l in enumerate(label)]
+            
+            labels.append(label)
         
-        # Mask prompt tokens in labels (only compute loss on target)
-        prompt_lengths = [
-            len(tokenizer(p, truncation=True, max_length=max_length)["input_ids"])
-            for p in examples["prompt"]
-        ]
-        
-        for i, prompt_len in enumerate(prompt_lengths):
-            # -100 = ignore in loss computation
-            model_inputs["labels"][i] = [-100] * prompt_len + model_inputs["labels"][i][prompt_len:]
+        model_inputs["labels"] = labels
         
         return model_inputs
     
@@ -326,6 +345,8 @@ def train_lora_classification(
         greater_is_better=True,
         save_strategy="steps",
         eval_accumulation_steps=8,  # Accumulate more to reduce memory footprint
+        # Gradient clipping to prevent NaN gradients
+        max_grad_norm=1.0,
         # Memory optimization settings
         dataloader_num_workers=0,  # Avoid multiprocessing overhead
         ddp_find_unused_parameters=False,
