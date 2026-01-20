@@ -82,7 +82,7 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         fp16=torch.cuda.is_available(),
         report_to="none",
-        eval_accumulation_steps=50, # Same optimization as training to prevent OOM
+        eval_accumulation_steps=16, # Same optimization as training to prevent OOM
     )
 
     data_collator = DataCollatorForSeq2Seq(

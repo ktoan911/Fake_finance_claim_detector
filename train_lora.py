@@ -20,7 +20,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train LoRA for crypto claim classification")
     parser.add_argument("--csv", type=str, default=None, help="Path to labeled CSV file")
     parser.add_argument("--model", type=str, default=None, help="Model name from HuggingFace")
-    parser.add_argument("--load-model", type=str, default=None, help="Path to existing LoRA checkpoint to resume training")
     parser.add_argument("--output", type=str, default=None, help="Output directory for LoRA model")
     parser.add_argument("--batch-size", type=int, default=None, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
@@ -65,8 +64,7 @@ def main():
         evidences=evidences,
         labels=labels,
         config=lora_config,
-        gradient_accumulation_steps=args.grad_accum or int(os.getenv("LORA_GRAD_ACCUM", "4")),
-        checkpoint_path=args.load_model  # Load from checkpoint if provided
+        gradient_accumulation_steps=args.grad_accum or int(os.getenv("LORA_GRAD_ACCUM", "4"))
     )
 
     logger.info(f"LoRA training complete. Model saved to: {lora_path}")
