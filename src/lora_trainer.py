@@ -266,7 +266,8 @@ def train_lora_classification(
     labels: List[str],
     config: Optional[LoRATrainingConfig] = None,
     gradient_accumulation_steps: int = 4,
-    skip_final_eval: bool = False,  # Skip final eval to save memory
+    skip_final_eval: bool = True,  # Skip final eval by default to prevent OOM
+    checkpoint_path: Optional[str] = None,  # Path to existing checkpoint to resume training
 ) -> str:
     """
     Train LLM with LoRA for classification task.
@@ -277,6 +278,8 @@ def train_lora_classification(
         labels: List of ground truth labels (SUPPORTED/REFUTED/NEI)
         config: Training configuration
         gradient_accumulation_steps: Number of gradient accumulation steps
+        skip_final_eval: Skip final evaluation to save memory
+        checkpoint_path: Path to existing LoRA checkpoint to resume training (optional)
     
     Returns:
         Path to saved LoRA model
@@ -286,33 +289,80 @@ def train_lora_classification(
     
     config = config or LoRATrainingConfig()
     
-    logger.info(f"Loading model: {config.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Check if resuming from checkpoint
+    import os
+    from peft import PeftModel
     
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        low_cpu_mem_usage=True
-    )
-    
-    # Enable gradient checkpointing to save VRAM
-    model.gradient_checkpointing_enable()
-    
-    # Configure LoRA
-    lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        bias="none",
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]  # Attention layers
-    )
-    
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        logger.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
+        
+        # Check if checkpoint has adapter files
+        adapter_config = os.path.join(checkpoint_path, "adapter_config.json")
+        if not os.path.exists(adapter_config):
+            raise ValueError(f"Invalid checkpoint: missing adapter_config.json in {checkpoint_path}")
+        
+        # Load tokenizer from checkpoint (if available) or base model
+        if os.path.exists(os.path.join(checkpoint_path, "tokenizer_config.json")):
+            logger.info(f"Loading tokenizer from checkpoint...")
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, use_fast=False, trust_remote_code=True)
+        else:
+            logger.info(f"Loading tokenizer from base model...")
+            tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False, trust_remote_code=True)
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Load base model
+        logger.info(f"Loading base model: {config.model_name}")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True
+        )
+        
+        # Enable gradient checkpointing
+        base_model.gradient_checkpointing_enable()
+        
+        # Load LoRA adapter from checkpoint
+        logger.info(f"Loading LoRA adapter from checkpoint...")
+        model = PeftModel.from_pretrained(base_model, checkpoint_path, is_trainable=True)
+        model.print_trainable_parameters()
+        
+    else:
+        # Create new model from scratch
+        if checkpoint_path:
+            logger.warning(f"⚠️  Checkpoint path provided but not found: {checkpoint_path}")
+            logger.info("Creating new LoRA model from scratch...")
+        else:
+            logger.info(f"Creating new LoRA model from {config.model_name}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True
+        )
+        
+        # Enable gradient checkpointing to save VRAM
+        model.gradient_checkpointing_enable()
+        
+        # Configure LoRA
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            bias="none",
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]  # Attention layers
+        )
+        
+        model = get_peft_model(model, lora_cfg)
+        model.print_trainable_parameters()
     
     # Prepare dataset
     logger.info(f"Preparing dataset with {len(claims)} samples...")
@@ -413,7 +463,8 @@ def train_lora_classification(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     else:
-        logger.info("⚠️  Skipping final evaluation to save memory")
+        logger.info("⚠️  Skipping final evaluation to prevent CUDA OOM")
+        logger.info("💡 You already have eval metrics from training (check logs above for eval_f1_macro)")
         final_metrics = {}
     
     # Save BEST model (according to F1 metric)
