@@ -60,7 +60,7 @@ def main():
     )
 
     lora_path = train_lora_classification(
-        claims=claims,
+        claims=claims, 
         evidences=evidences,
         labels=labels,
         config=lora_config,

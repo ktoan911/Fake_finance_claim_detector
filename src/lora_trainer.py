@@ -331,8 +331,8 @@ def train_lora_classification(
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
         logging_steps=10,
-        save_steps=200,  # Reduced save frequency to save memory
-        save_total_limit=2,  # Keep only 2 checkpoints to save disk space
+        save_steps=200,  # Save checkpoint every 200 steps
+        save_total_limit=3,  # Keep 3 checkpoints (best + recent ones for resuming)
         fp16=torch.cuda.is_available(),
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -398,9 +398,18 @@ def train_lora_classification(
                 f"Recall={final_metrics.get('eval_recall_macro', 0):.4f}, "
                 f"Accuracy={final_metrics.get('eval_accuracy', 0):.4f}")
     
-    # Save best model
-    trainer.save_model(config.output_dir)
-    tokenizer.save_pretrained(config.output_dir)
+    # Save BEST model (according to F1 metric)
+    best_model_dir = config.output_dir
+    trainer.save_model(best_model_dir)
+    tokenizer.save_pretrained(best_model_dir)
+    logger.info(f"✅ Best model (F1={final_metrics.get('eval_f1_macro', 0):.4f}) saved to {best_model_dir}")
     
-    logger.info(f"LoRA model saved to {config.output_dir}")
+    # Save LATEST checkpoint (epoch cuối - to resume training)
+    import os
+    latest_checkpoint_dir = os.path.join(config.output_dir, "latest_checkpoint")
+    model.save_pretrained(latest_checkpoint_dir)
+    tokenizer.save_pretrained(latest_checkpoint_dir)
+    trainer.state.save_to_json(os.path.join(latest_checkpoint_dir, "trainer_state.json"))
+    logger.info(f"✅ Latest checkpoint (for resuming) saved to {latest_checkpoint_dir}")
+    
     return config.output_dir
