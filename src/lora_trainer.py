@@ -30,6 +30,7 @@ try:
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
     from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+    from .config import PROMPT_TEMPLATE, LABEL_TO_ID, ID_TO_LABEL
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -51,28 +52,12 @@ class LoRATrainingConfig:
     early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
     
     # Prompt template for classification
-    prompt_template: str = """You are a crypto claim verification assistant.
-
-Given the following claim and evidence, classify the claim as:
-- SUPPORTED: The evidence supports the claim
-- REFUTED: The evidence contradicts the claim
-- NEI: Not Enough Information to verify
-
-Claim: {claim}
-
-Evidence: {evidence}
-
-Classification:"""
+    prompt_template: str = PROMPT_TEMPLATE
 
 
 def _build_prompt(claim: str, evidence: str, template: str) -> str:
     """Build prompt from claim and evidence."""
     return template.format(claim=claim, evidence=evidence)
-
-
-# Label mapping for metrics computation
-LABEL_TO_ID = {"SUPPORTED": 0, "REFUTED": 1, "NEI": 2}
-ID_TO_LABEL = {0: "SUPPORTED", 1: "REFUTED", 2: "NEI"}
 
 
 def compute_metrics(eval_pred, tokenizer):
@@ -473,12 +458,7 @@ def train_lora_classification(
     tokenizer.save_pretrained(best_model_dir)
     logger.info(f"✅ Best model (F1={final_metrics.get('eval_f1_macro', 0):.4f}) saved to {best_model_dir}")
     
-    # Save LATEST checkpoint (epoch cuối - to resume training)
-    import os
-    latest_checkpoint_dir = os.path.join(config.output_dir, "latest_checkpoint")
-    model.save_pretrained(latest_checkpoint_dir)
-    tokenizer.save_pretrained(latest_checkpoint_dir)
-    trainer.state.save_to_json(os.path.join(latest_checkpoint_dir, "trainer_state.json"))
-    logger.info(f"✅ Latest checkpoint (for resuming) saved to {latest_checkpoint_dir}")
+    logger.info(f"ℹ️  Intermediate checkpoints (e.g., checkpoint-XXX) are saved in {config.output_dir}")
+    logger.info(f"ℹ️  To resume training, use the latest checkpoint folder found there.")
     
     return config.output_dir

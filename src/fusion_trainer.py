@@ -20,6 +20,7 @@ except ImportError:
 from .retrieval import KnowledgeAugmentedRetriever
 from .fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from .llm_scorer import LLMScorer
+from .config import PROMPT_TEMPLATE, LABEL_LIST
 
 
 @dataclass
@@ -67,7 +68,7 @@ def train_fusion_from_dataframe(
 
     config = config or FusionTrainingConfig(model_name="meta-llama/Llama-3.1-8B")
     if config.label_list is None:
-        config.label_list = ["SUPPORTED", "REFUTED", "NEI"]
+        config.label_list = LABEL_LIST
 
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
@@ -84,11 +85,7 @@ def train_fusion_from_dataframe(
         model_name=config.model_name,
         device=config.device,
         labels=config.label_list,
-        prompt_template=(
-            "You are verifying a crypto/finance claim.\n"
-            "Claim: {text}\n"
-            "Answer with one label: SUPPORTED, REFUTED, or NEI."
-        ),
+        prompt_template=PROMPT_TEMPLATE,
     )
 
     retrieval_encoder = RetrievalFeatureEncoder(
@@ -111,6 +108,7 @@ def train_fusion_from_dataframe(
     optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 
     texts = labeled_df["text"].tolist()
+    evidences = labeled_df["evidence"].tolist()
     labels = labeled_df["label"].astype(int).tolist()
 
     fusion.train()
@@ -122,9 +120,10 @@ def train_fusion_from_dataframe(
 
         for i in range(0, len(texts), config.batch_size):
             batch_texts = texts[i:i + config.batch_size]
+            batch_evidences = evidences[i:i + config.batch_size]
             batch_labels = labels[i:i + config.batch_size]
 
-            lm_logits = llm.score_texts(batch_texts)
+            lm_logits = llm.score_texts(batch_texts, batch_evidences)
 
             batch_features = []
             for t in batch_texts:

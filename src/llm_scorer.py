@@ -5,12 +5,14 @@ Computes p_LM(y|q) for scam vs legitimate using a causal LLM.
 This is used in the fusion layer training and inference.
 """
 
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Optional
 from loguru import logger
+from .config import PROMPT_TEMPLATE, LABEL_LIST
 
 try:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel, PeftConfig
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -41,11 +43,32 @@ class LLMScorer:
         self.device = device
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name)
-        self.model.to(self.device)
+        
+        # Check if model_name is a LoRA adapter
+        import os
+        is_lora = os.path.exists(os.path.join(model_name, "adapter_config.json"))
+        
+        if is_lora:
+            logger.info(f"Detected LoRA adapter at {model_name}. Loading base model + adapter...")
+            config = PeftConfig.from_pretrained(model_name)
+            base_model_path = config.base_model_name_or_path
+            
+            # Load base model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                base_model_path,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map=self.device
+            )
+            # Load adapter
+            self.model = PeftModel.from_pretrained(self.model, model_name)
+        else:
+            logger.info(f"Loading standard model: {model_name}")
+            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+            self.model.to(self.device)
+            
         self.model.eval()
 
-        self.labels = labels or ["scam", "legitimate"]
+        self.labels = labels or LABEL_LIST
         # Label tokens (use leading space for BPE tokenization)
         self.label_tokens = {label: f" {label}" for label in self.labels}
         self.label_ids = {
@@ -53,22 +76,22 @@ class LLMScorer:
             for k, v in self.label_tokens.items()
         }
 
-        self.prompt_template = prompt_template or (
-            "Classify this reddit post as scam or legitimate.\n"
-            "Post: {text}\n"
-            "Answer:"
-        )
+        self.prompt_template = prompt_template or PROMPT_TEMPLATE
 
         logger.info(f"LLMScorer initialized with model: {model_name}")
 
-    def _build_prompt(self, text: str) -> str:
-        return self.prompt_template.format(text=text)
+    def _build_prompt(self, text: str, evidence: str = "") -> str:
+        return self.prompt_template.format(claim=text, evidence=evidence)
 
-    def score_texts(self, texts: List[str]) -> Any:
+    def score_texts(self, texts: List[str], evidences: Optional[List[str]] = None) -> Any:
         """
-        Returns logits for [legit, scam] in shape [batch, 2].
+        Returns logits for labels in shape [batch, num_labels].
         """
-        prompts = [self._build_prompt(t) for t in texts]
+        if evidences is None:
+            # If no evidence provided, pass empty string (though model expects evidence)
+            evidences = [""] * len(texts)
+            
+        prompts = [self._build_prompt(t, e) for t, e in zip(texts, evidences)]
         inputs = self.tokenizer(
             prompts,
             padding=True,
