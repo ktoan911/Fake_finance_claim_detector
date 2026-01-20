@@ -30,10 +30,11 @@ try:
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
     from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
-    from .config import PROMPT_TEMPLATE, LABEL_TO_ID, ID_TO_LABEL
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+
+from .config import PROMPT_TEMPLATE, LABEL_TO_ID, ID_TO_LABEL
 
 
 @dataclass
