@@ -9,11 +9,13 @@ Output: Label (SUPPORTED / REFUTED / NEI)
 
 This is SUPERVISED fine-tuning and requires labeled data.
 
+This version uses padding="max_length" (fixed-length tensors).
 Fixes included:
-- Avoid dataset RAM blow-up: no padding="max_length" in dataset.map (dynamic padding in collator)
-- Correct collator for CausalLM: DataCollatorForLanguageModeling(mlm=False)
+- Correct prompt length masking when padding=max_length (use attention_mask sum)
+- Correct evaluation_strategy arg name
 - Fix eval_f1_macro KeyError: compute_metrics handles logits or token-ids
 - Reduce eval RAM: preprocess_logits_for_metrics stores argmax token ids instead of full logits
+- Collator appropriate for fixed-length CausalLM labels (DataCollatorForSeq2Seq)
 - Training stability: use_cache=False with gradient checkpointing
 """
 
@@ -24,17 +26,19 @@ from loguru import logger
 try:
     import torch
     import numpy as np
+
     from transformers import (
         AutoTokenizer,
         AutoModelForCausalLM,
         TrainingArguments,
         Trainer,
-        DataCollatorForLanguageModeling,
+        DataCollatorForSeq2Seq,
         EarlyStoppingCallback,
     )
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
     from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -43,17 +47,22 @@ except ImportError:
 @dataclass
 class LoRATrainingConfig:
     """Configuration for LoRA supervised fine-tuning."""
+
     model_name: str = "meta-llama/Llama-3.1-8B"
     output_dir: str = "artifacts/lora_llm"
+
     batch_size: int = 1
     epochs: int = 3
     learning_rate: float = 2e-4
+
     max_length: int = 256
+
     lora_r: int = 4
     lora_alpha: int = 16
     lora_dropout: float = 0.1
-    eval_ratio: float = 0.1  # 10% data for evaluation
-    early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
+
+    eval_ratio: float = 0.1
+    early_stopping_patience: int = 3
 
     prompt_template: str = """You are a crypto claim verification assistant.
 
@@ -71,7 +80,6 @@ Classification:"""
 
 
 def _build_prompt(claim: str, evidence: str, template: str) -> str:
-    """Build prompt from claim and evidence."""
     return template.format(claim=claim, evidence=evidence)
 
 
@@ -88,17 +96,16 @@ def _extract_label_from_text(text: str) -> str:
 
 
 def compute_metrics(eval_pred, tokenizer):
+    """Compute F1/Precision/Recall/Accuracy.
+
+    Supports predictions as logits (N, seq, vocab) or token ids (N, seq).
     """
-    Compute F1, Precision, Recall, Accuracy for evaluation.
-    Works whether predictions are logits (N, seq, vocab) or token ids (N, seq).
-    """
+
     predictions, labels = eval_pred
 
-    # predictions may be tuple(logits, ...)
     if isinstance(predictions, (tuple, list)):
         predictions = predictions[0]
 
-    # logits -> token ids
     if hasattr(predictions, "ndim") and predictions.ndim == 3:
         pred_ids = np.argmax(predictions, axis=-1)
     else:
@@ -138,16 +145,17 @@ def _prepare_classification_dataset(
     labels: List[str],
     tokenizer,
     max_length: int,
-    prompt_template: str
+    prompt_template: str,
 ):
-    """
-    Prepare dataset for supervised classification fine-tuning.
+    """Prepare dataset for supervised classification fine-tuning.
+
     Format: prompt + label (causal LM style)
 
-    RAM fix: DO NOT pad to max_length here. Use dynamic padding in collator.
+    This version pads to max_length at dataset time.
     """
-    prompts = []
-    targets = []
+
+    prompts: List[str] = []
+    targets: List[str] = []
 
     def normalize_label(label_value) -> str:
         if isinstance(label_value, (int, float)):
@@ -157,6 +165,7 @@ def _prepare_classification_dataset(
             if idx == 1:
                 return "REFUTED"
             return "NEI"
+
         label_upper = str(label_value).upper().strip()
         if label_upper in ["SUPPORTED", "REFUTED", "NEI"]:
             return label_upper
@@ -167,39 +176,35 @@ def _prepare_classification_dataset(
         return "NEI"
 
     for claim, evidence, label in zip(claims, evidences, labels):
-        prompt = _build_prompt(claim, evidence, prompt_template)
-        target = normalize_label(label)
-        prompts.append(prompt)
-        targets.append(target)
+        prompts.append(_build_prompt(claim, evidence, prompt_template))
+        targets.append(normalize_label(label))
 
     def tokenize_function(examples):
-        full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"])]
+        full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"]) ]
 
         model_inputs = tokenizer(
             full_texts,
             truncation=True,
             max_length=max_length,
-            padding=False,  # IMPORTANT
+            padding="max_length",  # <- requested
         )
 
         # labels = input_ids copy
-        input_ids = model_inputs["input_ids"]
-        model_inputs["labels"] = [ids.copy() for ids in input_ids]
+        model_inputs["labels"] = [ids.copy() for ids in model_inputs["input_ids"]]
 
-        # compute prompt lengths without padding (batch)
+        # prompt lengths: MUST use attention_mask sum when padding=max_length
         prompt_tok = tokenizer(
             examples["prompt"],
             truncation=True,
             max_length=max_length,
-            padding=False,
+            padding="max_length",
         )
-        prompt_lengths = [len(ids) for ids in prompt_tok["input_ids"]]
+        prompt_lengths = [int(sum(mask)) for mask in prompt_tok["attention_mask"]]
 
-        # mask prompt tokens
+        # mask prompt tokens in labels (-100)
         for i, p_len in enumerate(prompt_lengths):
-            L = len(model_inputs["labels"][i])
-            cut = min(p_len, L)
-            model_inputs["labels"][i][:cut] = [-100] * cut
+            p_len = min(p_len, max_length)
+            model_inputs["labels"][i][:p_len] = [-100] * p_len
 
         return model_inputs
 
@@ -215,10 +220,8 @@ def train_lora_classification(
     config: Optional[LoRATrainingConfig] = None,
     gradient_accumulation_steps: int = 4,
 ) -> str:
-    """
-    Train LLM with LoRA for classification task.
-    Returns path to saved LoRA adapter.
-    """
+    """Train LLM with LoRA for classification task."""
+
     if not TORCH_AVAILABLE:
         raise ImportError("torch/transformers/peft/datasets are required for LoRA training.")
 
@@ -237,7 +240,6 @@ def train_lora_classification(
         low_cpu_mem_usage=True,
     )
 
-    # memory helpers
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
@@ -249,32 +251,38 @@ def train_lora_classification(
         bias="none",
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     )
+
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
     logger.info(f"Preparing dataset with {len(claims)} samples...")
     full_dataset = _prepare_classification_dataset(
-        claims, evidences, labels,
-        tokenizer, config.max_length, config.prompt_template
+        claims,
+        evidences,
+        labels,
+        tokenizer,
+        config.max_length,
+        config.prompt_template,
     )
 
-    split_dataset = full_dataset.train_test_split(
-        test_size=config.eval_ratio,
-        seed=42,
-        shuffle=True
-    )
+    split_dataset = full_dataset.train_test_split(test_size=config.eval_ratio, seed=42, shuffle=True)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
 
     logger.info(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
 
-    # Correct collator for CausalLM + dynamic padding
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # With fixed-length examples, this collator is fine and will NOT re-pad labels incorrectly.
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        padding="max_length",
+        label_pad_token_id=-100,
+        return_tensors="pt",
+    )
 
     def compute_metrics_fn(eval_pred):
         return compute_metrics(eval_pred, tokenizer)
 
-    # Reduce eval RAM: store argmax ids instead of full logits
     def preprocess_logits_for_metrics(logits, labels):
         if isinstance(logits, (tuple, list)):
             logits = logits[0]
@@ -298,14 +306,13 @@ def train_lora_classification(
         warmup_ratio=0.1,
         weight_decay=0.01,
 
-        eval_strategy="steps",
+        eval_strategy="steps",  # <- correct arg name
         eval_steps=100,
 
         load_best_model_at_end=True,
-        metric_for_best_model="f1_macro",  # Trainer will look for eval_f1_macro
+        metric_for_best_model="f1_macro",
         greater_is_better=True,
 
-        # prevents eval from holding too much at once
         eval_accumulation_steps=8,
         dataloader_pin_memory=True,
     )
