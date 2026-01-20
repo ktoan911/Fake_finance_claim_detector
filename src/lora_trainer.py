@@ -1,22 +1,12 @@
 """
-LoRA Fine-tuning for LLM (Supervised Classification)
+LoRA Fine-tuning for LLM (Supervised Classification) - padding=max_length
 
-Implements paper's LoRA fine-tuning step.
-LLM learns to predict: pLM(y | query, context)
-
-Input: Claim + Retrieved evidence
-Output: Label (SUPPORTED / REFUTED / NEI)
-
-This is SUPERVISED fine-tuning and requires labeled data.
-
-This version uses padding="max_length" (fixed-length tensors).
-Fixes included:
-- Correct prompt length masking when padding=max_length (use attention_mask sum)
-- Correct evaluation_strategy arg name
-- Fix eval_f1_macro KeyError: compute_metrics handles logits or token-ids
-- Reduce eval RAM: preprocess_logits_for_metrics stores argmax token ids instead of full logits
-- Collator appropriate for fixed-length CausalLM labels (DataCollatorForSeq2Seq)
-- Training stability: use_cache=False with gradient checkpointing
+Stable fixed-length training:
+- tokenize with padding="max_length"
+- prompt masking uses sum(attention_mask) (NOT len(input_ids))
+- use default_data_collator (dataset already fixed-length)
+- compute_metrics works with logits or token ids
+- preprocess_logits_for_metrics reduces eval RAM
 """
 
 from dataclasses import dataclass
@@ -26,19 +16,17 @@ from loguru import logger
 try:
     import torch
     import numpy as np
-
     from transformers import (
         AutoTokenizer,
         AutoModelForCausalLM,
         TrainingArguments,
         Trainer,
-        DataCollatorForSeq2Seq,
         EarlyStoppingCallback,
+        default_data_collator,
     )
     from peft import LoraConfig, get_peft_model, TaskType
     from datasets import Dataset
     from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
-
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -46,21 +34,15 @@ except ImportError:
 
 @dataclass
 class LoRATrainingConfig:
-    """Configuration for LoRA supervised fine-tuning."""
-
     model_name: str = "meta-llama/Llama-3.1-8B"
     output_dir: str = "artifacts/lora_llm"
-
     batch_size: int = 1
     epochs: int = 3
-    learning_rate: float = 2e-4
-
+    learning_rate: float = 5e-5  # ↓ safer than 2e-4 for fp16
     max_length: int = 256
-
     lora_r: int = 4
     lora_alpha: int = 16
     lora_dropout: float = 0.1
-
     eval_ratio: float = 0.1
     early_stopping_patience: int = 3
 
@@ -79,12 +61,11 @@ Evidence:
 Classification:"""
 
 
+LABEL_TO_ID = {"SUPPORTED": 0, "REFUTED": 1, "NEI": 2}
+
+
 def _build_prompt(claim: str, evidence: str, template: str) -> str:
     return template.format(claim=claim, evidence=evidence)
-
-
-LABEL_TO_ID = {"SUPPORTED": 0, "REFUTED": 1, "NEI": 2}
-ID_TO_LABEL = {0: "SUPPORTED", 1: "REFUTED", 2: "NEI"}
 
 
 def _extract_label_from_text(text: str) -> str:
@@ -96,16 +77,12 @@ def _extract_label_from_text(text: str) -> str:
 
 
 def compute_metrics(eval_pred, tokenizer):
-    """Compute F1/Precision/Recall/Accuracy.
-
-    Supports predictions as logits (N, seq, vocab) or token ids (N, seq).
-    """
-
     predictions, labels = eval_pred
 
     if isinstance(predictions, (tuple, list)):
         predictions = predictions[0]
 
+    # logits -> token ids
     if hasattr(predictions, "ndim") and predictions.ndim == 3:
         pred_ids = np.argmax(predictions, axis=-1)
     else:
@@ -132,7 +109,6 @@ def compute_metrics(eval_pred, tokenizer):
 
     return {
         "f1_macro": f1_score(true_labels, pred_labels, average="macro", zero_division=0),
-        "f1_weighted": f1_score(true_labels, pred_labels, average="weighted", zero_division=0),
         "precision_macro": precision_score(true_labels, pred_labels, average="macro", zero_division=0),
         "recall_macro": recall_score(true_labels, pred_labels, average="macro", zero_division=0),
         "accuracy": accuracy_score(true_labels, pred_labels),
@@ -147,61 +123,48 @@ def _prepare_classification_dataset(
     max_length: int,
     prompt_template: str,
 ):
-    """Prepare dataset for supervised classification fine-tuning.
-
-    Format: prompt + label (causal LM style)
-
-    This version pads to max_length at dataset time.
-    """
-
-    prompts: List[str] = []
-    targets: List[str] = []
+    prompts, targets = [], []
 
     def normalize_label(label_value) -> str:
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
-            if idx == 0:
-                return "SUPPORTED"
-            if idx == 1:
-                return "REFUTED"
-            return "NEI"
+            return "SUPPORTED" if idx == 0 else "REFUTED" if idx == 1 else "NEI"
 
-        label_upper = str(label_value).upper().strip()
-        if label_upper in ["SUPPORTED", "REFUTED", "NEI"]:
-            return label_upper
-        if label_upper in ["SCAM", "1"]:
+        s = str(label_value).upper().strip()
+        if s in ["SUPPORTED", "REFUTED", "NEI"]:
+            return s
+        if s in ["SCAM", "1"]:
             return "REFUTED"
-        if label_upper in ["LEGIT", "LEGITIMATE", "0"]:
+        if s in ["LEGIT", "LEGITIMATE", "0"]:
             return "SUPPORTED"
         return "NEI"
 
-    for claim, evidence, label in zip(claims, evidences, labels):
-        prompts.append(_build_prompt(claim, evidence, prompt_template))
-        targets.append(normalize_label(label))
+    for c, e, y in zip(claims, evidences, labels):
+        prompts.append(_build_prompt(c, e, prompt_template))
+        targets.append(normalize_label(y))
 
     def tokenize_function(examples):
-        full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"]) ]
+        full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"])]
 
         model_inputs = tokenizer(
             full_texts,
             truncation=True,
             max_length=max_length,
-            padding="max_length",  # <- requested
+            padding="max_length",
         )
 
         # labels = input_ids copy
         model_inputs["labels"] = [ids.copy() for ids in model_inputs["input_ids"]]
 
-        # prompt lengths: MUST use attention_mask sum when padding=max_length
+        # ✅ prompt length = sum(attention_mask), NOT len(input_ids)
         prompt_tok = tokenizer(
             examples["prompt"],
             truncation=True,
             max_length=max_length,
             padding="max_length",
         )
-        prompt_lengths = [int(sum(mask)) for mask in prompt_tok["attention_mask"]]
+        prompt_lengths = [int(sum(m)) for m in prompt_tok["attention_mask"]]
 
-        # mask prompt tokens in labels (-100)
         for i, p_len in enumerate(prompt_lengths):
             p_len = min(p_len, max_length)
             model_inputs["labels"][i][:p_len] = [-100] * p_len
@@ -209,8 +172,7 @@ def _prepare_classification_dataset(
         return model_inputs
 
     dataset = Dataset.from_dict({"prompt": prompts, "target": targets})
-    tokenized = dataset.map(tokenize_function, batched=True, remove_columns=["prompt", "target"])
-    return tokenized
+    return dataset.map(tokenize_function, batched=True, remove_columns=["prompt", "target"])
 
 
 def train_lora_classification(
@@ -220,8 +182,6 @@ def train_lora_classification(
     config: Optional[LoRATrainingConfig] = None,
     gradient_accumulation_steps: int = 4,
 ) -> str:
-    """Train LLM with LoRA for classification task."""
-
     if not TORCH_AVAILABLE:
         raise ImportError("torch/transformers/peft/datasets are required for LoRA training.")
 
@@ -231,6 +191,7 @@ def train_lora_classification(
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=False, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = config.max_length  # ✅ removes max_length ambiguity
 
     logger.info(f"Loading model: {config.model_name}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -251,18 +212,13 @@ def train_lora_classification(
         bias="none",
         target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     )
-
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
     logger.info(f"Preparing dataset with {len(claims)} samples...")
     full_dataset = _prepare_classification_dataset(
-        claims,
-        evidences,
-        labels,
-        tokenizer,
-        config.max_length,
-        config.prompt_template,
+        claims, evidences, labels,
+        tokenizer, config.max_length, config.prompt_template
     )
 
     split_dataset = full_dataset.train_test_split(test_size=config.eval_ratio, seed=42, shuffle=True)
@@ -270,15 +226,6 @@ def train_lora_classification(
     eval_dataset = split_dataset["test"]
 
     logger.info(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
-
-    # With fixed-length examples, this collator is fine and will NOT re-pad labels incorrectly.
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding="max_length",
-        label_pad_token_id=-100,
-        return_tensors="pt",
-    )
 
     def compute_metrics_fn(eval_pred):
         return compute_metrics(eval_pred, tokenizer)
@@ -306,7 +253,7 @@ def train_lora_classification(
         warmup_ratio=0.1,
         weight_decay=0.01,
 
-        eval_strategy="steps",  # <- correct arg name
+        evaluation_strategy="steps",
         eval_steps=100,
 
         load_best_model_at_end=True,
@@ -315,6 +262,8 @@ def train_lora_classification(
 
         eval_accumulation_steps=8,
         dataloader_pin_memory=True,
+
+        max_grad_norm=1.0,  # helps prevent fp16 NaN
     )
 
     trainer = Trainer(
@@ -322,7 +271,7 @@ def train_lora_classification(
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator,
+        data_collator=default_data_collator,  # ✅ safest for fixed-length
         compute_metrics=compute_metrics_fn,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience)],
@@ -333,12 +282,7 @@ def train_lora_classification(
 
     logger.info("Running final evaluation...")
     final_metrics = trainer.evaluate()
-    logger.info(
-        f"Final metrics: F1={final_metrics.get('eval_f1_macro', 0):.4f}, "
-        f"Precision={final_metrics.get('eval_precision_macro', 0):.4f}, "
-        f"Recall={final_metrics.get('eval_recall_macro', 0):.4f}, "
-        f"Accuracy={final_metrics.get('eval_accuracy', 0):.4f}"
-    )
+    logger.info(final_metrics)
 
     trainer.save_model(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
