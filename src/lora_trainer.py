@@ -250,6 +250,14 @@ class MemoryCleanupCallback(TrainerCallback):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    
+    def on_prediction_step(self, args, state, control, **kwargs):
+        """Clean up after each prediction step during evaluation."""
+        # Clean every 10 predictions to prevent accumulation
+        if state.global_step % 10 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def train_lora_classification(
@@ -258,6 +266,7 @@ def train_lora_classification(
     labels: List[str],
     config: Optional[LoRATrainingConfig] = None,
     gradient_accumulation_steps: int = 4,
+    skip_final_eval: bool = False,  # Skip final eval to save memory
 ) -> str:
     """
     Train LLM with LoRA for classification task.
@@ -344,7 +353,7 @@ def train_lora_classification(
         metric_for_best_model="f1_macro",
         greater_is_better=True,
         save_strategy="steps",
-        eval_accumulation_steps=8,  # Accumulate more to reduce memory footprint
+        eval_accumulation_steps=64,  # Accumulate 50 batches before updating to drastically reduce memory
         # Gradient clipping to prevent NaN gradients
         max_grad_norm=1.0,
         # Memory optimization settings
@@ -390,13 +399,22 @@ def train_lora_classification(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    # Final evaluation
-    logger.info("Running final evaluation...")
-    final_metrics = trainer.evaluate()
-    logger.info(f"Final metrics: F1={final_metrics.get('eval_f1_macro', 0):.4f}, "
-                f"Precision={final_metrics.get('eval_precision_macro', 0):.4f}, "
-                f"Recall={final_metrics.get('eval_recall_macro', 0):.4f}, "
-                f"Accuracy={final_metrics.get('eval_accuracy', 0):.4f}")
+    # Final evaluation (optional - can skip to save memory)
+    if not skip_final_eval:
+        logger.info("Running final evaluation...")
+        final_metrics = trainer.evaluate()
+        logger.info(f"Final metrics: F1={final_metrics.get('eval_f1_macro', 0):.4f}, "
+                    f"Precision={final_metrics.get('eval_precision_macro', 0):.4f}, "
+                    f"Recall={final_metrics.get('eval_recall_macro', 0):.4f}, "
+                    f"Accuracy={final_metrics.get('eval_accuracy', 0):.4f}")
+        
+        # Clear memory after eval
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        logger.info("⚠️  Skipping final evaluation to save memory")
+        final_metrics = {}
     
     # Save BEST model (according to F1 metric)
     best_model_dir = config.output_dir
