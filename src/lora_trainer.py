@@ -26,7 +26,7 @@ try:
         EarlyStoppingCallback,
         BitsAndBytesConfig
     )
-    from peft import LoraConfig, get_peft_model, TaskType
+    from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
     from datasets import Dataset
     from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
     TORCH_AVAILABLE = True
@@ -247,8 +247,9 @@ def train_lora_classification(
         low_cpu_mem_usage=True,
         trust_remote_code=True
     )
-    # Enable gradient checkpointing to save VRAM
-    model.gradient_checkpointing_enable()
+    
+    # Prepare model for k-bit training (required for quantized models)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # Configure LoRA
     lora_cfg = LoraConfig(
