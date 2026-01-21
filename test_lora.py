@@ -26,7 +26,8 @@ def parse_args():
     parser.add_argument("--csv", type=str, required=True, help="Path to labeled CSV file")
     parser.add_argument("--base-model", type=str, default=None, help="Override base model path (optional, auto-detected from adapter)")
     parser.add_argument("--batch-size", type=int, default=1, help="Evaluation batch size")
-    parser.add_argument("--max-length", type=int, default=256, help="Max sequence length")
+    parser.add_argument("--max-length", type=int, default=256, help="Max sequence length (reduced for lower RAM usage)")
+    parser.add_argument("--eval-accumulation", type=int, default=4, help="Number of batches to accumulate before metric computation")
     return parser.parse_args()
 
 def main():
@@ -71,10 +72,21 @@ def main():
         device_map="auto" if torch.cuda.is_available() else None,
         low_cpu_mem_usage=True
     )
+    
+    # Enable gradient checkpointing to save memory
+    if hasattr(base_model, 'gradient_checkpointing_enable'):
+        base_model.gradient_checkpointing_enable()
+        logger.info("Gradient checkpointing enabled")
 
     logger.info(f"Loading LoRA adapter from {args.model_path}...")
     model = PeftModel.from_pretrained(base_model, args.model_path)
     model.eval()
+    
+    # Clear memory
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        logger.info(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     # Prepare Dataset
     logger.info("Preparing dataset...")
@@ -88,9 +100,11 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         fp16=torch.cuda.is_available(),
         report_to="none",
-        eval_accumulation_steps=500, # Very high to prevent RAM overflow
+        eval_accumulation_steps=args.eval_accumulation, # Reduced to save RAM (default: 4)
         dataloader_num_workers=0, # Disable multiprocessing
         include_inputs_for_metrics=False, # Don't store inputs
+        gradient_checkpointing=True, # Enable gradient checkpointing
+        max_grad_norm=1.0, # Prevent gradient explosion
     )
 
     data_collator = DataCollatorForSeq2Seq(
@@ -113,6 +127,11 @@ def main():
     # Evaluate
     logger.info("Running evaluation...")
     metrics = trainer.evaluate()
+    
+    # Clean up memory after evaluation
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Print Results
     logger.info("Evaluation Results:")
