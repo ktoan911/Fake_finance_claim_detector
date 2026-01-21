@@ -387,16 +387,16 @@ def train_lora_classification(
             low_cpu_mem_usage=True
         )
         
+        # CRITICAL: Always resize embeddings on base_model BEFORE loading PeftModel
+        # This must happen before PeftModel wraps the embeddings with ModulesToSaveWrapper
+        base_model.resize_token_embeddings(len(tokenizer))
+        logger.info(f"Resized base model embeddings to {len(tokenizer)}")
+        
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
         
-        # FIXED: Disable cache when using gradient checkpointing
+        # Disable cache when using gradient checkpointing
         base_model.config.use_cache = False
-        
-        # CRITICAL FIX: Resize embeddings if new tokens were added
-        if new_special:
-            base_model.resize_token_embeddings(len(tokenizer))
-            logger.info(f"Resized model embeddings to {len(tokenizer)}")
         
         # Load LoRA adapter from checkpoint
         logger.info(f"Loading LoRA adapter from checkpoint...")
