@@ -91,7 +91,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     
     Args:
         eval_pred: Tuple of (predictions, labels)
-            - predictions: logits with shape [batch, seq_len, vocab_size]
+            - predictions: preprocessed logits with shape [batch, 3] (label logits only)
             - labels: label IDs with shape [batch, seq_len], -100 for masked positions
         tokenizer: Tokenizer to decode labels
         label_token_ids: Dict mapping label names to their token IDs
@@ -101,47 +101,17 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     """
     logits, labels = eval_pred
     
-    # logits shape: [batch, seq_len, vocab_size]
+    # logits shape: [batch, 3] - already preprocessed to label logits only!
     # labels shape: [batch, seq_len]
     
     pred_labels = []
     true_labels = []
     
     for batch_idx in range(len(logits)):
-        batch_logits = logits[batch_idx]  # [seq_len, vocab_size]
-        batch_labels = labels[batch_idx]  # [seq_len]
-        
-        # Find the first non-masked position (where label should be)
-        # This is the first position after prompt with label != -100
-        label_positions = np.where(batch_labels != -100)[0]
-        
-        if len(label_positions) == 0:
-            # No valid label found, skip this sample
-            logger.warning(f"Sample {batch_idx}: No valid label position found, skipping")
-            continue
-        
-        # CRITICAL FIX: CausalLM shift!
-        # logits[t] predicts token at position t+1
-        # So to predict token at label_pos, we need logits at label_pos-1
-        label_pos = label_positions[0]
-        pred_pos = label_pos - 1
-        
-        if pred_pos < 0:
-            # Edge case: label is at position 0, can't predict it
-            logger.warning(f"Sample {batch_idx}: Label at position 0, cannot predict, skipping")
-            continue
-        
-        # Extract logits at the PREDICTION position (one before label)
-        position_logits = batch_logits[pred_pos]  # [vocab_size]
-        
-        # Get logits for each label token
-        label_logits = {}
-        for label_name, token_id in label_token_ids.items():
-            label_logits[label_name] = position_logits[token_id]
+        # Logits are already extracted for label tokens: [3] = [SUPPORTED, REFUTED, NEI]
+        label_logits_array = logits[batch_idx]  # Shape: [3]
         
         # Apply softmax to get probabilities (pLM)
-        label_logits_array = np.array([label_logits[label] for label in LABEL_LIST])
-        # Softmax
         exp_logits = np.exp(label_logits_array - np.max(label_logits_array))  # numerical stability
         probs = exp_logits / np.sum(exp_logits)
         
@@ -151,6 +121,13 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         pred_labels.append(LABEL_TO_ID[pred_label])
         
         # Extract true label from labels
+        batch_labels = labels[batch_idx]
+        label_positions = np.where(batch_labels != -100)[0]
+        
+        if len(label_positions) == 0:
+            logger.warning(f"Sample {batch_idx}: No valid label position found, using NEI as default")
+            true_labels.append(LABEL_TO_ID["NEI"])
+            continue
         valid_label_ids = batch_labels[label_positions]
         true_label_token = valid_label_ids[0]  # First token of label
         
@@ -536,6 +513,54 @@ def train_lora_classification(
     def compute_metrics_fn(eval_pred):
         return compute_metrics(eval_pred, tokenizer, label_token_ids)
     
+    # CRITICAL: Preprocess logits to reduce memory usage during evaluation
+    # Without this, logits accumulation causes CUDA OOM (22GB+ for 337 samples)
+    def preprocess_logits_for_metrics(logits, labels):
+        """
+        Reduce full logits [batch, seq_len, vocab_size] to label logits [batch, 3]
+        BEFORE accumulation to save massive amounts of memory.
+        
+        For each sample, we extract:
+        - Find label position from labels
+        - Apply CausalLM shift (pred_pos = label_pos - 1)
+        - Extract logits for 3 label tokens only
+        
+        Memory savings: ~65MB/sample → ~200 bytes/sample (300x reduction!)
+        """
+        # logits: [batch, seq_len, vocab_size]
+        # labels: [batch, seq_len]
+        batch_size = logits.shape[0]
+        
+        # Pre-allocate for label logits only [batch, 3]
+        label_logits_batch = torch.zeros((batch_size, 3), device=logits.device, dtype=logits.dtype)
+        
+        # Extract token IDs for labels
+        label_token_id_list = [label_token_ids[label] for label in LABEL_LIST]
+        
+        for i in range(batch_size):
+            # Find label position
+            label_positions = (labels[i] != -100).nonzero(as_tuple=True)[0]
+            
+            if len(label_positions) == 0:
+                # No label found, use zeros (will be handled in compute_metrics)
+                continue
+            
+            label_pos = label_positions[0].item()
+            pred_pos = label_pos - 1
+            
+            if pred_pos < 0:
+                # Can't predict position 0
+                continue
+            
+            # Extract logits at prediction position for label tokens only
+            # This is the key: extract ONLY 3 values instead of entire vocab
+            for j, token_id in enumerate(label_token_id_list):
+                label_logits_batch[i, j] = logits[i, pred_pos, token_id]
+        
+        # Return reduced logits [batch, 3] instead of [batch, seq_len, vocab_size]
+        # This is ~300x smaller!
+        return label_logits_batch
+    
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -543,6 +568,7 @@ def train_lora_classification(
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics_fn,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,  # KEY FIX!
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=config.early_stopping_patience),
             MemoryCleanupCallback(),  # Add memory cleanup
