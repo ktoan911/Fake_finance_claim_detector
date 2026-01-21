@@ -10,15 +10,20 @@ ID_TO_LABEL = {0: "SUPPORTED", 1: "REFUTED", 2: "NEI"}
 
 # Prompt template used for both LoRA fine-tuning and Fusion scoring
 # MUST include {claim} and {evidence} placeholders
-PROMPT_TEMPLATE = """You are a crypto claim verification assistant.
+PROMPT_TEMPLATE = """You are an expert fact-checker for financial claims.
 
-Given the following claim and evidence, classify the claim as:
-- SUPPORTED: The evidence supports the claim
-- REFUTED: The evidence contradicts the claim
-- NEI: Not Enough Information to verify
+Classify the claim based on the evidence:
+- SUPPORTED: Evidence confirms the claim
+- REFUTED: Evidence contradicts the claim
+- NEI: Insufficient evidence
+
+Answer using EXACTLY ONE token from the following list:
+<SUPPORTED>
+<REFUTED>
+<NEI>
 
 Claim: {claim}
 
-Evidence: {evidence}
+Evidences: {evidence}
 
-Classification:"""
+Verdict:"""
