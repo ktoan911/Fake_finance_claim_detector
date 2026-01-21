@@ -1,15 +1,3 @@
-"""
-LoRA Fine-tuning for LLM (Supervised Classification)
-
-Implements paper's LoRA fine-tuning step.
-LLM learns to predict: pLM(y | query, context)
-
-Input: Claim + Retrieved evidence
-Output: Label (SUPPORTED / REFUTED / NEI)
-
-This is SUPERVISED fine-tuning and requires labeled data.
-"""
-
 from dataclasses import dataclass
 from typing import List, Optional
 from loguru import logger
@@ -44,9 +32,9 @@ class LoRATrainingConfig:
     output_dir: str = "artifacts/lora_llm"
     batch_size: int = 1
     epochs: int = 3
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4
     max_length: int = 256
-    lora_r: int = 4
+    lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.1
     eval_ratio: float = 0.1  # 10% data for evaluation
@@ -198,10 +186,13 @@ def _prepare_classification_dataset(
         label_upper = str(label_value).upper().strip()
         if label_upper in ["SUPPORTED", "REFUTED", "NEI"]:
             return label_upper
-        if label_upper in ["SCAM", "1"]:
+        # CRITICAL FIX: Add TRUE/FALSE/NEUTRAL mappings (from finfact dataset)
+        if label_upper in ["FALSE", "SCAM", "1"]:
             return "REFUTED"
-        if label_upper in ["LEGIT", "LEGITIMATE", "0"]:
+        if label_upper in ["TRUE", "LEGIT", "LEGITIMATE", "0"]:
             return "SUPPORTED"
+        if label_upper in ["NEUTRAL"]:
+            return "NEI"
         return "NEI"
     
     for claim, evidence, label in zip(claims, evidences, labels):
@@ -446,13 +437,17 @@ def train_lora_classification(
         model.config.use_cache = False
         
         # Configure LoRA
+        # CRITICAL: modules_to_save ensures embed_tokens and lm_head are trained
+        # This is required for new special tokens (<SUPPORTED>, <REFUTED>, <NEI>)
+        # Without this, new token embeddings remain random and model can't learn them!
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]  # Attention layers
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Attention layers
+            modules_to_save=["embed_tokens", "lm_head"]  # Train embeddings for new tokens!
         )
         
         model = get_peft_model(model, lora_cfg)
