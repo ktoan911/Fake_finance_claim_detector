@@ -24,7 +24,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate LoRA model F1 score")
     parser.add_argument("--model-path", type=str, required=True, help="Path to saved LoRA adapter (e.g., artifacts/lora_llm)")
     parser.add_argument("--csv", type=str, required=True, help="Path to labeled CSV file")
-    parser.add_argument("--base-model", type=str, default="instruction-pretrain/finance-Llama3-8B", help="Base model name")
+    parser.add_argument("--base-model", type=str, default=None, help="Override base model path (optional, auto-detected from adapter)")
     parser.add_argument("--batch-size", type=int, default=1, help="Evaluation batch size")
     parser.add_argument("--max-length", type=int, default=256, help="Max sequence length")
     return parser.parse_args()
@@ -46,21 +46,27 @@ def main():
     labels = df["label"].tolist()
     logger.info(f"Loaded {len(claims)} samples.")
 
+    # Auto-detect base model from adapter_config.json
+    logger.info(f"Reading adapter config from {args.model_path}...")
+    adapter_config = PeftConfig.from_pretrained(args.model_path)
+    base_model_path = args.base_model or adapter_config.base_model_name_or_path
+    logger.info(f"Base model: {base_model_path}")
+
     # Load Tokenizer
     logger.info(f"Loading tokenizer from {args.model_path}...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False, trust_remote_code=True)
     except Exception as e:
         logger.warning(f"Could not load tokenizer from checkpoint ({e}), loading from base model...")
-        tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=False, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False, trust_remote_code=True)
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load Model
-    logger.info(f"Loading base model: {args.base_model}")
+    logger.info(f"Loading base model: {base_model_path}")
     base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        base_model_path,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto" if torch.cuda.is_available() else None,
         low_cpu_mem_usage=True
@@ -76,13 +82,15 @@ def main():
         claims, evidences, labels, tokenizer, args.max_length, PROMPT_TEMPLATE
     )
 
-    # Trainer for Evaluation
+    # Trainer for Evaluation - Highly optimized for low memory
     training_args = TrainingArguments(
         output_dir="tmp_eval",
         per_device_eval_batch_size=args.batch_size,
         fp16=torch.cuda.is_available(),
         report_to="none",
-        eval_accumulation_steps=16, # Same optimization as training to prevent OOM
+        eval_accumulation_steps=500, # Very high to prevent RAM overflow
+        dataloader_num_workers=0, # Disable multiprocessing
+        include_inputs_for_metrics=False, # Don't store inputs
     )
 
     data_collator = DataCollatorForSeq2Seq(

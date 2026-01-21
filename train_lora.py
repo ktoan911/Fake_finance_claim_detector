@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
     parser.add_argument("--eval-ratio", type=float, default=None, help="Ratio of data for evaluation (default: 0.1)")
     parser.add_argument("--early-stopping", type=int, default=None, help="Early stopping patience (default: 3)")
+    parser.add_argument(
+        "--load-model",
+        type=str,
+        default=None,
+        help="Path to LoRA checkpoint to resume training (e.g., artifacts/lora_llm/checkpoint-190)"
+    )
     return parser.parse_args()
 
 
@@ -64,7 +70,8 @@ def main():
         evidences=evidences,
         labels=labels,
         config=lora_config,
-        gradient_accumulation_steps=args.grad_accum or int(os.getenv("LORA_GRAD_ACCUM", "4"))
+        gradient_accumulation_steps=args.grad_accum or int(os.getenv("LORA_GRAD_ACCUM", "4")),
+        checkpoint_path=args.load_model  # Load checkpoint to resume training
     )
 
     logger.info(f"LoRA training complete. Model saved to: {lora_path}")
