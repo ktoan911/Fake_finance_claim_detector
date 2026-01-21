@@ -166,6 +166,10 @@ def main():
                 gt_token_ids = labels_batch[i, label_positions[:num_label_tokens]].tolist()
                 gt_text = tokenizer.decode(gt_token_ids, skip_special_tokens=True).strip().upper()
                 
+                # Debug: Log first 10 samples to understand the format
+                if len(all_labels) + skipped_samples < 10:
+                    logger.info(f"Sample {len(all_labels) + skipped_samples}: GT='{gt_text}' | PRED='{pred_text}'")
+                
                 # Map to binary classification (0=SUPPORTED/LEGIT, 1=REFUTED/SCAM)
                 # Prediction
                 if "SUPPORTED" in pred_text or "LEGIT" in pred_text:
