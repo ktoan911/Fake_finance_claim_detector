@@ -34,7 +34,7 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-from .config import PROMPT_TEMPLATE, LABEL_TO_ID, ID_TO_LABEL
+from .config import PROMPT_TEMPLATE, LABEL_TO_ID, ID_TO_LABEL, LABEL_LIST
 
 
 @dataclass
@@ -61,42 +61,117 @@ def _build_prompt(claim: str, evidence: str, template: str) -> str:
     return template.format(claim=claim, evidence=evidence)
 
 
-def compute_metrics(eval_pred, tokenizer):
+def _get_label_token_ids(tokenizer, labels: list = None):
+    """
+    Get token ID for each label using special tokens.
+    Used for logits-based classification (pLM from paper).
+    
+    Special tokens ensure each label is exactly 1 token, making pLM extraction reliable.
+    """
+    if labels is None:
+        labels = LABEL_LIST
+    
+    label_token_ids = {}
+    for label in labels:
+        # Use special token format: <LABEL>
+        special_token = f"<{label}>"
+        tokens = tokenizer(special_token, add_special_tokens=False)["input_ids"]
+        if len(tokens) != 1:
+            raise ValueError(f"Special token '{special_token}' should be exactly 1 token, got {len(tokens)}")
+        label_token_ids[label] = tokens[0]
+    
+    return label_token_ids
+
+
+def compute_metrics(eval_pred, tokenizer, label_token_ids):
     """
     Compute F1, Precision, Recall, Accuracy for evaluation.
-    Optimizes for macro F1 score.
-    Memory-optimized version with explicit cleanup.
-    """
-    predictions, labels = eval_pred
     
-    # For causal LM, we need to decode and extract the predicted label
+    PAPER-ACCURATE: Extracts pLM(y|q) from logits, not from text generation.
+    
+    Args:
+        eval_pred: Tuple of (predictions, labels)
+            - predictions: logits with shape [batch, seq_len, vocab_size]
+            - labels: label IDs with shape [batch, seq_len], -100 for masked positions
+        tokenizer: Tokenizer to decode labels
+        label_token_ids: Dict mapping label names to their token IDs
+    
+    Returns:
+        Dict of metrics (F1, precision, recall, accuracy)
+    """
+    logits, labels = eval_pred
+    
+    # logits shape: [batch, seq_len, vocab_size]
+    # labels shape: [batch, seq_len]
+    
     pred_labels = []
     true_labels = []
     
-    for pred_ids, label_ids in zip(predictions, labels):
-        # Find the predicted token (last non-padding token)
-        pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+    for batch_idx in range(len(logits)):
+        batch_logits = logits[batch_idx]  # [seq_len, vocab_size]
+        batch_labels = labels[batch_idx]  # [seq_len]
         
-        # Extract predicted label from generated text
-        pred_label = "NEI"  # default
-        for label in ["SUPPORTED", "REFUTED", "NEI"]:
-            if label in pred_text.upper():
-                pred_label = label
-                break
+        # Find the first non-masked position (where label should be)
+        # This is the first position after prompt with label != -100
+        label_positions = np.where(batch_labels != -100)[0]
+        
+        if len(label_positions) == 0:
+            # No valid label found, skip this sample
+            logger.warning(f"Sample {batch_idx}: No valid label position found, skipping")
+            continue
+        
+        # CRITICAL FIX: CausalLM shift!
+        # logits[t] predicts token at position t+1
+        # So to predict token at label_pos, we need logits at label_pos-1
+        label_pos = label_positions[0]
+        pred_pos = label_pos - 1
+        
+        if pred_pos < 0:
+            # Edge case: label is at position 0, can't predict it
+            logger.warning(f"Sample {batch_idx}: Label at position 0, cannot predict, skipping")
+            continue
+        
+        # Extract logits at the PREDICTION position (one before label)
+        position_logits = batch_logits[pred_pos]  # [vocab_size]
+        
+        # Get logits for each label token
+        label_logits = {}
+        for label_name, token_id in label_token_ids.items():
+            label_logits[label_name] = position_logits[token_id]
+        
+        # Apply softmax to get probabilities (pLM)
+        label_logits_array = np.array([label_logits[label] for label in LABEL_LIST])
+        # Softmax
+        exp_logits = np.exp(label_logits_array - np.max(label_logits_array))  # numerical stability
+        probs = exp_logits / np.sum(exp_logits)
+        
+        # Choose label with highest probability
+        pred_label_idx = np.argmax(probs)
+        pred_label = LABEL_LIST[pred_label_idx]
         pred_labels.append(LABEL_TO_ID[pred_label])
         
-        # Extract true label from label_ids (non -100 tokens)
-        valid_label_ids = [l for l in label_ids if l != -100]
-        if valid_label_ids:
-            true_text = tokenizer.decode(valid_label_ids, skip_special_tokens=True)
-            true_label = "NEI"
-            for label in ["SUPPORTED", "REFUTED", "NEI"]:
-                if label in true_text.upper():
-                    true_label = label
-                    break
-            true_labels.append(LABEL_TO_ID[true_label])
-        else:
-            true_labels.append(LABEL_TO_ID["NEI"])
+        # Extract true label from labels
+        valid_label_ids = batch_labels[label_positions]
+        true_label_token = valid_label_ids[0]  # First token of label
+        
+        # Map back to label name
+        true_label = "NEI"  # default
+        for label_name, token_id in label_token_ids.items():
+            if token_id == true_label_token:
+                true_label = label_name
+                break
+        
+        true_labels.append(LABEL_TO_ID[true_label])
+    
+    if len(pred_labels) == 0:
+        logger.error("No valid predictions found!")
+        return {
+            "f1_macro": 0.0,
+            "f1_weighted": 0.0,
+            "precision_macro": 0.0,
+            "recall_macro": 0.0,
+            "accuracy": 0.0,
+        }
     
     pred_labels = np.array(pred_labels)
     true_labels = np.array(true_labels)
@@ -111,7 +186,7 @@ def compute_metrics(eval_pred, tokenizer):
     }
     
     # Clean up memory
-    del pred_labels, true_labels, predictions, labels
+    del pred_labels, true_labels, logits, labels
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -160,48 +235,76 @@ def _prepare_classification_dataset(
     
     # Tokenize
     def tokenize_function(examples):
-        # Tokenize prompts and targets separately to get accurate lengths
-        prompts_only = tokenizer(
-            examples["prompt"],
-            truncation=True,
-            max_length=max_length,
-            add_special_tokens=True,
-        )
+        """
+        FIXED: Build input_ids by direct concatenation to avoid alignment bugs.
+        This ensures labels mask exactly the prompt tokens.
+        """
+        model_inputs = {
+            "input_ids": [],
+            "attention_mask": [],
+            "labels": []
+        }
         
-        # Combine prompt + target for causal LM training
-        full_texts = [p + " " + t for p, t in zip(examples["prompt"], examples["target"])]
-        
-        model_inputs = tokenizer(
-            full_texts,
-            truncation=True,
-            max_length=max_length,
-            padding="max_length",
-            add_special_tokens=True,
-        )
-        
-        # Create labels by masking prompt tokens
-        labels = []
-        for i, (input_ids, prompt_ids) in enumerate(zip(model_inputs["input_ids"], prompts_only["input_ids"])):
-            # Find the actual prompt length in the full sequence
+        for prompt, target in zip(examples["prompt"], examples["target"]):
+            # Tokenize prompt with special tokens (BOS)
+            prompt_ids = tokenizer(
+                prompt,
+                add_special_tokens=True,
+                truncation=False,  # We'll handle truncation manually
+            )["input_ids"]
+            
+            # Tokenize target using special token format (NO space prefix)
+            # CRITICAL: Must match _get_label_token_ids() format exactly
+            # "<LABEL>" not " <LABEL>" to ensure single token
+            target_text = f"<{target}>"
+            target_ids = tokenizer(
+                target_text,
+                add_special_tokens=False,
+            )["input_ids"]
+            
+            # Add EOS token at the end
+            if tokenizer.eos_token_id is not None:
+                target_ids = target_ids + [tokenizer.eos_token_id]
+            
+            # Concatenate: [BOS, prompt_tokens, target_tokens, EOS]
+            full_input_ids = prompt_ids + target_ids
+            
+            # Truncate if too long (truncate prompt, keep target intact)
+            if len(full_input_ids) > max_length:
+                # Calculate how much to keep from prompt
+                target_len = len(target_ids)
+                max_prompt_len = max_length - target_len
+                if max_prompt_len < 1:
+                    # Edge case: target itself is too long, keep at least BOS
+                    max_prompt_len = 1
+                    target_ids = target_ids[:max_length - 1]
+                
+                prompt_ids = prompt_ids[:max_prompt_len]
+                full_input_ids = prompt_ids + target_ids
+            
+            # Create labels: mask prompt (all -100), keep ONLY label token, mask EOS
+            # This is more paper-accurate: only train on the label token itself
             prompt_len = len(prompt_ids)
             
-            # Create label sequence: mask prompt, keep target
-            label = [-100] * prompt_len + input_ids[prompt_len:]
+            # Count label tokens (excluding EOS)
+            label_token_count = len(target_ids) - (1 if tokenizer.eos_token_id is not None else 0)
             
-            # Ensure label has same length as input_ids
-            if len(label) > len(input_ids):
-                label = label[:len(input_ids)]
-            elif len(label) < len(input_ids):
-                # Pad with -100 if needed
-                label = label + [-100] * (len(input_ids) - len(label))
+            # Labels: [-100 for prompt] + [label_tokens] + [-100 for EOS]
+            labels = [-100] * prompt_len + target_ids[:label_token_count] + [-100] * (len(target_ids) - label_token_count)
             
-            # Also mask padding tokens
-            attention_mask = model_inputs["attention_mask"][i]
-            label = [l if attention_mask[j] == 1 else -100 for j, l in enumerate(label)]
+            # Pad to max_length
+            padding_length = max_length - len(full_input_ids)
+            if padding_length > 0:
+                pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                full_input_ids = full_input_ids + [pad_token_id] * padding_length
+                labels = labels + [-100] * padding_length
+                attention_mask = [1] * (max_length - padding_length) + [0] * padding_length
+            else:
+                attention_mask = [1] * max_length
             
-            labels.append(label)
-        
-        model_inputs["labels"] = labels
+            model_inputs["input_ids"].append(full_input_ids)
+            model_inputs["attention_mask"].append(attention_mask)
+            model_inputs["labels"].append(labels)
         
         return model_inputs
     
@@ -298,6 +401,15 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
+        # Add special tokens for labels if not already present
+        special_tokens = {"additional_special_tokens": ["<SUPPORTED>", "<REFUTED>", "<NEI>"]}
+        existing_special = set(tokenizer.additional_special_tokens or [])
+        new_special = [t for t in special_tokens["additional_special_tokens"] if t not in existing_special]
+        
+        if new_special:
+            tokenizer.add_special_tokens({"additional_special_tokens": new_special})
+            logger.info(f"Added {len(new_special)} special tokens for labels to checkpoint tokenizer")
+        
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
         base_model = AutoModelForCausalLM.from_pretrained(
@@ -309,6 +421,14 @@ def train_lora_classification(
         
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
+        
+        # FIXED: Disable cache when using gradient checkpointing
+        base_model.config.use_cache = False
+        
+        # CRITICAL FIX: Resize embeddings if new tokens were added
+        if new_special:
+            base_model.resize_token_embeddings(len(tokenizer))
+            logger.info(f"Resized model embeddings to {len(tokenizer)}")
         
         # Load LoRA adapter from checkpoint
         logger.info(f"Loading LoRA adapter from checkpoint...")
@@ -327,6 +447,11 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
+        # Add special tokens for labels (single-token classification)
+        special_tokens = {"additional_special_tokens": ["<SUPPORTED>", "<REFUTED>", "<NEI>"]}
+        num_added = tokenizer.add_special_tokens(special_tokens)
+        logger.info(f"Added {num_added} special tokens for labels")
+        
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -334,8 +459,14 @@ def train_lora_classification(
             low_cpu_mem_usage=True
         )
         
+        # Resize token embeddings to accommodate new special tokens
+        model.resize_token_embeddings(len(tokenizer))
+        
         # Enable gradient checkpointing to save VRAM
         model.gradient_checkpointing_enable()
+        
+        # FIXED: Disable cache when using gradient checkpointing
+        model.config.use_cache = False
         
         # Configure LoRA
         lora_cfg = LoraConfig(
@@ -384,29 +515,26 @@ def train_lora_classification(
         warmup_ratio=0.1,
         weight_decay=0.01,
         eval_strategy="steps",
-        eval_steps=200,  # Evaluate less frequently to reduce memory pressure
+        eval_steps=200,  
         load_best_model_at_end=True,
         metric_for_best_model="f1_macro",
         greater_is_better=True,
         save_strategy="steps",
-        eval_accumulation_steps=64,  # Accumulate 50 batches before updating to drastically reduce memory
-        # Gradient clipping to prevent NaN gradients
+        eval_accumulation_steps=64, 
         max_grad_norm=1.0,
-        # Memory optimization settings
-        dataloader_num_workers=0,  # Avoid multiprocessing overhead
+        dataloader_num_workers=0, 
         ddp_find_unused_parameters=False,
     )
     
-    # Data collator
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True
-    )
+    from transformers import default_data_collator
+    data_collator = default_data_collator
     
-    # Create compute_metrics function with tokenizer closure
+    # Get label token IDs for logits-based classification
+    label_token_ids = _get_label_token_ids(tokenizer)
+    
+    # Create compute_metrics function with tokenizer and label_token_ids closure
     def compute_metrics_fn(eval_pred):
-        return compute_metrics(eval_pred, tokenizer)
+        return compute_metrics(eval_pred, tokenizer, label_token_ids)
     
     trainer = Trainer(
         model=model,
