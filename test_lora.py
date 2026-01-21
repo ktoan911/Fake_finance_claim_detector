@@ -11,13 +11,14 @@ from loguru import logger
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    Trainer,
     DataCollatorForSeq2Seq,
-    TrainingArguments
 )
 from peft import PeftModel, PeftConfig
+from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score
+from tqdm import tqdm
 from src.csv_loader import CSVLabeledLoader
-from src.lora_trainer import _prepare_classification_dataset, compute_metrics
+from src.lora_trainer import _prepare_classification_dataset
 from src.config import PROMPT_TEMPLATE
 
 def parse_args():
@@ -94,39 +95,99 @@ def main():
         claims, evidences, labels, tokenizer, args.max_length, PROMPT_TEMPLATE
     )
 
-    # Trainer for Evaluation - Highly optimized for low memory
-    training_args = TrainingArguments(
-        output_dir="tmp_eval",
-        per_device_eval_batch_size=args.batch_size,
-        fp16=torch.cuda.is_available(),
-        report_to="none",
-        eval_accumulation_steps=args.eval_accumulation, # Reduced to save RAM (default: 4)
-        dataloader_num_workers=0, # Disable multiprocessing
-        include_inputs_for_metrics=False, # Don't store inputs
-        gradient_checkpointing=True, # Enable gradient checkpointing
-        max_grad_norm=1.0, # Prevent gradient explosion
-    )
-
+    # Prepare DataLoader for manual evaluation
+    logger.info("Preparing dataloader...")
     data_collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
         model=model,
         padding=True
     )
-
-    def compute_metrics_fn(eval_pred):
-        return compute_metrics(eval_pred, tokenizer)
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        eval_dataset=dataset,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics_fn,
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=data_collator,
+        num_workers=0,
+        pin_memory=False  # Disable pin_memory to save RAM
     )
-
-    # Evaluate
+    
+    # Custom evaluation loop - Memory efficient
     logger.info("Running evaluation...")
-    metrics = trainer.evaluate()
+    all_predictions = []
+    all_labels = []
+    total_loss = 0.0
+    num_batches = 0
+    
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            # Move batch to device
+            input_ids = batch["input_ids"].to(model.device)
+            attention_mask = batch["attention_mask"].to(model.device)
+            labels_batch = batch["labels"].to(model.device)
+            
+            # Forward pass
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels_batch
+            )
+            
+            # Get loss
+            if outputs.loss is not None:
+                total_loss += outputs.loss.item()
+                num_batches += 1
+            
+            # Get predictions - extract the generated label token
+            logits = outputs.logits
+            
+            # Find the position where we predict the label (after the prompt)
+            # We look at the last non-padding position
+            for i in range(len(labels_batch)):
+                label_positions = (labels_batch[i] != -100).nonzero(as_tuple=True)[0]
+                if len(label_positions) > 0:
+                    # Get the first label position (where we predict "true" or "false")
+                    label_pos = label_positions[0].item()
+                    pred_logits = logits[i, label_pos - 1, :]  # Get logits before the label
+                    
+                    # Get the tokens for "true" and "false"
+                    true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
+                    false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
+                    
+                    # Compare logits for true vs false
+                    true_score = pred_logits[true_token_id].item()
+                    false_score = pred_logits[false_token_id].item()
+                    
+                    # Predict based on higher score
+                    pred_label = 1 if true_score > false_score else 0
+                    
+                    # Get ground truth label
+                    label_token_id = labels_batch[i, label_pos].item()
+                    gt_label = 1 if label_token_id == true_token_id else 0
+                    
+                    # Store predictions and labels (move to CPU immediately)
+                    all_predictions.append(pred_label)
+                    all_labels.append(gt_label)
+            
+            # Clear GPU cache after each batch
+            if torch.cuda.is_available() and num_batches % 10 == 0:
+                torch.cuda.empty_cache()
+    
+    # Compute metrics using sklearn
+    logger.info("Computing metrics...")
+    f1_macro = f1_score(all_labels, all_predictions, average='macro', zero_division=0)
+    precision_macro = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
+    recall_macro = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
+    accuracy = accuracy_score(all_labels, all_predictions)
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    
+    metrics = {
+        'f1_macro': f1_macro,
+        'precision_macro': precision_macro,
+        'recall_macro': recall_macro,
+        'accuracy': accuracy,
+        'loss': avg_loss
+    }
     
     # Clean up memory after evaluation
     gc.collect()
@@ -139,11 +200,12 @@ def main():
     print(f"Model:         {args.model_path}")
     print(f"Data:          {args.csv}")
     print("-" * 30)
-    print(f"F1 Macro:      {metrics.get('eval_f1_macro', 0):.4f}")
-    print(f"Precision:     {metrics.get('eval_precision_macro', 0):.4f}")
-    print(f"Recall:        {metrics.get('eval_recall_macro', 0):.4f}")
-    print(f"Accuracy:      {metrics.get('eval_accuracy', 0):.4f}")
-    print(f"Loss:          {metrics.get('eval_loss', 0):.4f}")
+    print(f"F1 Macro:      {metrics['f1_macro']:.4f}")
+    print(f"Precision:     {metrics['precision_macro']:.4f}")
+    print(f"Recall:        {metrics['recall_macro']:.4f}")
+    print(f"Accuracy:      {metrics['accuracy']:.4f}")
+    print(f"Loss:          {metrics['loss']:.4f}")
+    print(f"Samples:       {len(all_labels)}")
     print("=" * 30 + "\n")
 
 if __name__ == "__main__":
