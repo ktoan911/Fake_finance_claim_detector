@@ -387,16 +387,25 @@ def train_lora_classification(
             low_cpu_mem_usage=True
         )
         
+        # Handle tie_word_embeddings for models like Mistral/LLaMA
+        if hasattr(base_model.config, 'tie_word_embeddings') and base_model.config.tie_word_embeddings:
+            logger.info("Model has tie_word_embeddings=True, handling for resize...")
+            base_model.config.tie_word_embeddings = False
+        
+        # CRITICAL: Resize embeddings BEFORE enabling gradient checkpointing or loading LoRA
+        # Must happen before PEFT wraps the embeddings!
+        current_embed_size = base_model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) > current_embed_size:
+            logger.info(f"Resizing embeddings: {current_embed_size} → {len(tokenizer)}")
+            base_model.resize_token_embeddings(len(tokenizer))
+        elif len(tokenizer) != current_embed_size:
+            logger.warning(f"Tokenizer size ({len(tokenizer)}) != embedding size ({current_embed_size})")
+        
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
         
-        # FIXED: Disable cache when using gradient checkpointing
+        # Disable cache when using gradient checkpointing
         base_model.config.use_cache = False
-        
-        # CRITICAL FIX: Resize embeddings if new tokens were added
-        if new_special:
-            base_model.resize_token_embeddings(len(tokenizer))
-            logger.info(f"Resized model embeddings to {len(tokenizer)}")
         
         # Load LoRA adapter from checkpoint
         logger.info(f"Loading LoRA adapter from checkpoint...")
@@ -427,8 +436,15 @@ def train_lora_classification(
             low_cpu_mem_usage=True
         )
         
+        # Handle tie_word_embeddings for models like Mistral/LLaMA
+        # Must untie before resize, then resize will handle correctly
+        if hasattr(model.config, 'tie_word_embeddings') and model.config.tie_word_embeddings:
+            logger.info("Model has tie_word_embeddings=True, handling for resize...")
+            model.config.tie_word_embeddings = False  # Temporarily untie
+        
         # Resize token embeddings to accommodate new special tokens
         model.resize_token_embeddings(len(tokenizer))
+        logger.info(f"Resized embeddings to {len(tokenizer)}")
         
         # Enable gradient checkpointing to save VRAM
         model.gradient_checkpointing_enable()
