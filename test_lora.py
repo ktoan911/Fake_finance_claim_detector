@@ -115,78 +115,82 @@ def main():
     logger.info("Running evaluation...")
     all_predictions = []
     all_labels = []
-    total_loss = 0.0
-    num_batches = 0
+    skipped_samples = 0
+    
+    # Pre-compute token IDs for true/false
+    true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
+    false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
     
     model.eval()
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
             # Move batch to device
             input_ids = batch["input_ids"].to(model.device)
             attention_mask = batch["attention_mask"].to(model.device)
             labels_batch = batch["labels"].to(model.device)
             
-            # Forward pass
+            # Forward pass to get logits
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                labels=labels_batch
             )
             
-            # Get loss
-            if outputs.loss is not None:
-                total_loss += outputs.loss.item()
-                num_batches += 1
-            
-            # Get predictions - extract the generated label token
             logits = outputs.logits
             
-            # Find the position where we predict the label (after the prompt)
-            # We look at the last non-padding position
+            # Process each sample in the batch
             for i in range(len(labels_batch)):
+                # Find where the label should be (first non -100 token in labels)
                 label_positions = (labels_batch[i] != -100).nonzero(as_tuple=True)[0]
-                if len(label_positions) > 0:
-                    # Get the first label position (where we predict "true" or "false")
-                    label_pos = label_positions[0].item()
-                    pred_logits = logits[i, label_pos - 1, :]  # Get logits before the label
-                    
-                    # Get the tokens for "true" and "false"
-                    true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
-                    false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
-                    
-                    # Compare logits for true vs false
-                    true_score = pred_logits[true_token_id].item()
-                    false_score = pred_logits[false_token_id].item()
-                    
-                    # Predict based on higher score
-                    pred_label = 1 if true_score > false_score else 0
-                    
-                    # Get ground truth label
-                    label_token_id = labels_batch[i, label_pos].item()
-                    gt_label = 1 if label_token_id == true_token_id else 0
-                    
-                    # Store predictions and labels (move to CPU immediately)
-                    all_predictions.append(pred_label)
-                    all_labels.append(gt_label)
+                
+                if len(label_positions) == 0:
+                    skipped_samples += 1
+                    logger.warning(f"Batch {batch_idx}, sample {i}: No label position found, skipping")
+                    continue
+                
+                # Get the first label position (where we predict "true" or "false")
+                label_pos = label_positions[0].item()
+                
+                # Get logits at the position BEFORE the label token
+                # (this is where the model predicts what the next token should be)
+                pred_logits = logits[i, label_pos - 1, :]
+                
+                # Compare scores for "true" vs "false" tokens
+                true_score = pred_logits[true_token_id].item()
+                false_score = pred_logits[false_token_id].item()
+                
+                # Predict based on higher score
+                pred_label = 1 if true_score > false_score else 0
+                
+                # Get ground truth label from the actual token at label_pos
+                label_token_id = labels_batch[i, label_pos].item()
+                gt_label = 1 if label_token_id == true_token_id else 0
+                
+                # Store predictions and labels
+                all_predictions.append(pred_label)
+                all_labels.append(gt_label)
             
-            # Clear GPU cache after each batch
-            if torch.cuda.is_available() and num_batches % 10 == 0:
+            # Clear GPU cache periodically
+            if torch.cuda.is_available() and batch_idx % 20 == 0:
                 torch.cuda.empty_cache()
     
     # Compute metrics using sklearn
     logger.info("Computing metrics...")
+    logger.info(f"Processed {len(all_labels)} samples, skipped {skipped_samples} samples")
+    
+    if len(all_labels) == 0:
+        logger.error("No samples were successfully processed!")
+        return
+    
     f1_macro = f1_score(all_labels, all_predictions, average='macro', zero_division=0)
     precision_macro = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
     recall_macro = recall_score(all_labels, all_predictions, average='macro', zero_division=0)
     accuracy = accuracy_score(all_labels, all_predictions)
-    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     
     metrics = {
         'f1_macro': f1_macro,
         'precision_macro': precision_macro,
         'recall_macro': recall_macro,
         'accuracy': accuracy,
-        'loss': avg_loss
     }
     
     # Clean up memory after evaluation
@@ -204,8 +208,10 @@ def main():
     print(f"Precision:     {metrics['precision_macro']:.4f}")
     print(f"Recall:        {metrics['recall_macro']:.4f}")
     print(f"Accuracy:      {metrics['accuracy']:.4f}")
-    print(f"Loss:          {metrics['loss']:.4f}")
-    print(f"Samples:       {len(all_labels)}")
+    print("-" * 30)
+    print(f"Processed:     {len(all_labels)}")
+    print(f"Skipped:       {skipped_samples}")
+    print(f"Total:         {len(all_labels) + skipped_samples}")
     print("=" * 30 + "\n")
 
 if __name__ == "__main__":
