@@ -111,15 +111,13 @@ def main():
         pin_memory=False  # Disable pin_memory to save RAM
     )
     
-    # Custom evaluation loop - Memory efficient
     logger.info("Running evaluation...")
     all_predictions = []
     all_labels = []
     skipped_samples = 0
     
-    # Pre-compute token IDs for true/false
-    true_token_id = tokenizer.encode("true", add_special_tokens=False)[0]
-    false_token_id = tokenizer.encode("false", add_special_tokens=False)[0]
+    # Label mapping to match training (SUPPORTED=0, REFUTED=1, NEI=2)
+    # But for binary classification in test set: SUPPORTED/LEGIT=0, REFUTED/SCAM=1
     
     model.eval()
     with torch.no_grad():
@@ -139,7 +137,7 @@ def main():
             
             # Process each sample in the batch
             for i in range(len(labels_batch)):
-                # Find where the label should be (first non -100 token in labels)
+                # Find where the label tokens are (non -100 positions)
                 label_positions = (labels_batch[i] != -100).nonzero(as_tuple=True)[0]
                 
                 if len(label_positions) == 0:
@@ -147,23 +145,47 @@ def main():
                     logger.warning(f"Batch {batch_idx}, sample {i}: No label position found, skipping")
                     continue
                 
-                # Get the first label position (where we predict "true" or "false")
-                label_pos = label_positions[0].item()
+                # Get the first label position (where model should predict the label)
+                label_start_pos = label_positions[0].item()
                 
-                # Get logits at the position BEFORE the label token
-                # (this is where the model predicts what the next token should be)
-                pred_logits = logits[i, label_pos - 1, :]
+                # Get predicted tokens by taking argmax over vocabulary
+                # We need to look at a few tokens to capture full label (e.g., "SUPPORTED", "REFUTED")
+                num_label_tokens = min(5, len(label_positions))  # Labels are typically 1-3 tokens
+                pred_token_ids = []
                 
-                # Compare scores for "true" vs "false" tokens
-                true_score = pred_logits[true_token_id].item()
-                false_score = pred_logits[false_token_id].item()
+                for offset in range(num_label_tokens):
+                    pos = label_start_pos + offset - 1  # -1 because we predict next token
+                    if pos >= 0 and pos < logits.shape[1]:
+                        pred_token_id = torch.argmax(logits[i, pos, :]).item()
+                        pred_token_ids.append(pred_token_id)
                 
-                # Predict based on higher score
-                pred_label = 1 if true_score > false_score else 0
+                # Decode predicted tokens to text
+                pred_text = tokenizer.decode(pred_token_ids, skip_special_tokens=True).strip().upper()
                 
-                # Get ground truth label from the actual token at label_pos
-                label_token_id = labels_batch[i, label_pos].item()
-                gt_label = 1 if label_token_id == true_token_id else 0
+                # Get ground truth tokens from label_positions
+                gt_token_ids = labels_batch[i, label_positions[:num_label_tokens]].tolist()
+                gt_text = tokenizer.decode(gt_token_ids, skip_special_tokens=True).strip().upper()
+                
+                # Map to binary classification (0=SUPPORTED/LEGIT, 1=REFUTED/SCAM)
+                # Prediction
+                if "SUPPORTED" in pred_text or "LEGIT" in pred_text:
+                    pred_label = 0
+                elif "REFUTED" in pred_text or "SCAM" in pred_text:
+                    pred_label = 1
+                else:
+                    # NEI or unclear - default to 0
+                    pred_label = 0
+                
+                # Ground truth
+                if "SUPPORTED" in gt_text or "LEGIT" in gt_text:
+                    gt_label = 0
+                elif "REFUTED" in gt_text or "SCAM" in gt_text:
+                    gt_label = 1
+                else:
+                    # NEI or unclear - skip this sample
+                    skipped_samples += 1
+                    logger.warning(f"Batch {batch_idx}, sample {i}: Unclear GT label '{gt_text}', skipping")
+                    continue
                 
                 # Store predictions and labels
                 all_predictions.append(pred_label)
