@@ -32,7 +32,7 @@ class LoRATrainingConfig:
     output_dir: str = "artifacts/lora_llm"
     batch_size: int = 1
     epochs: int = 3
-    learning_rate: float = 1e-4
+    learning_rate: float = 2e-4
     max_length: int = 256
     lora_r: int = 8
     lora_alpha: int = 16
@@ -387,16 +387,16 @@ def train_lora_classification(
             low_cpu_mem_usage=True
         )
         
-        # CRITICAL: Always resize embeddings on base_model BEFORE loading PeftModel
-        # This must happen before PeftModel wraps the embeddings with ModulesToSaveWrapper
-        base_model.resize_token_embeddings(len(tokenizer))
-        logger.info(f"Resized base model embeddings to {len(tokenizer)}")
-        
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
         
-        # Disable cache when using gradient checkpointing
+        # FIXED: Disable cache when using gradient checkpointing
         base_model.config.use_cache = False
+        
+        # CRITICAL FIX: Resize embeddings if new tokens were added
+        if new_special:
+            base_model.resize_token_embeddings(len(tokenizer))
+            logger.info(f"Resized model embeddings to {len(tokenizer)}")
         
         # Load LoRA adapter from checkpoint
         logger.info(f"Loading LoRA adapter from checkpoint...")
@@ -437,17 +437,13 @@ def train_lora_classification(
         model.config.use_cache = False
         
         # Configure LoRA
-        # CRITICAL: modules_to_save ensures embed_tokens and lm_head are trained
-        # This is required for new special tokens (<SUPPORTED>, <REFUTED>, <NEI>)
-        # Without this, new token embeddings remain random and model can't learn them!
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Attention layers
-            modules_to_save=["embed_tokens", "lm_head"]  # Train embeddings for new tokens!
+            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]  # Attention layers
         )
         
         model = get_peft_model(model, lora_cfg)
