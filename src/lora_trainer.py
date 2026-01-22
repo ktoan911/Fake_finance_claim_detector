@@ -63,13 +63,13 @@ def _get_label_token_ids(tokenizer, labels: list = None):
     LABEL_TO_WORD = {
         "SUPPORTED": "True",
         "REFUTED": "False", 
-        "NEI": "Unknown",
+        "NEI": "Unsure",
     }
     
     label_token_ids = {}
     for label in labels:
         # Get the word form for this label
-        word = LABEL_TO_WORD.get(label, "Unknown")
+        word = LABEL_TO_WORD.get(label, "Unsure")
         tokens = tokenizer(word, add_special_tokens=False)["input_ids"]
         
         if len(tokens) == 0:
@@ -239,9 +239,9 @@ def _prepare_classification_dataset(
             LABEL_TO_WORD = {
                 "SUPPORTED": "True",
                 "REFUTED": "False",
-                "NEI": "Unknown",
+                "NEI": "Unsure",
             }
-            target_word = LABEL_TO_WORD.get(target, "Unknown")
+            target_word = LABEL_TO_WORD.get(target, "Unsure")
             target_ids = tokenizer(
                 target_word,
                 add_special_tokens=False,
