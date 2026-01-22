@@ -59,14 +59,27 @@ def _get_label_token_ids(tokenizer, labels: list = None):
     if labels is None:
         labels = LABEL_LIST
     
+    # Map internal labels to output words the model already knows
+    LABEL_TO_WORD = {
+        "SUPPORTED": "True",
+        "REFUTED": "False", 
+        "NEI": "Unknown",
+    }
+    
     label_token_ids = {}
     for label in labels:
-        # Use special token format: <LABEL>
-        special_token = f"<{label}>"
-        tokens = tokenizer(special_token, add_special_tokens=False)["input_ids"]
-        if len(tokens) != 1:
-            raise ValueError(f"Special token '{special_token}' should be exactly 1 token, got {len(tokens)}")
+        # Get the word form for this label
+        word = LABEL_TO_WORD.get(label, "Unknown")
+        tokens = tokenizer(word, add_special_tokens=False)["input_ids"]
+        
+        if len(tokens) == 0:
+            raise ValueError(f"Word '{word}' tokenized to 0 tokens!")
+        
+        # Use first token (for multi-token words)
+        # Space prefix usually makes it a single token for common words
         label_token_ids[label] = tokens[0]
+        
+        logger.debug(f"Label '{label}' -> '{word}' -> token_id {tokens[0]} (total {len(tokens)} tokens)")
     
     return label_token_ids
 
@@ -221,12 +234,16 @@ def _prepare_classification_dataset(
                 truncation=False,  # We'll handle truncation manually
             )["input_ids"]
             
-            # Tokenize target using special token format (NO space prefix)
-            # CRITICAL: Must match _get_label_token_ids() format exactly
-            # "<LABEL>" not " <LABEL>" to ensure single token
-            target_text = f"<{target}>"
+            # Tokenize target using existing vocabulary word (NOT special token)
+            # Map: SUPPORTED->"True", REFUTED->"False", NEI->"Unknown"
+            LABEL_TO_WORD = {
+                "SUPPORTED": "True",
+                "REFUTED": "False",
+                "NEI": "Unknown",
+            }
+            target_word = LABEL_TO_WORD.get(target, "Unknown")
             target_ids = tokenizer(
-                target_text,
+                target_word,
                 add_special_tokens=False,
             )["input_ids"]
             
@@ -369,14 +386,7 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Add special tokens for labels if not already present
-        special_tokens = {"additional_special_tokens": ["<SUPPORTED>", "<REFUTED>", "<NEI>"]}
-        existing_special = set(tokenizer.additional_special_tokens or [])
-        new_special = [t for t in special_tokens["additional_special_tokens"] if t not in existing_special]
-        
-        if new_special:
-            tokenizer.add_special_tokens({"additional_special_tokens": new_special})
-            logger.info(f"Added {len(new_special)} special tokens for labels to checkpoint tokenizer")
+        # NO special tokens needed - using existing vocab (True/False/Unknown)
         
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
@@ -392,11 +402,6 @@ def train_lora_classification(
         
         # FIXED: Disable cache when using gradient checkpointing
         base_model.config.use_cache = False
-        
-        # CRITICAL FIX: Resize embeddings if new tokens were added
-        if new_special:
-            base_model.resize_token_embeddings(len(tokenizer))
-            logger.info(f"Resized model embeddings to {len(tokenizer)}")
         
         # Load LoRA adapter from checkpoint
         logger.info(f"Loading LoRA adapter from checkpoint...")
@@ -415,10 +420,8 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Add special tokens for labels (single-token classification)
-        special_tokens = {"additional_special_tokens": ["<SUPPORTED>", "<REFUTED>", "<NEI>"]}
-        num_added = tokenizer.add_special_tokens(special_tokens)
-        logger.info(f"Added {num_added} special tokens for labels")
+        # NO special tokens needed - using existing vocab (True/False/Unknown)
+        logger.info("Using existing vocabulary tokens for labels: True/False/Unknown")
         
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
@@ -426,9 +429,6 @@ def train_lora_classification(
             device_map="auto" if torch.cuda.is_available() else None,
             low_cpu_mem_usage=True
         )
-        
-        # Resize token embeddings to accommodate new special tokens
-        model.resize_token_embeddings(len(tokenizer))
         
         # Enable gradient checkpointing to save VRAM
         model.gradient_checkpointing_enable()

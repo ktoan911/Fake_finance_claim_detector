@@ -10,20 +10,16 @@ ID_TO_LABEL = {0: "SUPPORTED", 1: "REFUTED", 2: "NEI"}
 
 # Prompt template used for both LoRA fine-tuning and Fusion scoring
 # MUST include {claim} and {evidence} placeholders
+# Output uses existing vocabulary: True (supported), False (refuted), Unknown (NEI)
 PROMPT_TEMPLATE = """You are an expert fact-checker for financial claims.
 
 Classify the claim based on the evidence:
-- SUPPORTED: Evidence confirms the claim
-- REFUTED: Evidence contradicts the claim
-- NEI: Insufficient evidence
-
-Answer using EXACTLY ONE token from the following list:
-<SUPPORTED>
-<REFUTED>
-<NEI>
+- True: Evidence confirms the claim
+- False: Evidence contradicts the claim  
+- Unknown: Insufficient evidence
 
 Claim: {claim}
 
-Evidences: {evidence}
+Evidence: {evidence}
 
 Verdict:"""
