@@ -34,6 +34,21 @@ class CSVLabeledLoader:
 
         df = df.copy()
         df["evidence"] = df["evidence"].fillna("").astype(str)
+        
+        # Handle evidence that looks like a list string: "['item1', 'item2']"
+        def parse_evidence(ev):
+            ev_str = str(ev).strip()
+            if ev_str.startswith("[") and ev_str.endswith("]"):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(ev_str)
+                    if isinstance(parsed, list):
+                        return " ".join(str(item) for item in parsed)
+                except (ValueError, SyntaxError):
+                    pass
+            return ev_str
+        
+        df["evidence"] = df["evidence"].apply(parse_evidence)
         # Allow string/boolean labels
         if df["label"].dtype == object or df["label"].dtype == bool:
             label_map = {

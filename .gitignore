@@ -1,5 +1,6 @@
 # Data files
 data/
+lora_llm/
 
 # Python
 __pycache__/

@@ -1,16 +1,3 @@
-"""
-Knowledge-Augmented Retrieval System
-
-Implements Section 3.1 of the paper:
-- Temporal relevance scoring for scam templates
-- Score(q, di) = α · BM25(q, di) + (1 − α) · Recency(di)
-- FAISS indexing with BGE embeddings
-
-Also implements Section 3.5:
-- Semantic-Aware Retrieval with crypto-specific query expansion
-- Cycle-Aware Scoring with FFT for detecting repeating patterns
-"""
-
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime, timedelta, timezone
@@ -41,7 +28,6 @@ from scipy.signal import find_peaks
 
 @dataclass
 class RetrievalResult:
-    """Container for retrieval results"""
     document_id: str
     text: str
     score: float
@@ -64,10 +50,10 @@ class TemporalScorer:
     
     def __init__(
         self,
-        alpha: float = 0.7,  # Trade-off between semantic and temporal
-        lambda_decay: float = 0.1,  # Decay factor for recency
-        gamma: float = 0.5,  # Mix between recency and cyclicity
-        reference_date: datetime = None
+        alpha: float = 0.7,
+        lambda_decay: float = 0.1,
+        gamma: float = 0.5,
+        reference_date: datetime = None  # Will be set dynamically per query if None
     ):
         """
         Initialize temporal scorer with paper parameters.
@@ -82,12 +68,23 @@ class TemporalScorer:
         self.lambda_decay = lambda_decay
         self.lambda_base = lambda_decay
         self.gamma = gamma
-        # Use timezone-aware UTC to avoid naive/aware datetime errors
-        self.reference_date = reference_date or datetime.now(timezone.utc)
+        self._reference_date = reference_date  # Private, can be overridden
         
         logger.info(f"TemporalScorer initialized: α={alpha}, λ={lambda_decay}, γ={gamma}")
     
-    def calculate_recency(self, timestamp: datetime) -> float:
+    @property
+    def reference_date(self) -> datetime:
+        """Get reference date, defaulting to current time if not set."""
+        if self._reference_date is None:
+            return datetime.now(timezone.utc)
+        return self._reference_date
+    
+    @reference_date.setter
+    def reference_date(self, value: datetime):
+        """Set reference date for recency calculations."""
+        self._reference_date = value
+    
+    def calculate_recency(self, timestamp: datetime) -> float: 
         """
         Calculate recency score using exponential decay: e^(-λt)
         
@@ -105,9 +102,11 @@ class TemporalScorer:
         if ref.tzinfo is None:
             ref = ref.replace(tzinfo=timezone.utc)
 
-        days_diff = (ref - ts).days
-        days_diff = max(0, days_diff)  # Handle future dates
-        return np.exp(-self.lambda_decay * days_diff / 30)  # Normalize by month
+        # Paper Eq.1: e^(-λt) where t is time difference
+        # Use total_seconds for precise resolution (not quantized by .days)
+        time_diff_seconds = (ref - ts).total_seconds()
+        time_diff_days = max(0, time_diff_seconds / 86400.0)  # Convert to days
+        return float(np.exp(-self.lambda_decay * time_diff_days))
     
     def calculate_cyclicity(
         self,
@@ -116,7 +115,7 @@ class TemporalScorer:
     ) -> float:
         """
         Calculate cyclicity score using FFT to detect repeating patterns.
-        Implements Section 3.5's cycle-aware scoring.
+        Implements Section 4.1's cycle-aware scoring (Eq.8).
         
         Args:
             timestamps: List of document timestamps for pattern analysis
@@ -171,18 +170,53 @@ class TemporalScorer:
         sigmoid = 1 / (1 + np.exp(-trend_indicator))
         self.lambda_decay = sigmoid * self.lambda_base
     
+    def calculate_trend(self, timestamps: List[datetime]) -> float:
+        """
+        Calculate trend indicator for adaptive λ.
+        Simple approach: slope of recent occurrences.
+        Returns value suitable for sigmoid (-3 to 3 range).
+        """
+        if len(timestamps) < 5:
+            return 0.0
+        
+        # Sort and get recent window
+        sorted_ts = sorted(timestamps, reverse=True)[:30]
+        if len(sorted_ts) < 5:
+            return 0.0
+        
+        # Count occurrences in recent weeks
+        now = self.reference_date
+        week1 = sum(1 for t in sorted_ts if (now - t).days <= 7)
+        week2 = sum(1 for t in sorted_ts if 7 < (now - t).days <= 14)
+        week3 = sum(1 for t in sorted_ts if 14 < (now - t).days <= 21)
+        
+        # Trend: positive if increasing, negative if decreasing
+        if week3 > 0:
+            trend = (week1 - week3) / (week3 + 1)  # Normalized change
+        else:
+            trend = week1 / 3.0
+        
+        return np.clip(trend, -3, 3)  # For sigmoid input
+    
     def calculate_temporal_score(
         self,
         timestamp: datetime,
-        historical_timestamps: List[datetime] = None
+        historical_timestamps: List[datetime] = None,
+        use_adaptive_lambda: bool = True
     ) -> Tuple[float, float, float]:
         """
         Calculate combined temporal score.
-        Implements Equation (8): Score = α·BM25 + (1-α)·[γ·Recency + (1-γ)·Cyclicity]
+        Implements Equation (8): temporal = γ·Recency + (1-γ)·Cyclicity
+        with Equation (9): λt = Sigmoid(Trend) · λbase for adaptive decay
         
         Returns:
             Tuple of (temporal_score, recency_score, cyclicity_score)
         """
+        # Apply adaptive lambda if historical data available
+        if use_adaptive_lambda and historical_timestamps and len(historical_timestamps) > 5:
+            trend = self.calculate_trend(historical_timestamps)
+            self.adapt_lambda(trend)
+        
         recency = self.calculate_recency(timestamp)
         
         if historical_timestamps and len(historical_timestamps) > 10:
@@ -192,18 +226,22 @@ class TemporalScorer:
         
         temporal_score = self.gamma * recency + (1 - self.gamma) * cyclicity
         
+        # Reset lambda to base for next calculation
+        if use_adaptive_lambda:
+            self.lambda_decay = self.lambda_base
+        
         return temporal_score, recency, cyclicity
 
 
-class CryptoQueryExpander:
+class QueryExpander:
     """
-    Implements crypto-specific query expansion from Section 3.5.
-    Uses CryptoGlossary for synonym expansion.
+    Implements query expansion for fact-checking.
+    Uses synonyms for better evidence retrieval.
     """
     
     def __init__(self, glossary: Dict[str, List[str]] = None):
         """
-        Initialize query expander with crypto glossary.
+        Initialize query expander.
         
         Args:
             glossary: Dictionary mapping terms to synonyms
@@ -212,21 +250,25 @@ class CryptoQueryExpander:
         logger.info(f"QueryExpander initialized with {len(self.glossary)} terms")
     
     def _default_glossary(self) -> Dict[str, List[str]]:
-        """Default crypto-specific glossary"""
+        """Default fact-checking glossary"""
         return {
-            "rug pull": ["exit scam", "liquidity drain", "developer abandonment"],
-            "pump and dump": ["market manipulation", "price inflation", "coordinated selling"],
-            "dusting attack": ["wallet spam", "tracking attack", "dust transaction"],
-            "phishing": ["credential theft", "fake website", "social engineering"],
-            "ponzi": ["pyramid scheme", "investment fraud", "mlm scam"],
-            "giveaway scam": ["double your crypto", "celebrity impersonation", "send to receive"],
-            "honeypot": ["sell restriction", "locked token", "contract trap"],
-            "scam": ["fraud", "theft", "deception", "fake"],
-            "guaranteed": ["certain", "assured", "promised", "100%"],
+            # Claim verification terms
+            "claim": ["statement", "assertion", "allegation"],
+            "evidence": ["proof", "support", "documentation"],
+            "false": ["incorrect", "inaccurate", "misleading", "wrong"],
+            "true": ["correct", "accurate", "verified", "confirmed"],
+            "refuted": ["debunked", "disproven", "contradicted"],
+            "supported": ["confirmed", "validated", "corroborated"],
+            # Financial terms
+            "stock": ["shares", "equity", "securities"],
+            "investment": ["capital", "funding", "portfolio"],
+            "profit": ["gain", "return", "earnings"],
+            "loss": ["decline", "drop", "deficit"],
+            "market": ["exchange", "trading", "financial"],
+            # Verification terms
             "verify": ["confirm", "validate", "authenticate", "check"],
-            "urgent": ["immediate", "time-sensitive", "act now", "limited time"],
-            "airdrop": ["free tokens", "token distribution", "giveaway"],
-            "seed phrase": ["recovery phrase", "mnemonic", "backup words", "private key"],
+            "source": ["reference", "citation", "origin"],
+            "fact": ["truth", "reality", "data"],
         }
     
     def expand_query(self, query: str) -> str:
@@ -291,7 +333,7 @@ class KnowledgeAugmentedRetriever:
             gamma=gamma
         )
         
-        self.query_expander = CryptoQueryExpander() if use_query_expansion else None
+        self.query_expander = QueryExpander() if use_query_expansion else None
         
         # Initialize embedding model
         if SENTENCE_TRANSFORMERS_AVAILABLE:
@@ -350,6 +392,8 @@ class KnowledgeAugmentedRetriever:
             texts.append(doc_entry["text"])
         
         # Build BM25 index
+        # Note: Using BM25Okapi (standard BM25). Paper mentions BM25+ in Eq.8.
+        # BM25+ adds delta term to avoid negative scores, but difference is minor.
         tokenized = [self._tokenize(text) for text in texts]
         self.bm25 = BM25Okapi(tokenized)
         
@@ -377,24 +421,49 @@ class KnowledgeAugmentedRetriever:
         query: str,
         top_k: int = 5,
         use_temporal: bool = True,
-        expand_query: bool = True
+        expand_query: bool = True,
+        use_semantic: bool = True,
+        candidate_pool_size: int = None
     ) -> List[RetrievalResult]:
         """
         Retrieve relevant documents for a query.
-        Implements Equation (1): Score(q, di) = α·BM25 + (1-α)·Recency
+        
+        PAPER-FAITHFUL IMPLEMENTATION:
+        
+        Stage 1 (Optional): FAISS dense retrieval for candidates
+        - Uses BGE embeddings indexed via FAISS
+        - Returns top-N candidates by semantic similarity
+        
+        Stage 2: Rerank with Equation (1) and (8):
+        - Eq.1: Score(q,di) = α·BM25(q,di) + (1-α)·Temporal(di)
+        - Eq.8: Temporal = γ·Recency + (1-γ)·Cyclicity
+        - Eq.9: λt = Sigmoid(Trend)·λbase (adaptive decay)
+        
+        NOTE: Semantic similarity is used ONLY for candidate retrieval,
+        NOT mixed into final scoring (per paper Eq.1 which only mentions BM25).
+        
+        KNOWN DEVIATIONS FROM PAPER:
+        - Using BM25Okapi instead of BM25+ (minor difference)
+        - Normalize BM25 to [0,1] for score stability
+        - Query expansion adapted for fact-checking (not crypto-specific)
         
         Args:
             query: Search query
-            top_k: Number of results to return
-            use_temporal: Whether to apply temporal scoring
-            expand_query: Whether to expand query with synonyms
+            top_k: Number of final results
+            use_temporal: Apply temporal scoring (Eq.8/9)
+            expand_query: Expand query with synonyms
+            use_semantic: Use FAISS for candidate retrieval
+            candidate_pool_size: FAISS pool size. None = score all docs
             
         Returns:
-            List of RetrievalResult objects
+            List of RetrievalResult sorted by Eq.1 score
         """
         if not self.documents:
             logger.warning("No documents indexed")
             return []
+        
+        # Update reference date to current query time (fix G)
+        self.temporal_scorer.reference_date = datetime.now(timezone.utc)
         
         # Query expansion
         if expand_query and self.query_expander:
@@ -402,50 +471,66 @@ class KnowledgeAugmentedRetriever:
         else:
             expanded_query = query
         
-        # BM25 scores
+        # Stage 1: Get candidate pool via FAISS (dense retrieval)
+        # Paper: "dynamic databases indexed via FAISS"
+        if use_semantic and self.encoder is not None and self.faiss_index is not None:
+            if candidate_pool_size is None:
+                # Paper-faithful: score all documents
+                candidate_indices = set(range(len(self.documents)))
+            else:
+                # Practical: FAISS semantic search for top-N candidates
+                query_embedding = self.encoder.encode([expanded_query], convert_to_numpy=True)
+                faiss.normalize_L2(query_embedding)
+                
+                pool_size = min(candidate_pool_size, len(self.documents))
+                distances, indices = self.faiss_index.search(query_embedding, pool_size)
+                candidate_indices = set(indices[0].tolist())
+        else:
+            # No FAISS: score all documents
+            candidate_indices = set(range(len(self.documents)))
+        
+        # Stage 2: BM25 scoring
+        # Note: Using BM25Okapi (standard). Paper Eq.8 mentions BM25+.
         tokenized_query = self._tokenize(expanded_query)
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
-        # Normalize BM25 scores
+        # Normalize BM25 to [0,1] for score stability
+        # (Paper doesn't specify normalization, but needed for α weighting)
         max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
         bm25_scores_norm = bm25_scores / max_bm25
         
-        # Semantic scores (if available)
-        if self.encoder is not None and self.faiss_index is not None:
-            query_embedding = self.encoder.encode([query], convert_to_numpy=True)
-            faiss.normalize_L2(query_embedding)
-            
-            # Get all scores for combining
-            distances, indices = self.faiss_index.search(
-                query_embedding,
-                min(len(self.documents), len(self.documents))
-            )
-            
-            semantic_scores = np.zeros(len(self.documents))
-            for dist, idx in zip(distances[0], indices[0]):
-                if idx >= 0:
-                    semantic_scores[idx] = (dist + 1) / 2  # Convert to 0-1
-        else:
-            semantic_scores = bm25_scores_norm
+        # Build group histories from FULL corpus (fix E)
+        # Paper: cyclicity should reflect full pattern history, not just candidates
+        docs_by_group = {}
+        for i, doc in enumerate(self.documents):  # Full corpus
+            group_key = doc["metadata"].get("type") or doc["metadata"].get("source") or "default"
+            if group_key not in docs_by_group:
+                docs_by_group[group_key] = []
+            docs_by_group[group_key].append((i, doc["timestamp"]))
         
-        # Combine BM25 and semantic
-        combined_lexical_semantic = 0.5 * bm25_scores_norm + 0.5 * semantic_scores
-        
-        # Calculate final scores with temporal component
+        #  Stage 3: Rerank candidates with Paper Eq.1 + Eq.8
         final_scores = []
-        all_timestamps = [doc["timestamp"] for doc in self.documents]
         
-        for i, doc in enumerate(self.documents):
+        for i in candidate_indices:
+            doc = self.documents[i]
+            
             if use_temporal:
+                # Get group-specific timestamps for cyclicity (Eq.8)
+                group_key = doc["metadata"].get("type") or doc["metadata"].get("source") or "default"
+                group_timestamps = [ts for idx, ts in docs_by_group.get(group_key, [])]
+                
+                # Calculate temporal score with group-based cyclicity + adaptive λ (Eq.9)
                 temporal, recency, cyclicity = self.temporal_scorer.calculate_temporal_score(
                     doc["timestamp"],
-                    all_timestamps
+                    group_timestamps,
+                    use_adaptive_lambda=True
                 )
-                # Equation (1): Score = α·BM25 + (1-α)·Temporal
-                score = self.alpha * combined_lexical_semantic[i] + (1 - self.alpha) * temporal
+                # Paper Equation (1): Score = α·BM25 + (1-α)·Temporal
+                # where Temporal = γ·Recency + (1-γ)·Cyclicity from Eq.8
+                score = self.alpha * bm25_scores_norm[i] + (1 - self.alpha) * temporal
             else:
                 recency, cyclicity = 0.5, 0.5
-                score = combined_lexical_semantic[i]
+                score = bm25_scores_norm[i]
             
             final_scores.append({
                 "index": i,
@@ -455,7 +540,7 @@ class KnowledgeAugmentedRetriever:
                 "cyclicity_score": cyclicity
             })
         
-        # Sort and get top-k
+        # Step 4: Sort and get top-k
         final_scores.sort(key=lambda x: x["score"], reverse=True)
         top_results = final_scores[:top_k]
         
@@ -517,6 +602,8 @@ class KnowledgeAugmentedRetriever:
         
         if self.document_embeddings is not None and FAISS_AVAILABLE:
             self.faiss_index = faiss.IndexFlatIP(self.embedding_dim)
+            # Normalize for cosine similarity (must match indexing behavior)
+            faiss.normalize_L2(self.document_embeddings)
             self.faiss_index.add(self.document_embeddings)
         
         logger.info(f"Index loaded from {path}: {len(self.documents)} documents")

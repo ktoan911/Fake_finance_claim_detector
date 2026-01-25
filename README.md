@@ -345,3 +345,15 @@ This implementation is for educational and research purposes.
 - Using actual LLM (Llama-3, GPT-4) for claim verification
 - Connecting to trusted news/official sources for evidence
 - Implementing proper API rate limiting and error handling
+
+
+
+
+👉 Tất cả được gộp lại theo công thức trong paper:
+
+Score(q, d) = α · BM25(q, d) + (1 − α) · Temporal(d)
+
+
+Trong đó:
+
+Temporal(d) = γ · Recency(d) + (1 − γ) · Cyclicity(d)

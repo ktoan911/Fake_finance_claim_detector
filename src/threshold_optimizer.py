@@ -1,17 +1,3 @@
-"""
-Adaptive Threshold Optimization
-
-Implements Section 3.3 and Algorithm 1 from the paper:
-- Dynamic threshold optimization using gradient ascent
-- Fβ score optimization (β=2 for recall-prioritized)
-- Central difference approximation for gradient estimation
-- Early stopping with patience mechanism
-
-Key equations:
-- Fβ(τ) = (1 + β²) * (prec(τ) * rec(τ)) / (β² * prec(τ) + rec(τ))  [Eq. 4]
-- ∇Fβ ≈ (Fβ(τ+ε) - Fβ(τ-ε)) / 2ε  [Eq. 5]
-- τt+1 = τt + η * ∂Fβ/∂τ  [Eq. 6]
-"""
 
 import numpy as np
 from typing import List, Tuple, Dict, Optional, Callable
@@ -37,10 +23,10 @@ class ThresholdOptimizationResult:
 
 class AdaptiveThresholdOptimizer:
     """
-    Implements Algorithm 1: Dynamic Threshold Optimization for Scam Detection
+    Implements Algorithm 1: Dynamic Threshold Optimization for Classification
     
     Uses gradient ascent on Fβ score to find optimal classification threshold.
-    Particularly suited for imbalanced datasets (1:100 in CryptoScams).
+    Useful for imbalanced datasets in fact verification.
     """
     
     def __init__(
@@ -462,8 +448,8 @@ if __name__ == "__main__":
     np.random.seed(42)
     n_samples = 1000
     
-    # Imbalanced dataset (similar to CryptoScams 1:100)
-    n_positive = int(n_samples * 0.1)  # 10% scams
+    # Imbalanced dataset for testing
+    n_positive = int(n_samples * 0.1)  # 10% positive class
     n_negative = n_samples - n_positive
     
     y_true = np.concatenate([
@@ -473,8 +459,8 @@ if __name__ == "__main__":
     
     # Generate predictions with some noise
     y_pred_proba = np.concatenate([
-        np.random.beta(4, 2, n_positive),  # Higher scores for scams
-        np.random.beta(2, 4, n_negative)   # Lower scores for legitimate
+        np.random.beta(4, 2, n_positive),  # Higher scores for positive
+        np.random.beta(2, 4, n_negative)   # Lower scores for negative
     ])
     
     # Shuffle

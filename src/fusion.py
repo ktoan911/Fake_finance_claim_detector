@@ -1,13 +1,3 @@
-"""
-Confidence-Aware Fusion Layer
-
-Implements Section 3.2 of the paper:
-- Combines LM logits pLM(y|q) with retrieval evidence pret(y|D)
-- pfinal(y|q, D) = σ(β · pLM + (1 − β) · MLP(pret))
-- β is trainable gating parameter (initialized at 0.5)
-- Contrastive loss training with regularization
-"""
-
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
@@ -53,7 +43,7 @@ if TORCH_AVAILABLE:
             self,
             input_dim: int = 64,
             hidden_dim: int = 128,
-            output_dim: int = 2,
+            output_dim: int = 3,
             dropout: float = 0.1
         ):
             super().__init__()
@@ -83,6 +73,8 @@ if TORCH_AVAILABLE:
         Implements Equation (2) from the paper:
         pfinal(y|q, D) = σ(β · pLM + (1 − β) · MLP(pret))
         
+        Where σ is Softmax for multi-class (3 labels) or Sigmoid for binary.
+        
         With contrastive loss from Equation (3):
         L = -log(e^sp / Σe^sn) + λ||β||²
         """
@@ -91,7 +83,7 @@ if TORCH_AVAILABLE:
             self,
             retrieval_input_dim: int = 64,
             hidden_dim: int = 128,
-            num_classes: int = 2,
+            num_classes: int = 3,
             initial_beta: float = 0.5,
             lambda_reg: float = 0.01,
             learn_beta: bool = True
@@ -102,6 +94,7 @@ if TORCH_AVAILABLE:
             self.lambda_reg = lambda_reg
             
             # Trainable gating parameter β
+            # We use a logit parameter and apply sigmoid in forward() to ensure β ∈ [0, 1]
             self._beta_logit = nn.Parameter(
                 torch.tensor(self._inverse_sigmoid(initial_beta)),
                 requires_grad=learn_beta
@@ -122,7 +115,7 @@ if TORCH_AVAILABLE:
                 nn.Sigmoid()
             )
             
-            logger.info(f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}")
+            logger.info(f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}")
         
         def _inverse_sigmoid(self, x: float) -> float:
             """Inverse sigmoid for initialization"""
@@ -131,7 +124,7 @@ if TORCH_AVAILABLE:
         
         @property
         def beta(self) -> torch.Tensor:
-            """Get the current gating parameter β"""
+            """Get the current gating parameter β. Guaranteed to be in [0, 1]."""
             return torch.sigmoid(self._beta_logit)
         
         def forward(
@@ -139,16 +132,30 @@ if TORCH_AVAILABLE:
             lm_logits: torch.Tensor,
             retrieval_features: torch.Tensor
         ) -> FusionOutput:
-            """Forward pass implementing Equation (2)."""
-            # Get current beta
+            """Forward pass implementing Equation (2): β·pLM + (1-β)·MLP(pret)."""
+            
+            # Check shapes
+            batch_size = lm_logits.size(0)
+            assert lm_logits.size(1) == self.num_classes, \
+                f"lm_logits shape mismatch: expected [B, {self.num_classes}], got {lm_logits.shape}"
+            
+            # Get current beta (constrained to [0,1] via sigmoid)
             beta = self.beta
             
             # Project retrieval features to label space
             retrieval_logits = self.retrieval_mlp(retrieval_features)
             
+            # Check retrieval logits shape
+            assert retrieval_logits.size() == (batch_size, self.num_classes), \
+                f"retrieval_logits shape mismatch: expected [{batch_size}, {self.num_classes}], got {retrieval_logits.shape}"
+            
             # Fuse according to Equation (2)
+            # NOTE: These are raw LOGITS, not probabilities. No activation applied yet.
             fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits
-            final_probs = torch.sigmoid(fused_logits)
+            
+            # Use softmax for multi-class (not sigmoid which is for binary)
+            # This is p_final in the paper.
+            final_probs = torch.softmax(fused_logits, dim=-1)
             
             # Estimate confidence
             combined_features = torch.cat([lm_logits, retrieval_logits], dim=-1)

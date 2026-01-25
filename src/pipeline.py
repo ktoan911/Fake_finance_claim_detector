@@ -1,18 +1,3 @@
-"""
-Crypto Claim Verification Pipeline
-
-Goal:
-Input: one post/comment/message (Reddit/Telegram)
-Output:
-  - label ∈ {SUPPORTED, REFUTED, NEI}
-  - evidence: top-k retrieved evidence (links/snippets)
-  - confidence: reliability score
-
-The retrieval score uses the paper's formula:
-Score(q, d_i) = α · BM25(q, d_i) + (1 − α) · Recency(d_i)
-Recency(d_i) = e^(−λt), with α=0.7, λ=0.1
-"""
-
 import numpy as np
 import time
 from typing import List, Dict, Tuple, Optional
@@ -62,9 +47,9 @@ class PredictionResult:
     processing_time_ms: float
 
 
-class CryptoClaimVerificationPipeline:
+class ClaimVerificationPipeline:
     """
-    Pipeline for crypto-focused claim verification.
+    Pipeline for fact verification/claim checking.
     Output labels: SUPPORTED / REFUTED / NEI.
     """
     
@@ -78,7 +63,7 @@ class CryptoClaimVerificationPipeline:
         
         self.is_fitted = False
         
-        logger.info("CryptoClaimVerificationPipeline initialized")
+        logger.info("ClaimVerificationPipeline initialized")
     
     def build(self) -> None:
         """Build all pipeline components."""
@@ -103,7 +88,7 @@ class CryptoClaimVerificationPipeline:
         Fit the pipeline on knowledge base and optional training data.
         
         Args:
-            knowledge_base: List of scam templates/patterns for retrieval
+            knowledge_base: List of evidence documents for retrieval
             training_data: Optional labeled training data for threshold tuning
         """
         if self.retriever is None:

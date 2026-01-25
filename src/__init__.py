@@ -1,5 +1,5 @@
 """
-Knowledge-Grounded Detection of Cryptocurrency Scams
+Knowledge-Grounded Fact Verification System
 with Retrieval-Augmented Language Models
 
 Based on the paper by Zichao Li (Canoakbit Alliance)

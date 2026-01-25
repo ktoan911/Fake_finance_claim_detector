@@ -1,19 +1,6 @@
-"""
-Semantic-Aware Retrieval with Contrastive Learning
-
-Implements Section 3.5 of the paper:
-- Crypto-specific query expansion
-- Specialized embeddings fine-tuned with contrastive learning
-- Contrastive loss: L = -log(e^s+ / (e^s+ + e^s-)) + λ||θ||²  [Eq. 7]
-
-Key improvements over vanilla BGE:
-- ≤0.2 cosine distance between variant expressions of same scam type
-- ≥0.5 distance from legitimate content
-- 92% accuracy on lexical variation cases (vs 63% vanilla BGE)
-"""
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass
 from loguru import logger
 
@@ -40,7 +27,7 @@ class TripletSample:
     """Container for triplet training sample"""
     anchor: str  # Query
     positive: str  # Matching scam pattern
-    negative: str  # Non-matching (legitimate or different scam type)
+    negatives: List[str]  # List of non-matching samples (hard + random)
 
 
 class SimulatedEmbeddingModel:
@@ -64,26 +51,6 @@ class SimulatedEmbeddingModel:
         )
         self.svd = TruncatedSVD(n_components=embedding_dim, random_state=seed)
         self.is_fitted = False
-        
-        # Risk pattern keywords for bonus scoring
-        self.risk_patterns = {
-            "guaranteed": 0.3,
-            "profit": 0.2,
-            "returns": 0.2,
-            "giveaway": 0.3,
-            "free": 0.15,
-            "airdrop": 0.2,
-            "verify": 0.25,
-            "urgent": 0.25,
-            "elon": 0.3,
-            "musk": 0.3,
-            "double": 0.3,
-            "send": 0.15,
-            "receive": 0.15,
-            "limited": 0.2,
-            "invest": 0.2,
-            "roi": 0.25,
-        }
     
     def fit(self, texts: List[str]) -> None:
         """Fit the embedding model"""
@@ -100,18 +67,6 @@ class SimulatedEmbeddingModel:
         # TF-IDF + SVD
         tfidf = self.vectorizer.transform(texts)
         embeddings = self.svd.transform(tfidf)
-        
-        # Add risk pattern signal
-        for i, text in enumerate(texts):
-            text_lower = text.lower()
-            risk_bonus = 0
-            for pattern, weight in self.risk_patterns.items():
-                if pattern in text_lower:
-                    risk_bonus += weight
-            
-            # Boost certain dimensions based on risk
-            if risk_bonus > 0:
-                embeddings[i, :10] += risk_bonus * 0.5
         
         if normalize:
             norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -135,7 +90,8 @@ if TORCH_AVAILABLE:
     class CryptoEmbeddingDataset(TorchDataset):
         """
         Dataset for contrastive learning on crypto scam patterns.
-        Creates triplets (q, d+, d-) for training.
+        Creates triplets (q, d+, {d-}) for training.
+        Supports hard negative mining and multiple negatives.
         """
         
         def __init__(
@@ -143,11 +99,15 @@ if TORCH_AVAILABLE:
             scam_samples: List[Dict],
             legitimate_samples: List[Dict],
             num_triplets: int = 10000,
-            hard_negative_ratio: float = 0.3
+            num_negatives: int = 3,  # Number of negatives per anchor
+            hard_negative_ratio: float = 0.5,
+            embedding_model = None  # Optional model for hard negative mining
         ):
             self.scam_samples = scam_samples
             self.legitimate_samples = legitimate_samples
+            self.num_negatives = num_negatives
             self.hard_negative_ratio = hard_negative_ratio
+            self.embedding_model = embedding_model
             
             # Group scams by type
             self.scams_by_type = {}
@@ -157,12 +117,20 @@ if TORCH_AVAILABLE:
                     self.scams_by_type[scam_type] = []
                 self.scams_by_type[scam_type].append(sample)
             
+            # Pre-compute embeddings for hard negative mining if model provided
+            self.legit_embeddings = None
+            if self.embedding_model and hasattr(self.embedding_model, 'encode'):
+                logger.info("Pre-computing legitimate embeddings for hard negative mining...")
+                legit_texts = [s["text"] for s in self.legitimate_samples]
+                # We use CPU for storage to avoid OOM
+                self.legit_embeddings = self.embedding_model.encode(legit_texts, normalize=True).cpu()
+            
             # Generate triplets
             self.triplets = self._generate_triplets(num_triplets)
             logger.info(f"Created dataset with {len(self.triplets)} triplets")
         
         def _generate_triplets(self, num_triplets: int) -> List[TripletSample]:
-            """Generate triplet samples"""
+            """Generate triplet samples with hard negative mining"""
             triplets = []
             scam_types = list(self.scams_by_type.keys())
             
@@ -170,30 +138,75 @@ if TORCH_AVAILABLE:
                 anchor_type = np.random.choice(scam_types)
                 anchor_samples = self.scams_by_type[anchor_type]
                 
-                if len(anchor_samples) < 2:
+                # We need at least 1 sample. 
+                # If using Claim-Evidence, 1 is enough.
+                # If using Claim-Claim (fallback), we need 2.
+                if not anchor_samples:
                     continue
                 
-                anchor_idx, positive_idx = np.random.choice(
-                    len(anchor_samples), 2, replace=False
-                )
-                anchor = anchor_samples[anchor_idx]["text"]
-                positive = anchor_samples[positive_idx]["text"]
+                # Pick anchor
+                anchor_idx = np.random.choice(len(anchor_samples))
+                anchor_sample = anchor_samples[anchor_idx]
+                anchor_text = anchor_sample["text"]
                 
-                if np.random.random() < self.hard_negative_ratio:
-                    other_types = [t for t in scam_types if t != anchor_type]
-                    if other_types:
-                        neg_type = np.random.choice(other_types)
-                        neg_sample = np.random.choice(self.scams_by_type[neg_type])
-                        negative = neg_sample["text"]
-                    else:
-                        negative = np.random.choice(self.legitimate_samples)["text"]
+                # Determine Positive
+                # Priority: Use "evidence" field (Paper alignment: Query -> Evidence)
+                if "evidence" in anchor_sample and anchor_sample["evidence"]:
+                    positive_text = anchor_sample["evidence"]
+                    using_evidence = True
+                elif len(anchor_samples) >= 2:
+                    # Fallback: Metric Learning (Cluster same scam types)
+                    # Pick another sample of same type
+                    pos_idx = np.random.choice([i for i in range(len(anchor_samples)) if i != anchor_idx])
+                    positive_text = anchor_samples[pos_idx]["text"]
+                    using_evidence = False
                 else:
-                    negative = np.random.choice(self.legitimate_samples)["text"]
+                    # Cannot form pair
+                    continue
+                
+                negatives = []
+                
+                # Try to mine hard negatives
+                if self.legit_embeddings is not None:
+                    # Find legitimate sample that is semantically similar to anchor
+                    anchor_emb = self.embedding_model.encode([anchor_text], normalize=True).cpu()
+                    
+                    # Compute cosine similarity
+                    sims = F.cosine_similarity(anchor_emb, self.legit_embeddings, dim=1)
+                    
+                    # Select top-k similar but not identical
+                    top_k_indices = torch.topk(sims, k=min(20, len(self.legitimate_samples))).indices
+                    
+                    # Add hard negatives
+                    num_hard = int(self.num_negatives * self.hard_negative_ratio)
+                    for _ in range(num_hard):
+                        neg_idx = top_k_indices[np.random.randint(0, len(top_k_indices))].item()
+                        negatives.append(self.legitimate_samples[neg_idx]["text"])
+                
+                # Fill remaining with random negatives
+                while len(negatives) < self.num_negatives:
+                    if np.random.random() < 0.5:
+                        # Random negative from other scam types
+                        other_types = [t for t in scam_types if t != anchor_type]
+                        if other_types:
+                            neg_type = np.random.choice(other_types)
+                            neg_sample = np.random.choice(self.scams_by_type[neg_type])
+                            
+                            # If we are doing Claim-Evidence, try to pick Evidence as negative too
+                            if using_evidence and "evidence" in neg_sample and neg_sample["evidence"]:
+                                negatives.append(neg_sample["evidence"])
+                            else:
+                                negatives.append(neg_sample["text"])
+                        else:
+                            negatives.append(np.random.choice(self.legitimate_samples)["text"])
+                    else:
+                        # Random legitimate sample
+                        negatives.append(np.random.choice(self.legitimate_samples)["text"])
                 
                 triplets.append(TripletSample(
-                    anchor=anchor,
-                    positive=positive,
-                    negative=negative
+                    anchor=anchor_text,
+                    positive=positive_text,
+                    negatives=negatives
                 ))
             
             return triplets
@@ -201,19 +214,19 @@ if TORCH_AVAILABLE:
         def __len__(self) -> int:
             return len(self.triplets)
         
-        def __getitem__(self, idx: int) -> Dict[str, str]:
+        def __getitem__(self, idx: int) -> Dict[str, Union[str, List[str]]]:
             triplet = self.triplets[idx]
             return {
                 "anchor": triplet.anchor,
                 "positive": triplet.positive,
-                "negative": triplet.negative
+                "negatives": triplet.negatives
             }
 
     class ContrastiveEmbeddingModel(nn.Module):
         """
         Embedding model with contrastive fine-tuning capability.
         Implements Equation (7):
-        L = -log(e^s+ / (e^s+ + e^s-)) + λ||θ||²
+        L = -log(e^s+ / (e^s+ + Σe^s-)) + λ||θ||²
         """
         
         def __init__(
@@ -247,15 +260,20 @@ if TORCH_AVAILABLE:
         
         def encode(self, texts: List[str], normalize: bool = True) -> torch.Tensor:
             """Encode texts to embeddings."""
+            device = next(self.projection.parameters()).device
+            
             if self.encoder is not None:
                 with torch.no_grad():
+                    # SentenceTransformer encodes to CPU tensor by default usually
                     base_embeddings = self.encoder.encode(
                         texts,
                         convert_to_tensor=True,
                         show_progress_bar=False
                     )
+                    # Ensure on correct device
+                    base_embeddings = base_embeddings.to(device)
             else:
-                base_embeddings = torch.randn(len(texts), self.embedding_dim)
+                base_embeddings = torch.randn(len(texts), self.embedding_dim).to(device)
             
             projected = self.projection(base_embeddings)
             
@@ -276,25 +294,42 @@ if TORCH_AVAILABLE:
             self,
             anchor_emb: torch.Tensor,
             positive_emb: torch.Tensor,
-            negative_emb: torch.Tensor,
+            negative_embs: torch.Tensor,  # Can be [B, N_neg, Dim] or [B, Dim]
             temperature: float = 0.07
         ) -> torch.Tensor:
             """
-            Compute contrastive loss (Equation 7):
-            L = -log(e^s+ / (e^s+ + e^s-)) + λ||θ||²
+            Compute contrastive loss (Equation 7) with multiple negatives support:
+            L = -log(e^s+ / (e^s+ + Σe^s-)) + λ||θ||²
             """
+            # Positive similarity: [B]
             pos_sim = self.compute_similarity(anchor_emb, positive_emb) / temperature
-            neg_sim = self.compute_similarity(anchor_emb, negative_emb) / temperature
             
+            # Negative similarity
+            # If negative_embs is [B, Dim], treat as 1 negative per sample
+            if negative_embs.dim() == 2:
+                neg_sim = self.compute_similarity(anchor_emb, negative_embs) / temperature
+                neg_sim = neg_sim.unsqueeze(1) # [B, 1]
+            # If negative_embs is [B, N_neg, Dim], compute sim for each
+            elif negative_embs.dim() == 3:
+                # anchor: [B, 1, Dim]
+                anchor_expanded = anchor_emb.unsqueeze(1)
+                # neg_sim: [B, N_neg]
+                neg_sim = F.cosine_similarity(anchor_expanded, negative_embs, dim=2) / temperature
+            
+            # InfoNCE Loss
+            # numerator: e^pos
             numerator = torch.exp(pos_sim)
-            denominator = numerator + torch.exp(neg_sim)
+            
+            # denominator: e^pos + Σe^neg
+            denominator = numerator + torch.sum(torch.exp(neg_sim), dim=-1)
             
             contrastive_loss = -torch.log(numerator / (denominator + 1e-8))
             contrastive_loss = contrastive_loss.mean()
             
+            # Regularization (Squared L2 norm)
             reg_loss = 0.0
             for param in self.projection.parameters():
-                reg_loss += torch.norm(param, p=2)
+                reg_loss += torch.sum(param ** 2)
             reg_loss *= self.lambda_reg
             
             return contrastive_loss + reg_loss
@@ -329,10 +364,25 @@ if TORCH_AVAILABLE:
             for batch in dataloader:
                 anchor_emb = self.model.encode(batch["anchor"])
                 positive_emb = self.model.encode(batch["positive"])
-                negative_emb = self.model.encode(batch["negative"])
+                
+                negatives = batch["negatives"]
+                # Transpose the list of negatives to group by negative index
+                # If negatives was [N_neg][B], zip(*negatives) makes it [B][N_neg]
+                # If negatives was [B][N_neg], zip(*negatives) makes it [N_neg][B]
+                # Assuming default collate makes it [B][N_neg] (list of lists, each inner list is negatives for one sample)
+                # Then zip(*negatives) makes it [N_neg][B] (list of tuples, each tuple is the k-th negative across all samples)
+                negatives_by_k = list(zip(*negatives))
+                
+                neg_embs_list = []
+                for neg_texts_k in negatives_by_k:
+                    # Encode the k-th negative for all samples in the batch
+                    neg_embs_list.append(self.model.encode(list(neg_texts_k)))
+                
+                # Stack to [B, N_neg, Dim]
+                negative_embs = torch.stack(neg_embs_list, dim=1)
                 
                 loss = self.model.compute_contrastive_loss(
-                    anchor_emb, positive_emb, negative_emb
+                    anchor_emb, positive_emb, negative_embs
                 )
                 
                 self.optimizer.zero_grad()
@@ -355,7 +405,14 @@ if TORCH_AVAILABLE:
                 for batch in dataloader:
                     anchor_emb = self.model.encode(batch["anchor"])
                     positive_emb = self.model.encode(batch["positive"])
-                    negative_emb = self.model.encode(batch["negative"])
+                    
+                    # Handle multiple negatives: Transpose to get [N_neg][B]
+                    negatives = batch["negatives"]
+                    negatives_by_k = list(zip(*negatives))
+                    
+                    # Just take the first negative batch for simple evaluation metric
+                    first_neg_batch = negatives_by_k[0]
+                    negative_emb = self.model.encode(list(first_neg_batch))
                     
                     pos_sim = self.model.compute_similarity(anchor_emb, positive_emb)
                     neg_sim = self.model.compute_similarity(anchor_emb, negative_emb)
@@ -393,57 +450,3 @@ else:
         """Placeholder when PyTorch is not available"""
         def __init__(self, *args, **kwargs):
             logger.warning("CryptoEmbeddingTrainer requires PyTorch")
-
-
-if __name__ == "__main__":
-    # Demo usage
-    print("Testing Semantic-Aware Embeddings\n")
-    
-    # Create sample data
-    scam_samples = [
-        {"text": "🚀 Invest 1000 BTC and get 10x returns! Guaranteed!", "scam_type": "ponzi"},
-        {"text": "Join our exclusive investment club! 200% ROI monthly!", "scam_type": "ponzi"},
-        {"text": "Elon Musk is giving away 5000 BTC! Send to verify!", "scam_type": "giveaway"},
-        {"text": "FREE Bitcoin! Send 0.1 BTC and get 1 BTC back!", "scam_type": "giveaway"},
-        {"text": "URGENT: Verify your MetaMask wallet immediately!", "scam_type": "phishing"},
-        {"text": "Security Alert: Your Binance account compromised!", "scam_type": "phishing"},
-    ]
-    
-    legitimate_samples = [
-        {"text": "Just bought some ETH, curious to see where it goes"},
-        {"text": "Great discussion on blockchain technology today"},
-        {"text": "Remember to use hardware wallets for security"},
-    ]
-    
-    # Test simulated model (always available)
-    print("--- Simulated Embedding Model ---")
-    all_texts = [s["text"] for s in scam_samples + legitimate_samples]
-    
-    sim_model = SimulatedEmbeddingModel(embedding_dim=64)
-    sim_model.fit(all_texts)
-    
-    query = "Double your Bitcoin instantly!"
-    similarities = sim_model.similarity(query, all_texts)
-    
-    print(f"\nQuery: {query}")
-    print("\nTop matches:")
-    for idx in np.argsort(similarities)[::-1][:3]:
-        print(f"  {similarities[idx]:.4f}: {all_texts[idx][:50]}...")
-    
-    # Test PyTorch dataset if available
-    if TORCH_AVAILABLE:
-        print("\n--- Triplet Dataset (PyTorch) ---")
-        dataset = CryptoEmbeddingDataset(
-            scam_samples=scam_samples,
-            legitimate_samples=legitimate_samples,
-            num_triplets=100
-        )
-        
-        print(f"Created {len(dataset)} triplets")
-        sample = dataset[0]
-        print(f"\nSample triplet:")
-        print(f"  Anchor: {sample['anchor'][:50]}...")
-        print(f"  Positive: {sample['positive'][:50]}...")
-        print(f"  Negative: {sample['negative'][:50]}...")
-    else:
-        print("\n(PyTorch models not available - install torch for full functionality)")
