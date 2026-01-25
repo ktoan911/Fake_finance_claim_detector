@@ -11,7 +11,7 @@ from .config import PROMPT_TEMPLATE, LABEL_LIST
 
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from peft import PeftModel, PeftConfig
     TORCH_AVAILABLE = True
 except ImportError:
@@ -42,7 +42,6 @@ class LLMScorer:
         max_length: int = 1024,
         labels: Optional[List[str]] = None,
         prompt_template: Optional[str] = None,
-        load_in_4bit: bool = False,
     ):
         if not TORCH_AVAILABLE:
             raise ImportError("torch and transformers are required for LLMScorer.")
@@ -59,17 +58,6 @@ class LLMScorer:
         # Must set explicitly as some models default to left padding
         self.tokenizer.padding_side = 'right'
         
-        # Prepare quantization config if requested
-        bnb_config = None
-        if load_in_4bit:
-            logger.info("Enabling 4-bit quantization for LLMScorer")
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4"
-            )
-
         # Check if model_name is a LoRA adapter
         import os
         is_lora = os.path.exists(os.path.join(model_name, "adapter_config.json"))
@@ -82,8 +70,7 @@ class LLMScorer:
             # Load base model
             self.model = AutoModelForCausalLM.from_pretrained(
                 base_model_path,
-                quantization_config=bnb_config,
-                torch_dtype=torch.float16 if torch.cuda.is_available() and not load_in_4bit else None,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map=self.device if self.device != "cpu" else None,
                 low_cpu_mem_usage=True
             )
@@ -93,8 +80,7 @@ class LLMScorer:
             logger.info(f"Loading standard model: {model_name}")
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                quantization_config=bnb_config,
-                torch_dtype=torch.float16 if torch.cuda.is_available() and not load_in_4bit else None,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map=self.device if self.device != "cpu" else None,
                 low_cpu_mem_usage=True
             )
