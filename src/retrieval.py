@@ -94,6 +94,9 @@ class TemporalScorer:
         Returns:
             Recency score between 0 and 1
         """
+        if timestamp is None:
+            return 0.0
+
         # Normalize timezone awareness
         ts = timestamp
         if ts.tzinfo is None:
@@ -124,12 +127,13 @@ class TemporalScorer:
         Returns:
             Cyclicity score between 0 and 1
         """
-        if len(timestamps) < 10:
+        valid_timestamps = [t for t in timestamps if t is not None]
+        if len(valid_timestamps) < 10:
             return 0.5  # Default for insufficient data
         
         # Convert to daily occurrence counts
-        min_date = min(timestamps)
-        max_date = max(timestamps)
+        min_date = min(valid_timestamps)
+        max_date = max(valid_timestamps)
         date_range = (max_date - min_date).days + 1
         
         if date_range < 7:
@@ -137,7 +141,7 @@ class TemporalScorer:
         
         # Create time series
         daily_counts = np.zeros(date_range)
-        for ts in timestamps:
+        for ts in valid_timestamps:
             day_idx = (ts - min_date).days
             if 0 <= day_idx < date_range:
                 daily_counts[day_idx] += 1
@@ -176,11 +180,12 @@ class TemporalScorer:
         Simple approach: slope of recent occurrences.
         Returns value suitable for sigmoid (-3 to 3 range).
         """
-        if len(timestamps) < 5:
+        valid_timestamps = [t for t in timestamps if t is not None]
+        if len(valid_timestamps) < 5:
             return 0.0
         
         # Sort and get recent window
-        sorted_ts = sorted(timestamps, reverse=True)[:30]
+        sorted_ts = sorted(valid_timestamps, reverse=True)[:30]
         if len(sorted_ts) < 5:
             return 0.0
         
@@ -213,13 +218,13 @@ class TemporalScorer:
             Tuple of (temporal_score, recency_score, cyclicity_score)
         """
         # Apply adaptive lambda if historical data available
-        if use_adaptive_lambda and historical_timestamps and len(historical_timestamps) > 5:
+        if use_adaptive_lambda and historical_timestamps:
             trend = self.calculate_trend(historical_timestamps)
             self.adapt_lambda(trend)
         
         recency = self.calculate_recency(timestamp)
         
-        if historical_timestamps and len(historical_timestamps) > 10:
+        if historical_timestamps:
             cyclicity = self.calculate_cyclicity(historical_timestamps)
         else:
             cyclicity = 0.5
