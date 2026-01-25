@@ -46,7 +46,7 @@ def _normalize_label(label_value) -> int:
         return 0
     if label_upper in ["REFUTED", "FALSE", "SCAM", "1"]:
         return 1
-    if label_upper in ["NEI", "UNSURE", "NEUTRAL", "UNKNOWN", "2"]:
+    if label_upper in ["NEI", "NOT", "NEUTRAL", "UNKNOWN", "2"]:
         return 2
     
     return 2
@@ -160,48 +160,107 @@ def train_fusion_from_dataframe(
     logger.info(f"Training samples: {len(texts)}")
     logger.info(f"Label distribution: {dict(zip(*np.unique(labels, return_counts=True)))}")
 
+    # --- PRE-COMPUTATION PHASE ---
+    logger.info("Starting pre-computation of retrieval features and LLM logits...")
+    all_retrieval_features = []
+    all_llm_logits = []
+    
+    # Ensure LLM is in eval mode and cache is disabled
+    llm.model.eval()
+    llm.model.config.use_cache = False
+    for p in llm.model.parameters():
+        p.requires_grad_(False)
+        
+    # Use micro-batch size for LLM to save memory (fusion batch size can be larger)
+    LLM_MICRO_BATCH_SIZE = 1
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    
+    # Process in batches for pre-computation
+    for i in range(0, len(texts), config.batch_size):
+        batch_texts = texts[i:i + config.batch_size]
+        batch_gold_evidences = gold_evidences[i:i + config.batch_size]
+        
+        # 1. Retrieval
+        batch_feats = []
+        batch_retrieved_evidences = []
+        for t in batch_texts:
+            feats, retrieved_evidence = _build_retrieval_features(retriever, t, config.top_k)
+            batch_feats.append(feats)
+            batch_retrieved_evidences.append(retrieved_evidence)
+        
+        all_retrieval_features.extend(batch_feats)
+        
+        # 2. LLM Scoring
+        if config.evidence_mode == "retrieved":
+            batch_evidences = batch_retrieved_evidences
+        else:
+            batch_evidences = batch_gold_evidences
+            
+        # Micro-batching for LLM inference
+        batch_logits_list = []
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                for j in range(0, len(batch_texts), LLM_MICRO_BATCH_SIZE):
+                    sub_texts = batch_texts[j : j + LLM_MICRO_BATCH_SIZE]
+                    sub_evidences = batch_evidences[j : j + LLM_MICRO_BATCH_SIZE]
+                    
+                    logits = llm.score_logits(sub_texts, sub_evidences)
+                    batch_logits_list.append(logits)
+        
+        # Concatenate micro-batches
+        lm_logits = torch.cat(batch_logits_list, dim=0)
+        all_llm_logits.append(lm_logits.cpu()) # Store on CPU to save GPU memory
+            
+        if (i // config.batch_size) % 10 == 0:
+            logger.info(f"Pre-computed {i + len(batch_texts)}/{len(texts)} samples")
+
+    # Convert to tensors
+    tensor_retrieval = torch.tensor(np.array(all_retrieval_features), dtype=torch.float32)
+    tensor_llm_logits = torch.cat(all_llm_logits, dim=0)
+    tensor_labels = torch.tensor(labels, dtype=torch.long)
+    
+    logger.info("Pre-computation complete. Unloading LLM...")
+    
+    # Unload LLM to free memory
+    del llm
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
     fusion.train()
     retrieval_encoder.train()
+    
+    dataset_size = len(texts)
+    indices = torch.randperm(dataset_size)
 
     for epoch in range(config.epochs):
+        # Shuffle indices at the start of each epoch
+        indices = torch.randperm(dataset_size)
+        
         total_loss = 0.0
         correct = 0
         total = 0
         num_batches = 0
 
-        for i in range(0, len(texts), config.batch_size):
-            batch_texts = texts[i:i + config.batch_size]
-            batch_gold_evidences = gold_evidences[i:i + config.batch_size]
-            batch_labels = labels[i:i + config.batch_size]
-
-            # Build retrieval features and get retrieved evidence
-            batch_features = []
-            batch_retrieved_evidences = []
-            for t in batch_texts:
-                feats, retrieved_evidence = _build_retrieval_features(retriever, t, config.top_k)
-                batch_features.append(feats)
-                batch_retrieved_evidences.append(retrieved_evidence)
+        for i in range(0, dataset_size, config.batch_size):
+            batch_indices = indices[i:i + config.batch_size]
             
-            # Choose evidence source based on config
-            if config.evidence_mode == "retrieved":
-                batch_evidences = batch_retrieved_evidences  # Paper-accurate
-            else:
-                batch_evidences = batch_gold_evidences  # Gold labels for debugging
-
-            # Get LLM LOGITS (not probabilities!) per paper Eq.2
-            lm_logits = llm.score_logits(batch_texts, batch_evidences)  # [batch, num_classes]
+            # Move batch to device
+            b_retrieval = tensor_retrieval[batch_indices].to(config.device)
+            b_llm_logits = tensor_llm_logits[batch_indices].to(config.device)
+            b_labels = tensor_labels[batch_indices].to(config.device)
 
             # Encode retrieval features
-            retrieval_scores = torch.tensor(batch_features, dtype=torch.float32, device=config.device)
-            retrieval_features = retrieval_encoder(retrieval_scores)
+            retrieval_features = retrieval_encoder(b_retrieval)
             
             # Fusion: β·pLM + (1-β)·MLP(pret) per Eq.2
-            output = fusion(lm_logits, retrieval_features)
+            output = fusion(b_llm_logits, retrieval_features)
             fused_logits = output.fused_logits
 
             # Cross-entropy loss
-            targets = torch.tensor(batch_labels, dtype=torch.long, device=config.device)
-            ce_loss = F.cross_entropy(fused_logits, targets)
+            ce_loss = F.cross_entropy(fused_logits, b_labels)
             
             # Add beta regularization (L = CE + λ||β||²)
             beta_reg = fusion.lambda_reg * (fusion.beta ** 2)
@@ -215,8 +274,8 @@ def train_fusion_from_dataframe(
             # Track metrics
             total_loss += loss.item()
             preds = torch.argmax(fused_logits, dim=-1)
-            correct += (preds == targets).sum().item()
-            total += len(batch_labels)
+            correct += (preds == b_labels).sum().item()
+            total += len(b_labels)
             num_batches += 1
 
         avg_loss = total_loss / max(1, num_batches)

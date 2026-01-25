@@ -65,7 +65,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Get label token IDs (True/False/Unsure)
+    # Get label token IDs (True/False/Not)
     logger.info("Extracting label token IDs...")
     label_token_ids = _get_label_token_ids(tokenizer)
     logger.info(f"Label token IDs: {label_token_ids}")

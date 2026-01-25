@@ -24,14 +24,14 @@ except ImportError:
 LABEL_TO_WORD = {
     "SUPPORTED": "True",
     "REFUTED": "False",
-    "NEI": "Unsure",
+    "NEI": "Not",
 }
 
 
 class LLMScorer:
     """
     Get LM logits for labels using a prompt.
-    Uses existing vocabulary tokens: True, False, Unsure.
+    Uses existing vocabulary tokens: True, False, Not.
     Returns LOGITS, not probabilities (for fusion layer per Eq.2).
     """
 
@@ -89,10 +89,10 @@ class LLMScorer:
 
         self.labels = labels or LABEL_LIST
         
-        # Get token IDs for vocab words (True/False/Unsure)
+        # Get token IDs for vocab words (True/False/Not)
         self.label_token_ids = {}
         for label in self.labels:
-            word = LABEL_TO_WORD.get(label, "Unsure")
+            word = LABEL_TO_WORD.get(label, "Not")
             tokens = self.tokenizer(word, add_special_tokens=False)["input_ids"]
             if len(tokens) == 0:
                 raise ValueError(f"Word '{word}' tokenized to 0 tokens!")
@@ -129,7 +129,7 @@ class LLMScorer:
         # CRITICAL: Reserve space for label tokens to match training truncation
         # Training: truncates prompt to (max_length - target_len) where target_len ~= 2-3
         # Inference: must do the same to ensure sequence length consistency
-        # Reserve 3 tokens: 1 for label (True/False/Unsure) + 1 safety + 1 for EOS
+        # Reserve 3 tokens: 1 for label (True/False/Not) + 1 safety + 1 for EOS
         reserved_for_label = 3
         effective_max_length = self.max_length - reserved_for_label
         

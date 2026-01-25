@@ -63,13 +63,13 @@ def _get_label_token_ids(tokenizer, labels: list = None):
     LABEL_TO_WORD = {
         "SUPPORTED": "True",
         "REFUTED": "False", 
-        "NEI": "Unsure",
+        "NEI": "Not",
     }
     
     label_token_ids = {}
     for label in labels:
         # Get the word form for this label
-        word = LABEL_TO_WORD.get(label, "Unsure")
+        word = LABEL_TO_WORD.get(label, "Not")
         tokens = tokenizer(word, add_special_tokens=False)["input_ids"]
         
         if len(tokens) == 0:
@@ -183,8 +183,8 @@ def _prepare_classification_dataset(
     """
     Prepare dataset for supervised classification fine-tuning.
     Format: prompt + label (causal LM style)
+    Implements smart truncation: preserves claim/template, truncates evidence from bottom.
     """
-    prompts = []
     targets = []
     
     def normalize_label(label_value) -> str:
@@ -208,17 +208,14 @@ def _prepare_classification_dataset(
             return "NEI"
         return "NEI"
     
-    for claim, evidence, label in zip(claims, evidences, labels):
-        prompt = _build_prompt(claim, evidence, prompt_template)
+    for label in labels:
         target = normalize_label(label)
-        prompts.append(prompt)
         targets.append(target)
     
     # Tokenize
     def tokenize_function(examples):
         """
-        FIXED: Build input_ids by direct concatenation to avoid alignment bugs.
-        This ensures labels mask exactly the prompt tokens.
+        Build input_ids with smart truncation and numbered evidence.
         """
         model_inputs = {
             "input_ids": [],
@@ -226,58 +223,79 @@ def _prepare_classification_dataset(
             "labels": []
         }
         
-        for prompt, target in zip(examples["prompt"], examples["target"]):
-            # Tokenize prompt with special tokens (BOS)
-            prompt_ids = tokenizer(
-                prompt,
-                add_special_tokens=True,
-                truncation=False,  # We'll handle truncation manually
-            )["input_ids"]
+        # Split template into start (before evidence) and end (after evidence)
+        # Template: "... Claim: {claim} ... Evidence: {evidence} ... Verdict:"
+        if "{evidence}" not in prompt_template:
+            raise ValueError("Prompt template must contain {evidence} placeholder")
             
-            # Tokenize target using existing vocabulary word (NOT special token)
-            # Map: SUPPORTED->"True", REFUTED->"False", NEI->"Unknown"
+        template_parts = prompt_template.split("{evidence}")
+        template_start_raw = template_parts[0]
+        template_end_raw = template_parts[1]
+        
+        for claim, evidence_raw, target in zip(examples["claim"], examples["evidence"], examples["target"]):
+            # 1. Prepare fixed parts
+            # Format start with claim
+            template_start = template_start_raw.format(claim=claim)
+            template_end = template_end_raw # No other placeholders in end
+            
+            # Tokenize fixed parts
+            start_ids = tokenizer(template_start, add_special_tokens=True, truncation=False)["input_ids"]
+            end_ids = tokenizer(template_end, add_special_tokens=False, truncation=False)["input_ids"]
+            
+            # Tokenize target
             LABEL_TO_WORD = {
                 "SUPPORTED": "True",
                 "REFUTED": "False",
-                "NEI": "Unsure",
+                "NEI": "Not",
             }
-            target_word = LABEL_TO_WORD.get(target, "Unsure")
-            target_ids = tokenizer(
-                target_word,
-                add_special_tokens=False,
-            )["input_ids"]
+            target_word = LABEL_TO_WORD.get(target, "Not")
+            target_ids = tokenizer(target_word, add_special_tokens=False)["input_ids"]
             
-            # Add EOS token at the end
             if tokenizer.eos_token_id is not None:
                 target_ids = target_ids + [tokenizer.eos_token_id]
-            
-            # Concatenate: [BOS, prompt_tokens, target_tokens, EOS]
-            full_input_ids = prompt_ids + target_ids
-            
-            # Truncate if too long (truncate prompt, keep target intact)
-            if len(full_input_ids) > max_length:
-                # Calculate how much to keep from prompt
-                target_len = len(target_ids)
-                max_prompt_len = max_length - target_len
-                if max_prompt_len < 1:
-                    # Edge case: target itself is too long, keep at least BOS
-                    max_prompt_len = 1
-                    target_ids = target_ids[:max_length - 1]
                 
-                prompt_ids = prompt_ids[:max_prompt_len]
-                full_input_ids = prompt_ids + target_ids
+            # 2. Calculate available space for evidence
+            # input = start + evidence + end + target
+            fixed_len = len(start_ids) + len(end_ids) + len(target_ids)
+            available_for_evidence = max_length - fixed_len
             
-            # Create labels: mask prompt (all -100), keep ONLY label token, mask EOS
-            # This is more paper-accurate: only train on the label token itself
-            prompt_len = len(prompt_ids)
+            # 3. Process evidence with smart truncation
+            evidence_ids = []
+            if available_for_evidence > 0:
+                # Split evidence by newline (preserved from csv_loader)
+                evidence_items = str(evidence_raw).split('\n')
+                
+                current_evidence_ids = []
+                for i, item in enumerate(evidence_items):
+                    if not item.strip():
+                        continue
+                        
+                    # Format: "1. Evidence text\n"
+                    formatted_item = f"{i+1}. {item.strip()}\n"
+                    item_ids = tokenizer(formatted_item, add_special_tokens=False)["input_ids"]
+                    
+                    if len(current_evidence_ids) + len(item_ids) <= available_for_evidence:
+                        current_evidence_ids.extend(item_ids)
+                    else:
+                        # Truncate the current item to fill remaining space
+                        remaining_space = available_for_evidence - len(current_evidence_ids)
+                        if remaining_space > 0:
+                            current_evidence_ids.extend(item_ids[:remaining_space])
+                        break
+                
+                evidence_ids = current_evidence_ids
             
-            # Count label tokens (excluding EOS)
+            # 4. Construct full input
+            full_input_ids = start_ids + evidence_ids + end_ids + target_ids
+            
+            # 5. Create labels
+            # Mask everything except target
+            prompt_len = len(start_ids) + len(evidence_ids) + len(end_ids)
             label_token_count = len(target_ids) - (1 if tokenizer.eos_token_id is not None else 0)
             
-            # Labels: [-100 for prompt] + [label_tokens] + [-100 for EOS]
             labels = [-100] * prompt_len + target_ids[:label_token_count] + [-100] * (len(target_ids) - label_token_count)
             
-            # Pad to max_length
+            # 6. Pad to max_length
             padding_length = max_length - len(full_input_ids)
             if padding_length > 0:
                 pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -285,6 +303,9 @@ def _prepare_classification_dataset(
                 labels = labels + [-100] * padding_length
                 attention_mask = [1] * (max_length - padding_length) + [0] * padding_length
             else:
+                # If we somehow exceeded max_length (shouldn't happen with logic above), truncate
+                full_input_ids = full_input_ids[:max_length]
+                labels = labels[:max_length]
                 attention_mask = [1] * max_length
             
             model_inputs["input_ids"].append(full_input_ids)
@@ -294,14 +315,15 @@ def _prepare_classification_dataset(
         return model_inputs
     
     dataset = Dataset.from_dict({
-        "prompt": prompts,
+        "claim": claims,
+        "evidence": evidences,
         "target": targets
     })
     
     tokenized = dataset.map(
         tokenize_function,
         batched=True,
-        remove_columns=["prompt", "target"]
+        remove_columns=["claim", "evidence", "target"]
     )
     
     return tokenized

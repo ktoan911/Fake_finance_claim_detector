@@ -43,7 +43,7 @@ class CSVLabeledLoader:
                     import ast
                     parsed = ast.literal_eval(ev_str)
                     if isinstance(parsed, list):
-                        return " ".join(str(item) for item in parsed)
+                        return "\n".join(str(item) for item in parsed)
                 except (ValueError, SyntaxError):
                     pass
             return ev_str

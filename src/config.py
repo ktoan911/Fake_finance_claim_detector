@@ -16,7 +16,7 @@ PROMPT_TEMPLATE = """You are an expert fact-checker for financial claims.
 Classify the claim based on the evidence:
 - True: Evidence confirms the claim
 - False: Evidence contradicts the claim  
-- Unsure: Insufficient evidence
+- Not: Insufficient evidence
 
 Claim: {claim}
 
