@@ -1,7 +1,7 @@
 
 from transformers import AutoTokenizer
 
-model_path = "./lora_llm"
+model_path = "/kaggle/input/best-modelll/lora_llm"
 try:
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     

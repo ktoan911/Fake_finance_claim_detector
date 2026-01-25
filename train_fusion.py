@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--model_path", type=str, default=os.getenv("LORA_MODEL_PATH") or os.getenv("LLM_MODEL_NAME", "meta-llama/Llama-3.1-8B"), help="Path to the model (LoRA or base model)")
     parser.add_argument("--device", type=str, default="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.system("nvidia-smi > /dev/null 2>&1") == 0 else "cpu", help="Device to use (cuda/cpu)")
     parser.add_argument("--save_path", type=str, default=os.getenv("FUSION_OUTPUT_PATH", "artifacts/fusion_model.pt"), help="Path to save the fusion model")
+    parser.add_argument("--load_in_4bit", action="store_true", help="Use 4-bit quantization for the LLM")
     
     args = parser.parse_args()
 
@@ -41,7 +42,8 @@ def main():
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
         device=args.device,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        load_in_4bit=args.load_in_4bit
     )
 
     train_fusion_from_dataframe(

@@ -33,6 +33,7 @@ class FusionTrainingConfig:
     max_length: int = 1024
     evidence_mode: str = "retrieved"  # "gold" or "retrieved" - per paper, should be "retrieved"
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
+    load_in_4bit: bool = False
 
 
 def _normalize_label(label_value) -> int:
@@ -128,6 +129,7 @@ def train_fusion_from_dataframe(
         max_length=config.max_length,
         labels=config.label_list,
         prompt_template=PROMPT_TEMPLATE,
+        load_in_4bit=config.load_in_4bit,
     )
 
     # Initialize retrieval encoder
