@@ -40,7 +40,8 @@ def main():
 
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
-        device=args.device
+        device=args.device,
+        batch_size=args.batch_size
     )
 
     train_fusion_from_dataframe(
@@ -48,6 +49,7 @@ def main():
         labeled_df=labeled_df,
         config=fusion_config,
         save_path=args.save_path
+
     )
 
     logger.info(f"Fusion training complete. Model saved to: {args.save_path}")
