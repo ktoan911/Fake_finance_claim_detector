@@ -42,7 +42,7 @@ def main():
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
         device=args.device,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
         llm_batch_size = args.llm_batch_size
     )
 
