@@ -22,6 +22,7 @@ class FusionTrainingConfig:
     model_name: str = "artifacts/lora_llm"
     device: str = "auto"
     batch_size: int = 4
+    llm_batch_size: int = 4
     epochs: int = 3
     learning_rate: float = 1e-4
     top_k: int = 5
@@ -69,10 +70,8 @@ def _build_retrieval_features(
     if len(features) < top_k:
         features.extend([[0.0, 0.0, 0.0, 0.0]] * (top_k - len(features)))
     
-    # Combine retrieved evidence into single string
-    combined_evidence = " ".join(evidence_texts) if evidence_texts else ""
-    
-    return np.array(features, dtype=np.float32), combined_evidence
+    # Return list of evidence texts (for smart truncation in LLMScorer)
+    return np.array(features, dtype=np.float32), evidence_texts
 
 
 def train_fusion_from_dataframe(
@@ -172,7 +171,6 @@ def train_fusion_from_dataframe(
         p.requires_grad_(False)
         
     # Use micro-batch size for LLM to save memory (fusion batch size can be larger)
-    LLM_MICRO_BATCH_SIZE = 1
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     # Process in batches for pre-computation
@@ -200,9 +198,9 @@ def train_fusion_from_dataframe(
         batch_logits_list = []
         with torch.inference_mode():
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                for j in range(0, len(batch_texts), LLM_MICRO_BATCH_SIZE):
-                    sub_texts = batch_texts[j : j + LLM_MICRO_BATCH_SIZE]
-                    sub_evidences = batch_evidences[j : j + LLM_MICRO_BATCH_SIZE]
+                for j in range(0, len(batch_texts), config.llm_batch_size):
+                    sub_texts = batch_texts[j : j + config.llm_batch_size]
+                    sub_evidences = batch_evidences[j : j + config.llm_batch_size]
                     
                     logits = llm.score_logits(sub_texts, sub_evidences)
                     batch_logits_list.append(logits)

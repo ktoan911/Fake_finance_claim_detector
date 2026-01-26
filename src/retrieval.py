@@ -24,6 +24,102 @@ except ImportError:
 
 from scipy.fft import fft
 from scipy.signal import find_peaks
+import re
+
+try:
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.corpus import wordnet
+    from nltk.stem import WordNetLemmatizer
+    NLTK_AVAILABLE = True
+except ImportError as e:
+    NLTK_AVAILABLE = False
+    logger.warning(f"NLTK not available, advanced preprocessing disabled. Error: {e}")
+
+class TextPreprocessor:
+    """
+    Handles text preprocessing for retrieval:
+    - URL removal
+    - Stopword removal
+    - Lemmatization
+    """
+    def __init__(self):
+        if not NLTK_AVAILABLE:
+            return
+            
+        # Download necessary NLTK data
+        try:
+            nltk.data.find('corpora/stopwords')
+            nltk.data.find('corpora/wordnet')
+            nltk.data.find('tokenizers/punkt')
+            nltk.data.find('taggers/averaged_perceptron_tagger')
+        except LookupError:
+            logger.info("Downloading NLTK resources...")
+            nltk.download('stopwords', quiet=True)
+            nltk.download('wordnet', quiet=True)
+            nltk.download('punkt', quiet=True)
+            nltk.download('punkt_tab', quiet=True)
+            nltk.download('averaged_perceptron_tagger', quiet=True)
+            nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+            
+        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = set(stopwords.words('english'))
+
+    def _get_wordnet_pos(self, treebank_tag):
+        """Map NLTK POS tag to WordNet POS tag"""
+        if treebank_tag.startswith('J'):
+            return wordnet.ADJ
+        elif treebank_tag.startswith('V'):
+            return wordnet.VERB
+        elif treebank_tag.startswith('N'):
+            return wordnet.NOUN
+        elif treebank_tag.startswith('R'):
+            return wordnet.ADV
+        else:
+            return wordnet.NOUN
+
+    def preprocess(self, text: str) -> List[str]:
+        """
+        Preprocess text and return list of tokens.
+        1. Remove URLs
+        2. Lowercase
+        3. Tokenize
+        4. Remove stopwords & Lemmatize (with POS tags)
+        """
+        if not NLTK_AVAILABLE:
+            # Fallback to simple tokenization
+            return re.findall(r'\b\w+\b', text.lower())
+
+        # 1. Remove URLs
+        text = re.sub(r'http\S+|www\.\S+', '', text)
+        
+        # 2. Lowercase
+        text = text.lower()
+        
+        # 3. Tokenize
+        try:
+            tokens = nltk.word_tokenize(text)
+        except LookupError:
+             # Fallback if punkt fails
+             tokens = re.findall(r'\b\w+\b', text)
+        
+        # 4. Remove stopwords and Lemmatize
+        clean_tokens = []
+        
+        # Get POS tags for better lemmatization
+        try:
+            pos_tags = nltk.pos_tag(tokens)
+        except LookupError:
+            # Fallback if tagger fails
+            pos_tags = [(t, 'N') for t in tokens]
+
+        for token, tag in pos_tags:
+            # Simple check for alphanumeric to avoid punctuation
+            if token.isalnum() and token not in self.stop_words:
+                wn_tag = self._get_wordnet_pos(tag)
+                clean_tokens.append(self.lemmatizer.lemmatize(token, wn_tag))
+                
+        return clean_tokens
 
 
 @dataclass
@@ -339,6 +435,7 @@ class KnowledgeAugmentedRetriever:
         )
         
         self.query_expander = QueryExpander() if use_query_expansion else None
+        self.preprocessor = TextPreprocessor()
         
         # Initialize embedding model
         if SENTENCE_TRANSFORMERS_AVAILABLE:
@@ -358,11 +455,8 @@ class KnowledgeAugmentedRetriever:
         logger.info("KnowledgeAugmentedRetriever initialized")
     
     def _tokenize(self, text: str) -> List[str]:
-        """Simple tokenization for BM25"""
-        import re
-        text = text.lower()
-        tokens = re.findall(r'\b\w+\b', text)
-        return tokens
+        """Tokenization using preprocessor"""
+        return self.preprocessor.preprocess(text)
     
     def index_documents(
         self,
@@ -430,39 +524,7 @@ class KnowledgeAugmentedRetriever:
         use_semantic: bool = True,
         candidate_pool_size: int = None
     ) -> List[RetrievalResult]:
-        """
-        Retrieve relevant documents for a query.
-        
-        PAPER-FAITHFUL IMPLEMENTATION:
-        
-        Stage 1 (Optional): FAISS dense retrieval for candidates
-        - Uses BGE embeddings indexed via FAISS
-        - Returns top-N candidates by semantic similarity
-        
-        Stage 2: Rerank with Equation (1) and (8):
-        - Eq.1: Score(q,di) = α·BM25(q,di) + (1-α)·Temporal(di)
-        - Eq.8: Temporal = γ·Recency + (1-γ)·Cyclicity
-        - Eq.9: λt = Sigmoid(Trend)·λbase (adaptive decay)
-        
-        NOTE: Semantic similarity is used ONLY for candidate retrieval,
-        NOT mixed into final scoring (per paper Eq.1 which only mentions BM25).
-        
-        KNOWN DEVIATIONS FROM PAPER:
-        - Using BM25Okapi instead of BM25+ (minor difference)
-        - Normalize BM25 to [0,1] for score stability
-        - Query expansion adapted for fact-checking (not crypto-specific)
-        
-        Args:
-            query: Search query
-            top_k: Number of final results
-            use_temporal: Apply temporal scoring (Eq.8/9)
-            expand_query: Expand query with synonyms
-            use_semantic: Use FAISS for candidate retrieval
-            candidate_pool_size: FAISS pool size. None = score all docs
-            
-        Returns:
-            List of RetrievalResult sorted by Eq.1 score
-        """
+
         if not self.documents:
             logger.warning("No documents indexed")
             return []

@@ -106,62 +106,121 @@ class LLMScorer:
     def _build_prompt(self, text: str, evidence: str = "") -> str:
         return self.prompt_template.format(claim=text, evidence=evidence)
 
-    def score_logits(self, texts: List[str], evidences: Optional[List[str]] = None) -> torch.Tensor:
+    def score_logits(self, texts: List[str], evidences: Optional[List[Any]] = None) -> torch.Tensor:
         """
         Returns LOGITS (not probabilities) for labels in shape [batch, num_labels].
         This is the paper-accurate p_LM(y|q) for Eq.2.
         
-        TRAINING ALIGNMENT:
-        During training, sequence structure is: [BOS, prompt_tokens, label_token, EOS]
-        - Labels mask prompt with -100, keep label_token, mask EOS
-        - CausalLM predicts NEXT token, so at position (prompt_end), it predicts label_token
-        
-        During inference:
-        - We need to extract logits from the position that predicts the label token
-        - This is the second-to-last non-pad position (before EOS)
-        - If no EOS, it's the last position
+        Implements SMART TRUNCATION:
+        - Preserves Claim and Template structure
+        - Formats evidence as numbered list: "1. ...\n2. ..."
+        - Truncates evidence from bottom to fill max_length
         """
         if evidences is None:
-            evidences = [""] * len(texts)
+            evidences = [[]] * len(texts)
             
-        prompts = [self._build_prompt(t, e) for t, e in zip(texts, evidences)]
+        # Prepare batch inputs manually to handle smart truncation
+        batch_input_ids = []
+        batch_attention_mask = []
         
-        # CRITICAL: Reserve space for label tokens to match training truncation
-        # Training: truncates prompt to (max_length - target_len) where target_len ~= 2-3
-        # Inference: must do the same to ensure sequence length consistency
-        # Reserve 3 tokens: 1 for label (True/False/Not) + 1 safety + 1 for EOS
-        reserved_for_label = 3
-        effective_max_length = self.max_length - reserved_for_label
+        # Split template into start (before evidence) and end (after evidence)
+        if "{evidence}" not in self.prompt_template:
+             raise ValueError("Prompt template must contain {evidence} placeholder")
+        template_parts = self.prompt_template.split("{evidence}")
+        template_start_raw = template_parts[0]
+        template_end_raw = template_parts[1]
         
-        inputs = self.tokenizer(
-            prompts,
-            add_special_tokens=True,  # Match training - add BOS token
-            padding=True,
-            truncation=True,
-            max_length=effective_max_length,  # Truncate prompt, reserve space for label
-            return_tensors="pt",
-        ).to(self.device)
+        # Reserve space for label tokens (True/False/Not) + EOS
+        # Training uses: [BOS, prompt, label, EOS]
+        # Inference needs logits at position of last prompt token to predict label
+        # So we need to fit [BOS, prompt] into max_length - 1 (for label prediction space)
+        # But wait, we want to match training exactly.
+        # Training: input = [BOS, prompt, label, EOS] (length <= max_len)
+        # Inference: input = [BOS, prompt] (length <= max_len - 1)
+        # We reserve 2 tokens: 1 for potential label generation (though we don't generate), 1 for EOS safety
+        reserved_tokens = 2 
+        
+        for text, evidence_item in zip(texts, evidences):
+            # 1. Prepare fixed parts
+            template_start = template_start_raw.format(claim=text)
+            template_end = template_end_raw
+            
+            # Tokenize fixed parts
+            start_ids = self.tokenizer(template_start, add_special_tokens=True, truncation=False)["input_ids"]
+            end_ids = self.tokenizer(template_end, add_special_tokens=False, truncation=False)["input_ids"]
+            
+            # 2. Calculate available space for evidence
+            fixed_len = len(start_ids) + len(end_ids)
+            available_for_evidence = self.max_length - fixed_len - reserved_tokens
+            
+            # 3. Process evidence
+            evidence_ids = []
+            if available_for_evidence > 0:
+                # Handle both List[str] (from retriever) and str (from CSV with \n)
+                if isinstance(evidence_item, list):
+                    evidence_list = evidence_item
+                elif isinstance(evidence_item, str):
+                    evidence_list = evidence_item.split('\n')
+                else:
+                    evidence_list = []
+                
+                current_evidence_ids = []
+                for i, item in enumerate(evidence_list):
+                    if not str(item).strip():
+                        continue
+                    
+                    # Format: "1. Evidence text\n"
+                    formatted_item = f"{i+1}. {str(item).strip()}\n"
+                    item_ids = self.tokenizer(formatted_item, add_special_tokens=False)["input_ids"]
+                    
+                    if len(current_evidence_ids) + len(item_ids) <= available_for_evidence:
+                        current_evidence_ids.extend(item_ids)
+                    else:
+                        # Truncate current item to fill remaining space
+                        remaining = available_for_evidence - len(current_evidence_ids)
+                        if remaining > 0:
+                            current_evidence_ids.extend(item_ids[:remaining])
+                        break
+                
+                evidence_ids = current_evidence_ids
+            
+            # 4. Construct full input
+            full_input_ids = start_ids + evidence_ids + end_ids
+            
+            # Truncate if still too long (shouldn't happen with logic above but safety first)
+            if len(full_input_ids) > self.max_length:
+                full_input_ids = full_input_ids[:self.max_length]
+                
+            batch_input_ids.append(full_input_ids)
+            batch_attention_mask.append([1] * len(full_input_ids))
+
+        # Pad batch
+        max_batch_len = max(len(ids) for ids in batch_input_ids)
+        padded_input_ids = []
+        padded_attention_mask = []
+        
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        
+        for ids, mask in zip(batch_input_ids, batch_attention_mask):
+            padding = [pad_id] * (max_batch_len - len(ids))
+            mask_padding = [0] * (max_batch_len - len(ids))
+            
+            # Right padding (match training)
+            padded_input_ids.append(ids + padding)
+            padded_attention_mask.append(mask + mask_padding)
+            
+        input_tensor = torch.tensor(padded_input_ids, dtype=torch.long, device=self.device)
+        mask_tensor = torch.tensor(padded_attention_mask, dtype=torch.long, device=self.device)
 
         with torch.no_grad():
-            outputs = self.model(**inputs)
+            outputs = self.model(input_ids=input_tensor, attention_mask=mask_tensor)
             # outputs.logits: [batch, seq_len, vocab_size]
             
             # Find the position where we predict the label token
-            # Training: [BOS, prompt_tokens, label_token, EOS]
-            #           Model predicts label from position (last_prompt_position)
-            # 
-            # Inference: [BOS, prompt_tokens, PAD...]
-            #            We need logits from last_prompt_position to predict next token (label)
-            #            This is simply the last non-pad position (seq_lengths - 1)
-            
-            attn_mask = inputs["attention_mask"]  # [batch, seq_len]
-            seq_lengths = attn_mask.sum(dim=1)    # [batch] - total non-pad tokens
-            
-            batch_idx = torch.arange(attn_mask.size(0), device=self.model.device)
-            
-            # The prediction position is the last non-pad token (last prompt token)
-            # This position's logits predict the NEXT token, which would be the label
-            pred_pos = seq_lengths - 1  # Last non-pad position
+            # This is the last non-pad position
+            seq_lengths = mask_tensor.sum(dim=1)
+            batch_idx = torch.arange(input_tensor.size(0), device=self.device)
+            pred_pos = seq_lengths - 1
             
             pred_logits = outputs.logits[batch_idx, pred_pos, :]  # [batch, vocab_size]
 
