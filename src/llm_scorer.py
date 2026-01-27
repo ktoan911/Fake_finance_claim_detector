@@ -71,7 +71,7 @@ class LLMScorer:
             self.model = AutoModelForCausalLM.from_pretrained(
                 base_model_path,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map=self.device if self.device != "cpu" else None,
+                device_map="auto",
                 low_cpu_mem_usage=True
             )
             # Load adapter
@@ -81,7 +81,7 @@ class LLMScorer:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map=self.device if self.device != "cpu" else None,
+                device_map="auto",
                 low_cpu_mem_usage=True
             )
             

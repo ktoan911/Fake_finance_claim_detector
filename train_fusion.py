@@ -27,17 +27,45 @@ def main():
     labeled_df = CSVLabeledLoader(args.labeled_csv).load()
     logger.info(f"Labeled data: {len(labeled_df)} samples")
 
-    evidences = labeled_df["evidence"].tolist()
-    timestamps = labeled_df["timestamp"].tolist() if "timestamp" in labeled_df.columns else [None] * len(evidences)
-
-    kb_docs = []
+    def normalize_text(text):
+        """Normalize text for deduplication: lowercase, remove punctuation, extra spaces"""
+        import re
+        # Lowercase
+        text = text.lower()
+        # Remove punctuation (keep alphanumeric and spaces)
+        text = re.sub(r'[^\w\s]', '', text)
+        # Remove extra spaces
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+    
+    # Use dict to deduplicate by normalized text, keeping original text
+    unique_docs = {}
+    
     for evidence, ts in zip(evidences, timestamps):
-        kb_docs.append({
-            "text": str(evidence),
-            "timestamp": ts,
-            "source": "csv"
-        })
-    logger.info(f"Knowledge base built from CSV evidence: {len(kb_docs)} documents")
+        # Split evidence into individual articles
+        # Evidence articles are separated by |||
+        evidence_str = str(evidence)
+        articles = evidence_str.split('|||')
+        
+        for article in articles:
+            article = article.strip()
+            if len(article) > 10:  # Filter out empty or very short strings
+                # Normalize for deduplication key, but store original text
+                norm_key = normalize_text(article)
+                
+                if norm_key not in unique_docs:
+                    unique_docs[norm_key] = {
+                        "text": article,  # Keep original text
+                        "timestamp": ts,
+                        "source": "csv"
+                    }
+                else:
+                    # If duplicate, keep the document with non-None timestamp
+                    if ts is not None and unique_docs[norm_key]["timestamp"] is None:
+                        unique_docs[norm_key]["timestamp"] = ts
+    
+    kb_docs = list(unique_docs.values())
+    logger.info(f"Knowledge base built: {len(kb_docs)} unique documents (deduplicated from {len(evidences)} evidence entries)")
 
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
