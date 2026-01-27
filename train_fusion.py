@@ -38,6 +38,10 @@ def main():
         text = re.sub(r'\s+', ' ', text).strip()
         return text
     
+    # Extract evidence and timestamps from dataframe
+    evidences = labeled_df["evidence"].tolist()
+    timestamps = labeled_df["timestamp"].tolist() if "timestamp" in labeled_df.columns else [None] * len(evidences)
+    
     # Use dict to deduplicate by normalized text, keeping original text
     unique_docs = {}
     
