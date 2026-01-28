@@ -1,16 +1,17 @@
 """
-Generic MongoDB Loader for Knowledge Sources
+MongoDB Knowledge Base Loader
 
-Supports two sources:
-  1) Trusted news/official sources
-  2) Social media (Reddit/Telegram/etc.)
-
-Only prepares documents d_i for retrieval.
-No scoring changes.
+Loads documents from MongoDB for use in the RAG system.
+Expected schema:
+- _id: MongoDB ObjectId
+- title: str
+- body: str  
+- created_utc: int (Unix timestamp)
+- url: str
 """
 
-from datetime import datetime, timezone
 from typing import List, Dict, Optional
+from datetime import datetime, timezone
 from loguru import logger
 
 try:
@@ -18,70 +19,116 @@ try:
     PYMONGO_AVAILABLE = True
 except ImportError:
     PYMONGO_AVAILABLE = False
-    logger.warning("pymongo not available. Install to load MongoDB sources.")
+    logger.warning("pymongo not available. Install with: pip install pymongo")
 
 
-def _parse_timestamp(value):
-    if value is None:
-        return datetime.now(timezone.utc)
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
-    try:
-        return datetime.fromisoformat(str(value))
-    except Exception:
-        return datetime.now(timezone.utc)
-
-
-class MongoSourceLoader:
-    """
-    Load documents from MongoDB with configurable field mapping.
-    """
-
-    def __init__(self, mongo_uri: str, db_name: str, collection_name: str):
-        if not PYMONGO_AVAILABLE:
-            raise ImportError("pymongo is required to load from MongoDB.")
-        self.client = MongoClient(mongo_uri)
-        self.collection = self.client[db_name][collection_name]
-
-    def fetch_documents(
+class MongoKBLoader:
+    """Load knowledge base from MongoDB"""
+    
+    def __init__(
         self,
-        text_fields: List[str],
-        timestamp_field: str,
-        source_label: str,
-        link_field: Optional[str] = None,
-        limit: int = 5000,
-        query: Optional[Dict] = None,
+        mongo_uri: str = "mongodb://localhost:27017/",
+        database: str = "crypto_kb",
+        collection: str = "posts"
+    ):
+        """
+        Initialize MongoDB connection.
+        
+        Args:
+            mongo_uri: MongoDB connection string
+            database: Database name
+            collection: Collection name
+        """
+        if not PYMONGO_AVAILABLE:
+            raise ImportError("pymongo is required. Install with: pip install pymongo")
+        
+        self.client = MongoClient(mongo_uri)
+        self.db = self.client[database]
+        self.collection = self.db[collection]
+        
+        logger.info(f"Connected to MongoDB: {database}.{collection}")
+    
+    def load_documents(
+        self,
+        limit: Optional[int] = None,
+        query: Optional[Dict] = None
     ) -> List[Dict]:
         """
-        Returns list of documents compatible with KnowledgeAugmentedRetriever:
-          { id, text, timestamp, source, metadata }
+        Load documents from MongoDB.
+        
+        Args:
+            limit: Maximum number of documents to load (None = all)
+            query: MongoDB query filter (None = all documents)
+            
+        Returns:
+            List of document dictionaries with fields:
+            - id: str (MongoDB _id converted to string)
+            - text: str (title + body combined)
+            - timestamp: datetime
+            - metadata: dict (url, title, source)
         """
         query = query or {}
-        cursor = self.collection.find(query).limit(limit)
-
+        
+        cursor = self.collection.find(query)
+        if limit:
+            cursor = cursor.limit(limit)
+        
         documents = []
         for doc in cursor:
-            parts = []
-            for f in text_fields:
-                val = doc.get(f)
-                if val:
-                    parts.append(str(val).strip())
-            text = "\n".join([p for p in parts if p])
-            if not text:
+            # Combine title and body for full text
+            title = doc.get('title', '').strip()
+            body = doc.get('body', '').strip()
+            
+            # Combine with clear separation
+            if title and body:
+                text = f"{title}\n\n{body}"
+            elif title:
+                text = title
+            else:
+                text = body
+            
+            # Skip empty documents
+            if not text or len(text) < 10:
                 continue
-
-            ts = _parse_timestamp(doc.get(timestamp_field))
-            metadata = {"source": source_label}
-            if link_field and doc.get(link_field):
-                metadata["link"] = doc.get(link_field)
-
+            
+            # Parse timestamp
+            created_utc = doc.get('created_utc')
+            if created_utc:
+                timestamp = datetime.fromtimestamp(created_utc, tz=timezone.utc)
+            else:
+                timestamp = datetime.now(timezone.utc)
+            
             documents.append({
-                "id": str(doc.get("_id")),
-                "text": text,
-                "timestamp": ts,
-                "source": source_label,
-                "metadata": metadata,
+                'id': str(doc['_id']),
+                'text': text,
+                'timestamp': timestamp,
+                'metadata': {
+                    'url': doc.get('url', ''),
+                    'title': title,
+                    'source': 'mongodb'
+                }
             })
-
-        logger.info(f"Loaded {len(documents)} documents from {source_label}")
+        
+        logger.info(f"Loaded {len(documents)} documents from MongoDB")
         return documents
+    
+    def close(self):
+        """Close MongoDB connection"""
+        self.client.close()
+        logger.info("MongoDB connection closed")
+
+
+if __name__ == "__main__":
+    # Example usage
+    loader = MongoKBLoader()
+    docs = loader.load_documents(limit=10)
+    
+    print(f"Loaded {len(docs)} documents")
+    if docs:
+        print("\nFirst document:")
+        print(f"ID: {docs[0]['id']}")
+        print(f"Text preview: {docs[0]['text'][:200]}...")
+        print(f"Timestamp: {docs[0]['timestamp']}")
+        print(f"URL: {docs[0]['metadata']['url']}")
+    
+    loader.close()
