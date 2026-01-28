@@ -438,11 +438,12 @@ def main():
     logger.info(f"  Columns: {list(test_df.columns)}")
     
     # Build knowledge base
-    from datetime import datetime
+    from datetime import datetime, timezone
     knowledge_base = []
     for idx, row in test_df.iterrows():
         # Use incrementing timestamps to avoid all being same time
-        base_time = datetime(2024, 1, 1, 0, 0, 0)
+        # Make timezone-aware (UTC) to match retrieval system expectations
+        base_time = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
         # Add idx hours to spread timestamps out
         timestamp = base_time.replace(hour=idx % 24, day=1 + (idx // 24) % 28)
         
