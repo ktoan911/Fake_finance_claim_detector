@@ -438,11 +438,17 @@ def main():
     logger.info(f"  Columns: {list(test_df.columns)}")
     
     # Build knowledge base
+    from datetime import datetime
     knowledge_base = []
-    for _, row in test_df.iterrows():
+    for idx, row in test_df.iterrows():
+        # Use incrementing timestamps to avoid all being same time
+        base_time = datetime(2024, 1, 1, 0, 0, 0)
+        # Add idx hours to spread timestamps out
+        timestamp = base_time.replace(hour=idx % 24, day=1 + (idx // 24) % 28)
+        
         knowledge_base.append({
             "text": str(row["claim"]) if "claim" in test_df.columns else str(row["text"]),
-            "timestamp": "2024-01-01T00:00:00"
+            "timestamp": timestamp
         })
     
     # ==========================================
