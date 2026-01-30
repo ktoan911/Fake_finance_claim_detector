@@ -1,6 +1,6 @@
 # Data files
 data/
-lora_llm/
+artifacts/
 
 # Python
 __pycache__/
@@ -36,3 +36,6 @@ models/lora_llm/
 # OS
 .DS_Store
 Thumbs.db
+
+#file 
+test.py

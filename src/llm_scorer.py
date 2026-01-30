@@ -20,12 +20,7 @@ except ImportError:
     torch = None  # type: ignore
 
 
-# Mapping from internal labels to vocab words (matching lora_trainer.py)
-LABEL_TO_WORD = {
-    "SUPPORTED": "True",
-    "REFUTED": "False",
-    "NEI": "Not",
-}
+# Labels are already words (True/False/Not) - no mapping needed
 
 
 class LLMScorer:
@@ -89,15 +84,15 @@ class LLMScorer:
 
         self.labels = labels or LABEL_LIST
         
-        # Get token IDs for vocab words (True/False/Not)
+        # Get token IDs for labels (already words: True/False/Not)
         self.label_token_ids = {}
         for label in self.labels:
-            word = LABEL_TO_WORD.get(label, "Not")
-            tokens = self.tokenizer(word, add_special_tokens=False)["input_ids"]
+            # Use label directly as it's already a word
+            tokens = self.tokenizer(label, add_special_tokens=False)["input_ids"]
             if len(tokens) == 0:
-                raise ValueError(f"Word '{word}' tokenized to 0 tokens!")
+                raise ValueError(f"Label '{label}' tokenized to 0 tokens!")
             self.label_token_ids[label] = tokens[0]
-            logger.debug(f"Label '{label}' -> '{word}' -> token_id {tokens[0]}")
+            logger.debug(f"Label '{label}' -> token_id {tokens[0]}")
 
         self.prompt_template = prompt_template or PROMPT_TEMPLATE
         logger.info(f"LLMScorer initialized with model: {model_name}")

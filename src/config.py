@@ -3,10 +3,10 @@ Shared configuration for LoRA training and Fusion training.
 Ensures consistency in prompts and labels across the pipeline.
 """
 
-# Label mapping
-LABEL_LIST = ["SUPPORTED", "REFUTED", "NEI"]
-LABEL_TO_ID = {"SUPPORTED": 0, "REFUTED": 1, "NEI": 2}
-ID_TO_LABEL = {0: "SUPPORTED", 1: "REFUTED", 2: "NEI"}
+# Label mapping - Direct model output labels
+LABEL_LIST = ["True", "False", "Not"]
+LABEL_TO_ID = {"True": 0, "False": 1, "Not": 2}
+ID_TO_LABEL = {0: "True", 1: "False", 2: "Not"}
 
 # Prompt template used for both LoRA fine-tuning and Fusion scoring
 # MUST include {claim} and {evidence} placeholders

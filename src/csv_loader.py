@@ -4,7 +4,7 @@ CSV Labeled Data Loader
 Expected CSV columns (minimum):
   - text (string) OR claim (string)
   - evidence (string)
-  - label (int or string: SUPPORTED/REFUTED/NEI/true/false/neutral)
+  - label (int or string: True/False/Not or TRUE/FALSE/NEUTRAL or SUPPORTED/REFUTED/NEI)
 
 Optional:
   - timestamp (ISO string or unix seconds)
@@ -50,21 +50,21 @@ class CSVLabeledLoader:
             return ev_str
         
         df["evidence"] = df["evidence"].apply(parse_evidence)
-        # Allow string/boolean labels
+        # Allow string/boolean labels - Map directly to True/False/Not IDs
         if df["label"].dtype == object or df["label"].dtype == bool:
             label_map = {
-                "SUPPORTED": 0,
-                "REFUTED": 1,
-                "NEI": 2,
-                "TRUE": 0,
-                "FALSE": 1,
-                "NEUTRAL": 2,
+                # True variants (ID: 0)
+                "TRUE": 0, "SUPPORTED": 0, "LEGIT": 0, "LEGITIMATE": 0, "0": 0,
+                # False variants (ID: 1)
+                "FALSE": 1, "REFUTED": 1, "SCAM": 1, "1": 1,
+                # Not variants (ID: 2)
+                "NEUTRAL": 2, "NEI": 2, "NOT": 2, "UNKNOWN": 2, "2": 2,
             }
             df["label"] = df["label"].astype(str).str.upper().map(label_map)
 
         unmapped = df["label"].isna().sum()
         if unmapped:
-            logger.warning(f"{unmapped} labels could not be mapped. Defaulting to NEI.")
+            logger.warning(f"{unmapped} labels could not be mapped. Defaulting to Not (2).")
             df["label"] = df["label"].fillna(2)
 
         df["label"] = df["label"].astype(int)

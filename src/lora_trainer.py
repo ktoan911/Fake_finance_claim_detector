@@ -59,27 +59,20 @@ def _get_label_token_ids(tokenizer, labels: list = None):
     if labels is None:
         labels = LABEL_LIST
     
-    # Map internal labels to output words the model already knows
-    LABEL_TO_WORD = {
-        "SUPPORTED": "True",
-        "REFUTED": "False", 
-        "NEI": "Not",
-    }
-    
+    # Labels are already words (True/False/Not) - no mapping needed
     label_token_ids = {}
     for label in labels:
-        # Get the word form for this label
-        word = LABEL_TO_WORD.get(label, "Not")
-        tokens = tokenizer(word, add_special_tokens=False)["input_ids"]
+        # Use label directly as it's already a word
+        tokens = tokenizer(label, add_special_tokens=False)["input_ids"]
         
         if len(tokens) == 0:
-            raise ValueError(f"Word '{word}' tokenized to 0 tokens!")
+            raise ValueError(f"Label '{label}' tokenized to 0 tokens!")
         
         # Use first token (for multi-token words)
         # Space prefix usually makes it a single token for common words
         label_token_ids[label] = tokens[0]
         
-        logger.debug(f"Label '{label}' -> '{word}' -> token_id {tokens[0]} (total {len(tokens)} tokens)")
+        logger.debug(f"Label '{label}' -> token_id {tokens[0]} (total {len(tokens)} tokens)")
     
     return label_token_ids
 
@@ -109,7 +102,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     true_labels = []
     
     for batch_idx in range(len(logits)):
-        # Logits are already extracted for label tokens: [3] = [SUPPORTED, REFUTED, NEI]
+        # Logits are already extracted for label tokens: [3] = [True, False, Not]
         label_logits_array = logits[batch_idx]  # Shape: [3]
         
         # Apply softmax to get probabilities (pLM)
@@ -188,25 +181,27 @@ def _prepare_classification_dataset(
     targets = []
     
     def normalize_label(label_value) -> str:
+        """Normalize label to True/False/Not."""
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
             if idx == 0:
-                return "SUPPORTED"
+                return "True"
             if idx == 1:
-                return "REFUTED"
-            return "NEI"
+                return "False"
+            return "Not"
         
         label_upper = str(label_value).upper().strip()
-        if label_upper in ["SUPPORTED", "REFUTED", "NEI"]:
-            return label_upper
-        # CRITICAL FIX: Add TRUE/FALSE/NEUTRAL mappings (from finfact dataset)
-        if label_upper in ["FALSE", "SCAM", "1"]:
-            return "REFUTED"
-        if label_upper in ["TRUE", "LEGIT", "LEGITIMATE", "0"]:
-            return "SUPPORTED"
-        if label_upper in ["NEUTRAL"]:
-            return "NEI"
-        return "NEI"
+        
+        # Map all variants to True/False/Not
+        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
+            return "True"
+        if label_upper in ["FALSE", "REFUTED", "SCAM", "1"]:
+            return "False"
+        if label_upper in ["NEUTRAL", "NEI", "NOT", "UNKNOWN", "2"]:
+            return "Not"
+        
+        # Default to Not
+        return "Not"
     
     for label in labels:
         target = normalize_label(label)
@@ -242,14 +237,8 @@ def _prepare_classification_dataset(
             start_ids = tokenizer(template_start, add_special_tokens=True, truncation=False)["input_ids"]
             end_ids = tokenizer(template_end, add_special_tokens=False, truncation=False)["input_ids"]
             
-            # Tokenize target
-            LABEL_TO_WORD = {
-                "SUPPORTED": "True",
-                "REFUTED": "False",
-                "NEI": "Not",
-            }
-            target_word = LABEL_TO_WORD.get(target, "Not")
-            target_ids = tokenizer(target_word, add_special_tokens=False)["input_ids"]
+            # Tokenize target (already a word: True/False/Not)
+            target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
             
             if tokenizer.eos_token_id is not None:
                 target_ids = target_ids + [tokenizer.eos_token_id]
@@ -371,7 +360,7 @@ def train_lora_classification(
     Args:
         claims: List of claims to verify
         evidences: List of retrieved evidence for each claim
-        labels: List of ground truth labels (SUPPORTED/REFUTED/NEI)
+        labels: List of ground truth labels (True/False/Not or dataset variants)
         config: Training configuration
         gradient_accumulation_steps: Number of gradient accumulation steps
         skip_final_eval: Skip final evaluation to save memory
@@ -442,8 +431,8 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # NO special tokens needed - using existing vocab (True/False/Unknown)
-        logger.info("Using existing vocabulary tokens for labels: True/False/Unknown")
+        # NO special tokens needed - using existing vocab (True/False/Not)
+        logger.info("Using existing vocabulary tokens for labels: True/False/Not")
         
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,

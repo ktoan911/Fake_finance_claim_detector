@@ -97,8 +97,8 @@ def predict_claim(
     Returns:
         Dictionary with prediction results
     """
-    # 1. Retrieve evidence
-    results = retriever.retrieve(claim, top_k=config['top_k'])
+    # 1. Retrieve evidence (FAISS filtering: top 100 candidates, then BM25 re-rank)
+    results = retriever.retrieve(claim, top_k=config['top_k'], candidate_pool_size=100)
     
     # 2. Extract retrieval features
     features = []

@@ -119,10 +119,11 @@ def precompute_all_data(
         batch_texts = texts[i:i + batch_size]
         batch_gold_evidences = gold_evidences[i:i + batch_size]
         
-        # 1. Retrieval (once per sample)
+        # 1. Retrieval (once per sample) - FAISS filtering enabled
         batch_retrieval_features = []
         batch_retrieved_evidences = []
         for t in batch_texts:
+            # Note: _build_retrieval_features now uses candidate_pool_size=100 internally
             feats, retrieved_evidence = _build_retrieval_features(retriever, t, top_k)
             batch_retrieval_features.append(feats)
             batch_retrieved_evidences.append(retrieved_evidence)

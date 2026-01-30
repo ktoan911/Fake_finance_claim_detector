@@ -37,29 +37,32 @@ class FusionTrainingConfig:
 
 
 def _normalize_label(label_value) -> int:
-    """Convert label to integer ID."""
+    """Convert label to integer ID (True=0, False=1, Not=2)."""
     if isinstance(label_value, (int, float)):
         return int(label_value)
     
     label_upper = str(label_value).upper().strip()
     
-    if label_upper in ["SUPPORTED", "TRUE", "LEGIT", "0"]:
-        return 0
-    if label_upper in ["REFUTED", "FALSE", "SCAM", "1"]:
-        return 1
-    if label_upper in ["NEI", "NOT", "NEUTRAL", "UNKNOWN", "2"]:
-        return 2
+    # Map all variants to True/False/Not IDs
+    if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
+        return 0  # True
+    if label_upper in ["FALSE", "REFUTED", "SCAM", "1"]:
+        return 1  # False
+    if label_upper in ["NEUTRAL", "NEI", "NOT", "UNKNOWN", "2"]:
+        return 2  # Not
     
-    return 2
+    return 2  # Default to Not
 
 
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever,
     text: str,
     top_k: int,
+    candidate_pool_size: int = 100
 ) -> tuple:
     """Returns (features, retrieved_evidence_text)."""
-    results = retriever.retrieve(text, top_k=top_k)
+    # FAISS filtering: top 100 candidates, then BM25 re-rank to get top_k
+    results = retriever.retrieve(text, top_k=top_k, candidate_pool_size=candidate_pool_size)
     features = []
     evidence_texts = []
     
