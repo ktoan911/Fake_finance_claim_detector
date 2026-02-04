@@ -42,7 +42,7 @@ if TORCH_AVAILABLE:
             self,
             input_dim: int = 64,
             hidden_dim: int = 128,
-            output_dim: int = 3,
+            output_dim: int = 1,
             dropout: float = 0.1
         ):
             super().__init__()
@@ -72,7 +72,8 @@ if TORCH_AVAILABLE:
         Implements Equation (2) from the paper:
         pfinal(y|q, D) = σ(β · pLM + (1 − β) · MLP(pret))
         
-        Where σ is Softmax for multi-class (3 labels) or Sigmoid for binary.
+        Where σ is Sigmoid for binary classification (num_classes=2).
+        For binary: MLP outputs 1 logit, sigmoid gives P(True), P(False)=1-P(True)
         
         With contrastive loss from Equation (3):
         L = -log(e^sp / Σe^sn) + λ||β||²
@@ -82,7 +83,7 @@ if TORCH_AVAILABLE:
             self,
             retrieval_input_dim: int = 64,
             hidden_dim: int = 128,
-            num_classes: int = 3,
+            num_classes: int = 2,
             initial_beta: float = 0.5,
             lambda_reg: float = 0.01,
             learn_beta: bool = True
@@ -91,6 +92,7 @@ if TORCH_AVAILABLE:
             
             self.num_classes = num_classes
             self.lambda_reg = lambda_reg
+            self.is_binary = (num_classes == 2)
             
             # Trainable gating parameter β
             # We use a logit parameter and apply sigmoid in forward() to ensure β ∈ [0, 1]
@@ -100,13 +102,16 @@ if TORCH_AVAILABLE:
             )
             
             # MLP for projecting retrieval scores
+            # For binary classification, output 1 logit; else output num_classes logits
+            mlp_output_dim = 1 if self.is_binary else num_classes
             self.retrieval_mlp = RetrievalMLP(
                 input_dim=retrieval_input_dim,
                 hidden_dim=hidden_dim,
-                output_dim=num_classes
+                output_dim=mlp_output_dim
             )
             
-            logger.info(f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}")
+            activation_type = "sigmoid" if self.is_binary else "softmax"
+            logger.info(f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}, activation={activation_type}")
         
         def _inverse_sigmoid(self, x: float) -> float:
             """Inverse sigmoid for initialization"""
@@ -125,28 +130,48 @@ if TORCH_AVAILABLE:
         ) -> FusionOutput:
             """Forward pass implementing Equation (2): β·pLM + (1-β)·MLP(pret)."""
             
-            # Check shapes
             batch_size = lm_logits.size(0)
-            assert lm_logits.size(1) == self.num_classes, \
-                f"lm_logits shape mismatch: expected [B, {self.num_classes}], got {lm_logits.shape}"
-            
-            # Get current beta (constrained to [0,1] via sigmoid)
             beta = self.beta
             
             # Project retrieval features to label space
             retrieval_logits = self.retrieval_mlp(retrieval_features)
             
-            # Check retrieval logits shape
-            assert retrieval_logits.size() == (batch_size, self.num_classes), \
-                f"retrieval_logits shape mismatch: expected [{batch_size}, {self.num_classes}], got {retrieval_logits.shape}"
-            
-            # Fuse according to Equation (2)
-            # NOTE: These are raw LOGITS, not probabilities. No activation applied yet.
-            fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits
-            
-            # Use softmax for multi-class (not sigmoid which is for binary)
-            # This is p_final in the paper.
-            final_probs = torch.softmax(fused_logits, dim=-1)
+            if self.is_binary:
+                # Binary classification: use sigmoid
+                # lm_logits: [B, 2] -> convert to single logit [B, 1]
+                # Take difference: logit_True - logit_False
+                assert lm_logits.size(1) == 2, \
+                    f"Binary mode: lm_logits should be [B, 2], got {lm_logits.shape}"
+                
+                lm_single_logit = lm_logits[:, 0:1] - lm_logits[:, 1:2]  # [B, 1]
+                
+                # retrieval_logits already [B, 1] from MLP
+                assert retrieval_logits.size() == (batch_size, 1), \
+                    f"Binary mode: retrieval_logits should be [B, 1], got {retrieval_logits.shape}"
+                
+                # Fuse: β·pLM + (1-β)·MLP(pret)
+                fused_single_logit = beta * lm_single_logit + (1 - beta) * retrieval_logits
+                
+                # Apply sigmoid to get P(True)
+                prob_true = torch.sigmoid(fused_single_logit)  # [B, 1]
+                prob_false = 1 - prob_true
+                
+                # Concatenate to [B, 2] for compatibility
+                final_probs = torch.cat([prob_true, prob_false], dim=-1)
+                
+                # fused_logits for loss computation (we'll use the single logit)
+                fused_logits = fused_single_logit.squeeze(-1)  # [B]
+                
+            else:
+                # Multi-class: use softmax
+                assert lm_logits.size(1) == self.num_classes, \
+                    f"lm_logits shape mismatch: expected [B, {self.num_classes}], got {lm_logits.shape}"
+                
+                assert retrieval_logits.size() == (batch_size, self.num_classes), \
+                    f"retrieval_logits shape mismatch: expected [{batch_size}, {self.num_classes}], got {retrieval_logits.shape}"
+                
+                fused_logits = beta * lm_logits + (1 - beta) * retrieval_logits
+                final_probs = torch.softmax(fused_logits, dim=-1)
             
             return FusionOutput(
                 final_probs=final_probs,

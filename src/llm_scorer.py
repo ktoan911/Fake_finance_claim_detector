@@ -1,10 +1,3 @@
-"""
-LLM Scorer - Paper-accurate implementation
-
-Computes p_LM(y|q) logits for classification using a causal LLM.
-Returns LOGITS (not probabilities) as per Eq.2: β·pLM + (1-β)·MLP(pret)
-"""
-
 from typing import List, Any, Optional
 from loguru import logger
 from .config import PROMPT_TEMPLATE, LABEL_LIST
@@ -26,7 +19,7 @@ except ImportError:
 class LLMScorer:
     """
     Get LM logits for labels using a prompt.
-    Uses existing vocabulary tokens: True, False, Not.
+    Uses existing vocabulary tokens: True, False.
     Returns LOGITS, not probabilities (for fusion layer per Eq.2).
     """
 
@@ -84,7 +77,7 @@ class LLMScorer:
 
         self.labels = labels or LABEL_LIST
         
-        # Get token IDs for labels (already words: True/False/Not)
+        # Get token IDs for labels (already words: True/False)
         self.label_token_ids = {}
         for label in self.labels:
             # Use label directly as it's already a word
@@ -125,7 +118,7 @@ class LLMScorer:
         template_start_raw = template_parts[0]
         template_end_raw = template_parts[1]
         
-        # Reserve space for label tokens (True/False/Not) + EOS
+        # Reserve space for label tokens (True/False) + EOS
         # Training uses: [BOS, prompt, label, EOS]
         # Inference needs logits at position of last prompt token to predict label
         # So we need to fit [BOS, prompt] into max_length - 1 (for label prediction space)

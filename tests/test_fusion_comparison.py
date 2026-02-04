@@ -206,7 +206,8 @@ def test_fusion_fast(
         with torch.inference_mode():
             retrieval_encoded = retrieval_encoder(batch_retrieval)
             output = fusion(batch_logits, retrieval_encoded)
-            predictions = torch.argmax(output.fused_logits, dim=-1).cpu().numpy()
+            # Use final_probs for predictions (works for both binary and multi-class)
+            predictions = torch.argmax(output.final_probs, dim=-1).cpu().numpy()
         
         all_predictions.extend(predictions.tolist())
     

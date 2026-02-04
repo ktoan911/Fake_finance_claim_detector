@@ -79,13 +79,13 @@ def _get_label_token_ids(tokenizer, labels: list = None):
 
 def compute_metrics(eval_pred, tokenizer, label_token_ids):
     """
-    Compute F1, Precision, Recall, Accuracy for evaluation.
+    Compute F1, Precision, Recall, Accuracy for binary classification evaluation.
     
     PAPER-ACCURATE: Extracts pLM(y|q) from logits, not from text generation.
     
     Args:
         eval_pred: Tuple of (predictions, labels)
-            - predictions: preprocessed logits with shape [batch, 3] (label logits only)
+            - predictions: preprocessed logits with shape [batch, 2] (label logits only)
             - labels: label IDs with shape [batch, seq_len], -100 for masked positions
         tokenizer: Tokenizer to decode labels
         label_token_ids: Dict mapping label names to their token IDs
@@ -95,15 +95,15 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     """
     logits, labels = eval_pred
     
-    # logits shape: [batch, 3] - already preprocessed to label logits only!
+    # logits shape: [batch, 2] - already preprocessed to label logits only!
     # labels shape: [batch, seq_len]
     
     pred_labels = []
     true_labels = []
     
     for batch_idx in range(len(logits)):
-        # Logits are already extracted for label tokens: [3] = [True, False, Not]
-        label_logits_array = logits[batch_idx]  # Shape: [3]
+        # Logits are already extracted for label tokens: [2] = [True, False]
+        label_logits_array = logits[batch_idx]  # Shape: [2]
         
         # Apply softmax to get probabilities (pLM)
         exp_logits = np.exp(label_logits_array - np.max(label_logits_array))  # numerical stability
@@ -119,14 +119,14 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         label_positions = np.where(batch_labels != -100)[0]
         
         if len(label_positions) == 0:
-            logger.warning(f"Sample {batch_idx}: No valid label position found, using NEI as default")
-            true_labels.append(LABEL_TO_ID["NEI"])
+            logger.warning(f"Sample {batch_idx}: No valid label position found, using False as default")
+            true_labels.append(LABEL_TO_ID["False"])
             continue
         valid_label_ids = batch_labels[label_positions]
         true_label_token = valid_label_ids[0]  # First token of label
         
         # Map back to label name
-        true_label = "NEI"  # default
+        true_label = "False"  # default
         for label_name, token_id in label_token_ids.items():
             if token_id == true_label_token:
                 true_label = label_name
@@ -147,10 +147,11 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     pred_labels = np.array(pred_labels)
     true_labels = np.array(true_labels)
     
-    # Compute metrics
+    # Compute metrics (binary classification)
     metrics = {
         "f1_macro": f1_score(true_labels, pred_labels, average="macro", zero_division=0),
         "f1_weighted": f1_score(true_labels, pred_labels, average="weighted", zero_division=0),
+        "f1_binary": f1_score(true_labels, pred_labels, average="binary", pos_label=0, zero_division=0),  # True as positive
         "precision_macro": precision_score(true_labels, pred_labels, average="macro", zero_division=0),
         "recall_macro": recall_score(true_labels, pred_labels, average="macro", zero_division=0),
         "accuracy": accuracy_score(true_labels, pred_labels),
@@ -181,27 +182,23 @@ def _prepare_classification_dataset(
     targets = []
     
     def normalize_label(label_value) -> str:
-        """Normalize label to True/False/Not."""
+        """Normalize label to binary True/False."""
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
             if idx == 0:
                 return "True"
-            if idx == 1:
+            else:
                 return "False"
-            return "Not"
         
         label_upper = str(label_value).upper().strip()
         
-        # Map all variants to True/False/Not
+        # Map all variants to True/False (binary classification)
         if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
             return "True"
-        if label_upper in ["FALSE", "REFUTED", "SCAM", "1"]:
+        # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
+        # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN
+        else:
             return "False"
-        if label_upper in ["NEUTRAL", "NEI", "NOT", "UNKNOWN", "2"]:
-            return "Not"
-        
-        # Default to Not
-        return "Not"
     
     for label in labels:
         target = normalize_label(label)
@@ -237,7 +234,7 @@ def _prepare_classification_dataset(
             start_ids = tokenizer(template_start, add_special_tokens=True, truncation=False)["input_ids"]
             end_ids = tokenizer(template_end, add_special_tokens=False, truncation=False)["input_ids"]
             
-            # Tokenize target (already a word: True/False/Not)
+            # Tokenize target (already a word: True/False)
             target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
             
             if tokenizer.eos_token_id is not None:
@@ -431,8 +428,8 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # NO special tokens needed - using existing vocab (True/False/Not)
-        logger.info("Using existing vocabulary tokens for labels: True/False/Not")
+        # NO special tokens needed - using existing vocab (True/False)
+        logger.info("Using existing vocabulary tokens for binary labels: True/False")
         
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
@@ -519,24 +516,24 @@ def train_lora_classification(
     # Without this, logits accumulation causes CUDA OOM (22GB+ for 337 samples)
     def preprocess_logits_for_metrics(logits, labels):
         """
-        Reduce full logits [batch, seq_len, vocab_size] to label logits [batch, 3]
+        Reduce full logits [batch, seq_len, vocab_size] to label logits [batch, 2]
         BEFORE accumulation to save massive amounts of memory.
         
         For each sample, we extract:
         - Find label position from labels
         - Apply CausalLM shift (pred_pos = label_pos - 1)
-        - Extract logits for 3 label tokens only
+        - Extract logits for 2 label tokens only (True/False)
         
-        Memory savings: ~65MB/sample → ~200 bytes/sample (300x reduction!)
+        Memory savings: ~65MB/sample → ~100 bytes/sample (650x reduction!)
         """
         # logits: [batch, seq_len, vocab_size]
         # labels: [batch, seq_len]
         batch_size = logits.shape[0]
         
-        # Pre-allocate for label logits only [batch, 3]
-        label_logits_batch = torch.zeros((batch_size, 3), device=logits.device, dtype=logits.dtype)
+        # Pre-allocate for label logits only [batch, 2] for binary classification
+        label_logits_batch = torch.zeros((batch_size, 2), device=logits.device, dtype=logits.dtype)
         
-        # Extract token IDs for labels
+        # Extract token IDs for labels (True, False)
         label_token_id_list = [label_token_ids[label] for label in LABEL_LIST]
         
         for i in range(batch_size):
@@ -555,12 +552,12 @@ def train_lora_classification(
                 continue
             
             # Extract logits at prediction position for label tokens only
-            # This is the key: extract ONLY 3 values instead of entire vocab
+            # This is the key: extract ONLY 2 values instead of entire vocab
             for j, token_id in enumerate(label_token_id_list):
                 label_logits_batch[i, j] = logits[i, pred_pos, token_id]
         
-        # Return reduced logits [batch, 3] instead of [batch, seq_len, vocab_size]
-        # This is ~300x smaller!
+        # Return reduced logits [batch, 2] instead of [batch, seq_len, vocab_size]
+        # This is ~650x smaller for binary classification!
         return label_logits_batch
     
     trainer = Trainer(

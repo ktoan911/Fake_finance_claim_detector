@@ -538,8 +538,8 @@ class KnowledgeAugmentedRetriever:
         expand_query: bool = True,
         use_semantic: bool = True,
         candidate_pool_size: int = None,
-        bm25_top_k: int = 30,
-        temporal_top_k: int = 20
+        bm25_top_k: int = 100,
+        temporal_top_k: int = 50
     ) -> List[RetrievalResult]:
 
         if not self.documents:

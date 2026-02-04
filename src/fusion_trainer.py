@@ -37,31 +37,31 @@ class FusionTrainingConfig:
 
 
 def _normalize_label(label_value) -> int:
-    """Convert label to integer ID (True=0, False=1, Not=2)."""
+    """Convert label to integer ID for binary classification (True=0, False=1)."""
     if isinstance(label_value, (int, float)):
-        return int(label_value)
+        idx = int(label_value)
+        # Map: 0->True, anything else->False
+        return 0 if idx == 0 else 1
     
     label_upper = str(label_value).upper().strip()
     
-    # Map all variants to True/False/Not IDs
+    # Map all variants to binary True/False IDs
     if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
         return 0  # True
-    if label_upper in ["FALSE", "REFUTED", "SCAM", "1"]:
+    # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
+    # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN
+    else:
         return 1  # False
-    if label_upper in ["NEUTRAL", "NEI", "NOT", "UNKNOWN", "2"]:
-        return 2  # Not
-    
-    return 2  # Default to Not
 
 
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever,
     text: str,
     top_k: int,
-    candidate_pool_size: int = 100
+    candidate_pool_size: int = 500
 ) -> tuple:
     """Returns (features, retrieved_evidence_text)."""
-    # FAISS filtering: top 100 candidates, then BM25 re-rank to get top_k
+    # FAISS filtering: top 500 candidates, then BM25 re-rank to get top_k
     results = retriever.retrieve(text, top_k=top_k, candidate_pool_size=candidate_pool_size)
     features = []
     evidence_texts = []
@@ -261,8 +261,18 @@ def train_fusion_from_dataframe(
             output = fusion(b_llm_logits, retrieval_features)
             fused_logits = output.fused_logits
 
-            # Cross-entropy loss
-            ce_loss = F.cross_entropy(fused_logits, b_labels)
+            # Loss computation
+            if num_classes == 2:
+                # Binary classification: use BCEWithLogitsLoss
+                # fused_logits: [B] (single logit per sample)
+                # labels need to be float [B] with values 0.0 or 1.0
+                # Label 0 = True, Label 1 = False, so we need to flip for BCE
+                # BCE expects: 1.0 for positive class (True), 0.0 for negative class (False)
+                target_binary = (b_labels == 0).float()  # Convert: 0->1.0 (True), 1->0.0 (False)
+                ce_loss = F.binary_cross_entropy_with_logits(fused_logits, target_binary)
+            else:
+                # Multi-class: use CrossEntropyLoss
+                ce_loss = F.cross_entropy(fused_logits, b_labels)
             
             # Add beta regularization (L = CE + λ||β||²)
             beta_reg = fusion.lambda_reg * (fusion.beta ** 2)
@@ -275,7 +285,14 @@ def train_fusion_from_dataframe(
 
             # Track metrics
             total_loss += loss.item()
-            preds = torch.argmax(fused_logits, dim=-1)
+            
+            if num_classes == 2:
+                # Binary: predictions from probabilities (final_probs[:, 0] = P(True))
+                preds = (output.final_probs[:, 0] > 0.5).long()  # 0 if P(True) > 0.5, else 1
+            else:
+                # Multi-class: argmax
+                preds = torch.argmax(fused_logits, dim=-1)
+            
             correct += (preds == b_labels).sum().item()
             total += len(b_labels)
             num_batches += 1
