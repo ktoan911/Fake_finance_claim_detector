@@ -113,12 +113,13 @@ def train_fusion_from_dataframe(
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
 
-    # Initialize retriever
+    # Initialize retriever with Cross-Encoder
     retriever = KnowledgeAugmentedRetriever(
         alpha=config.alpha,
         lambda_decay=config.lambda_decay,
         gamma=config.gamma,
-        use_query_expansion=True
+        use_query_expansion=True,
+        use_cross_encoder=True  # Enable 4-stage pipeline
     )
     retriever.index_documents(knowledge_base, text_field="text", timestamp_field="timestamp")
     logger.info(f"Indexed {len(knowledge_base)} documents in retriever")

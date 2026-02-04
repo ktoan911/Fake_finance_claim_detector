@@ -16,11 +16,12 @@ except ImportError:
     logger.warning("FAISS not available, using numpy-based similarity")
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
     logger.warning("SentenceTransformers not available, using TF-IDF")
+    CrossEncoder = None
 
 from scipy.fft import fft
 from scipy.signal import find_peaks
@@ -395,22 +396,24 @@ class QueryExpander:
 
 class KnowledgeAugmentedRetriever:
     """
-    Main retrieval system implementing Section 3.1.
+    Main retrieval system implementing Section 3.1 + Cross-Encoder.
     
     Combines:
-    - BM25 for lexical matching
-    - BGE embeddings for semantic search (via FAISS)
-    - Temporal scoring for recency awareness
-    - Cycle-aware scoring for pattern detection
+    - BGE embeddings for semantic search (via FAISS) - Stage 1
+    - BM25 for lexical matching - Stage 2
+    - Temporal scoring for recency awareness - Stage 3
+    - Cross-Encoder for final accurate re-ranking - Stage 4
     """
     
     def __init__(
         self,
         embedding_model: str = "BAAI/bge-small-en-v1.5",
+        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
         gamma: float = 0.5,
         use_query_expansion: bool = True,
+        use_cross_encoder: bool = True,
         index_path: str = None
     ):
         """
@@ -426,6 +429,7 @@ class KnowledgeAugmentedRetriever:
         """
         self.alpha = alpha
         self.index_path = index_path
+        self.use_cross_encoder = use_cross_encoder
         
         # Initialize components
         self.temporal_scorer = TemporalScorer(
@@ -437,7 +441,7 @@ class KnowledgeAugmentedRetriever:
         self.query_expander = QueryExpander() if use_query_expansion else None
         self.preprocessor = TextPreprocessor()
         
-        # Initialize embedding model
+        # Initialize embedding model (Bi-Encoder for FAISS)
         if SENTENCE_TRANSFORMERS_AVAILABLE:
             logger.info(f"Loading embedding model: {embedding_model}")
             self.encoder = SentenceTransformer(embedding_model)
@@ -445,6 +449,17 @@ class KnowledgeAugmentedRetriever:
         else:
             self.encoder = None
             self.embedding_dim = 384  # Default
+        
+        # Initialize Cross-Encoder for final re-ranking
+        self.cross_encoder = None
+        if use_cross_encoder and SENTENCE_TRANSFORMERS_AVAILABLE and CrossEncoder is not None:
+            try:
+                logger.info(f"Loading Cross-Encoder: {cross_encoder_model}")
+                self.cross_encoder = CrossEncoder(cross_encoder_model, max_length=512)
+                logger.info("✓ Cross-Encoder loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load Cross-Encoder: {e}. Proceeding without it.")
+                self.cross_encoder = None
         
         # Storage
         self.documents = []
@@ -522,7 +537,9 @@ class KnowledgeAugmentedRetriever:
         use_temporal: bool = True,
         expand_query: bool = True,
         use_semantic: bool = True,
-        candidate_pool_size: int = None
+        candidate_pool_size: int = None,
+        bm25_top_k: int = 30,
+        temporal_top_k: int = 20
     ) -> List[RetrievalResult]:
 
         if not self.documents:
@@ -607,18 +624,54 @@ class KnowledgeAugmentedRetriever:
                 "cyclicity_score": cyclicity
             })
         
-        # Step 4: Sort and get top-k
+        # Stage 3.1: Sort by BM25+Temporal and get top bm25_top_k
         final_scores.sort(key=lambda x: x["score"], reverse=True)
-        top_results = final_scores[:top_k]
+        bm25_temporal_results = final_scores[:bm25_top_k]
         
-        # Build results
+        # Stage 3.2: Further filter to temporal_top_k for Cross-Encoder
+        # (Temporal already included in score above)
+        cross_encoder_candidates = bm25_temporal_results[:temporal_top_k]
+        
+        # Stage 4: Cross-Encoder Final Re-ranking (most accurate)
+        if self.cross_encoder is not None and len(cross_encoder_candidates) > 0:
+            logger.debug(f"Applying Cross-Encoder re-ranking on {len(cross_encoder_candidates)} candidates")
+            
+            # Prepare pairs for Cross-Encoder
+            ce_pairs = []
+            ce_items = []
+            for item in cross_encoder_candidates:
+                doc = self.documents[item["index"]]
+                ce_pairs.append([query, doc["text"]])
+                ce_items.append(item)
+            
+            # Get Cross-Encoder scores
+            ce_scores = self.cross_encoder.predict(ce_pairs, show_progress_bar=False)
+            
+            # Update items with cross-encoder scores
+            for i, item in enumerate(ce_items):
+                item["cross_encoder_score"] = float(ce_scores[i])
+                # Blend Cross-Encoder with previous score (optional, or just use CE)
+                # Using pure CE score as it's most accurate
+                item["final_score"] = float(ce_scores[i])
+            
+            # Re-sort by Cross-Encoder score
+            ce_items.sort(key=lambda x: x["final_score"], reverse=True)
+            top_results = ce_items[:top_k]
+        else:
+            # No Cross-Encoder: use BM25+Temporal results
+            top_results = cross_encoder_candidates[:top_k]
+            for item in top_results:
+                item["cross_encoder_score"] = 0.0
+                item["final_score"] = item["score"]
+        
+        # Build final results
         results = []
         for item in top_results:
             doc = self.documents[item["index"]]
             results.append(RetrievalResult(
                 document_id=doc["id"],
                 text=doc["text"],
-                score=item["score"],
+                score=item["final_score"],
                 bm25_score=item["bm25_score"],
                 recency_score=item["recency_score"],
                 cyclicity_score=item["cyclicity_score"],

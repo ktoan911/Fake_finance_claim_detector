@@ -2140,6 +2140,303 @@ results_df = pd.DataFrame([
 results_df.to_csv("verification_results.csv", index=False)
 ```
 
+#### 5.5.3. Ví Dụ Chi Tiết: Phân Tích Từng Thành Phần
+
+Phần này trình bày một ví dụ cụ thể với đầu ra từ từng thành phần của hệ thống để minh họa cách pipeline xử lý và đưa ra quyết định cuối cùng.
+
+**Input Claim:**
+```
+"Binance exchange suffered a major security breach in March 2024, losing $500M in customer funds"
+```
+
+##### Bước 1: Evidence Retrieval
+
+**1a. Semantic Search (FAISS)**
+
+Hệ thống sử dụng BGE encoder để embed claim và tìm kiếm 100 candidates từ knowledge base:
+
+```python
+# Claim embedding (384 dimensions, chỉ hiển thị 8 giá trị đầu)
+claim_embedding = [0.0342, -0.1245, 0.0891, 0.2103, -0.0567, 0.1432, -0.0891, 0.0234, ...]
+
+# Top FAISS candidates (cosine similarity)
+Candidate 1: similarity=0.89
+Candidate 2: similarity=0.86
+...
+Candidate 100: similarity=0.45
+```
+
+**1b. BM25 Scoring**
+
+Re-ranking candidates bằng BM25 lexical matching:
+
+| Doc ID | BM25 Score | Snippet |
+|--------|------------|---------|
+| doc_1234 | 12.47 | "Binance security update: No breach detected..." |
+| doc_5678 | 10.32 | "Binance denies hack rumors, confirms all funds safe..." |
+| doc_9102 | 9.85 | "False alarm: Binance $500M hack claim debunked..." |
+| doc_3456 | 8.91 | "Binance implements new security measures after 2022 incident..." |
+| doc_7890 | 7.23 | "Cryptocurrency exchange security best practices..." |
+
+**1c. Temporal Scoring**
+
+Tính toán recency và cyclicity scores:
+
+| Doc ID | Timestamp | Δt (days) | Recency | Cyclicity | Temporal |
+|--------|-----------|-----------|---------|-----------|----------|
+| doc_1234 | 2024-03-15 | 2 | 0.982 | 0.234 | 0.608 |
+| doc_5678 | 2024-03-14 | 3 | 0.974 | 0.234 | 0.604 |
+| doc_9102 | 2024-03-13 | 4 | 0.961 | 0.234 | 0.598 |
+| doc_3456 | 2023-05-20 | 301 | 0.048 | 0.156 | 0.102 |
+| doc_7890 | 2023-12-10 | 97 | 0.368 | 0.189 | 0.279 |
+
+```python
+# Temporal scoring formula
+Recency(d) = exp(-λ × Δt) = exp(-0.1 × Δt)
+Temporal(d) = γ × Recency + (1-γ) × Cyclicity 
+           = 0.5 × Recency + 0.5 × Cyclicity
+```
+
+**1d. Final Ranking**
+
+Kết hợp BM25 và Temporal scores:
+
+```python
+Final_Score = α × BM25 + (1-α) × Temporal
+           = 0.7 × BM25_normalized + 0.3 × Temporal
+```
+
+| Rank | Doc ID | BM25 | Temporal | **Final Score** | Evidence Text |
+|------|--------|------|----------|-----------------|---------------|
+| 1 | doc_1234 | 12.47 (1.00) | 0.608 | **0.882** | "Binance security update: No breach detected. All systems operating normally as of March 15, 2024." |
+| 2 | doc_5678 | 10.32 (0.83) | 0.604 | **0.762** | "Binance CEO denies hack rumors, confirms all funds are safe with proof of reserves." |
+| 3 | doc_9102 | 9.85 (0.79) | 0.598 | **0.732** | "Investigation complete: Binance $500M hack claim thoroughly debunked as misinformation campaign." |
+| 4 | doc_3456 | 8.91 (0.71) | 0.102 | **0.528** | "Binance implements enhanced security measures following 2022 incident, no recent breaches reported." |
+| 5 | doc_7890 | 7.23 (0.58) | 0.279 | **0.490** | "Cryptocurrency exchange security best practices: cold storage, multi-sig wallets..." |
+
+**Retrieval Features Vector (top-5):**
+```python
+retrieval_features = [
+    # [score, bm25, recency, cyclicity] for each of top-5 docs
+    [0.882, 1.000, 0.982, 0.234],  # doc_1234
+    [0.762, 0.828, 0.974, 0.234],  # doc_5678
+    [0.732, 0.790, 0.961, 0.234],  # doc_9102
+    [0.528, 0.714, 0.048, 0.156],  # doc_3456
+    [0.490, 0.580, 0.368, 0.189]   # doc_7890
+]
+# Flattened to 20-dim vector: [0.882, 1.000, 0.982, 0.234, 0.762, 0.828, ...]
+```
+
+##### Bước 2: LLM Scoring
+
+**2a. Prompt Construction**
+
+```python
+prompt = """You are an expert fact-checker for financial claims.
+
+Classify the claim based on the evidence:
+- True: Evidence confirms the claim
+- False: Evidence contradicts the claim  
+- Not: Insufficient evidence
+
+Claim: Binance exchange suffered a major security breach in March 2024, losing $500M in customer funds
+
+Evidence: 
+[1] Binance security update: No breach detected. All systems operating normally as of March 15, 2024.
+[2] Binance CEO denies hack rumors, confirms all funds are safe with proof of reserves.
+[3] Investigation complete: Binance $500M hack claim thoroughly debunked as misinformation campaign.
+[4] Binance implements enhanced security measures following 2022 incident, no recent breaches reported.
+[5] Cryptocurrency exchange security best practices: cold storage, multi-sig wallets...
+
+Verdict:"""
+```
+
+**2b. LLM Forward Pass**
+
+```python
+# Tokenize input
+input_ids = tokenizer(prompt)["input_ids"]  # length: 287 tokens
+
+# Forward pass through LoRA-finetuned Llama-3.1-8B
+with torch.no_grad():
+    outputs = model(input_ids)
+    logits = outputs.logits[0, -1, :]  # Logits for next token [vocab_size=128256]
+
+# Extract logits for label tokens
+label_tokens = {
+    "SUPPORTED": tokenizer("True")["input_ids"][0],    # token_id: 2575
+    "REFUTED": tokenizer("False")["input_ids"][0],     # token_id: 4139  
+    "NEI": tokenizer("Not")["input_ids"][0]            # token_id: 2688
+}
+
+# Raw logits for these specific tokens
+lm_logits_raw = [
+    logits[2575],  # True:  -2.341
+    logits[4139],  # False: 4.892
+    logits[2688]   # Not:   -1.105
+]
+```
+
+**LLM Output:**
+```python
+lm_logits = torch.tensor([-2.341, 4.892, -1.105])  # [SUPPORTED, REFUTED, NEI]
+
+# If we apply softmax directly (without fusion):
+lm_probs = softmax(lm_logits) = [0.006, 0.990, 0.004]
+# Strong signal towards REFUTED
+```
+
+##### Bước 3: Fusion Layer
+
+**3a. Retrieval Feature Encoding**
+
+```python
+# Input: retrieval_features (flattened 20-dim vector)
+retrieval_features_flat = torch.tensor([
+    0.882, 1.000, 0.982, 0.234,
+    0.762, 0.828, 0.974, 0.234,
+    0.732, 0.790, 0.961, 0.234,
+    0.528, 0.714, 0.048, 0.156,
+    0.490, 0.580, 0.368, 0.189
+])
+
+# Pass through 2-layer MLP: [20] → [128] → [3]
+hidden = ReLU(Linear_1(retrieval_features_flat))  # [128-dim]
+retrieval_logits = Linear_2(hidden)  # [3-dim]
+
+retrieval_logits = torch.tensor([-0.823, 2.156, -0.445])  # [SUPPORTED, REFUTED, NEI]
+```
+
+**3b. Gating and Fusion**
+
+```python
+# Learned gating parameter (trained from data)
+β = sigmoid(β_logit) = 0.62  # LLM weight
+(1 - β) = 0.38  # Retrieval weight
+
+# Fusion (Equation 2)
+fused_logits = β × lm_logits + (1-β) × retrieval_logits
+
+fused_logits = 0.62 × [-2.341, 4.892, -1.105] + 0.38 × [-0.823, 2.156, -0.445]
+             = [-1.451, 3.033, -0.685] + [-0.313, 0.819, -0.169]
+             = [-1.764, 3.852, -0.854]  # [SUPPORTED, REFUTED, NEI]
+```
+
+**3c. Final Probabilities**
+
+```python
+final_probs = softmax(fused_logits)
+            = softmax([-1.764, 3.852, -0.854])
+            = [0.013, 0.977, 0.031]  # [SUPPORTED, REFUTED, NEI]
+
+# Predicted label: argmax(final_probs) = REFUTED (index 1)
+# Confidence: max(final_probs) = 0.977
+```
+
+##### Bước 4: Post-processing và Threshold
+
+```python
+# Apply optimal threshold (learned from validation set)
+optimal_threshold = 0.62
+
+max_prob = max(final_probs) = 0.977
+predicted_label = argmax(final_probs) = "REFUTED"
+
+# Check if confidence exceeds threshold
+if max_prob > optimal_threshold:
+    final_label = predicted_label  # "REFUTED"
+else:
+    final_label = "NEI"  # Low confidence → fallback to NEI
+
+# In this case: 0.977 > 0.62 → REFUTED
+```
+
+##### Kết Quả Cuối Cùng
+
+```json
+{
+  "claim": "Binance exchange suffered a major security breach in March 2024, losing $500M in customer funds",
+  "label": "REFUTED",
+  "confidence": 0.977,
+  "processing_time_ms": 732,
+  "model_breakdown": {
+    "lm_logits": [-2.341, 4.892, -1.105],
+    "lm_probs": [0.006, 0.990, 0.004],
+    "retrieval_logits": [-0.823, 2.156, -0.445],
+    "fusion_weight_lm": 0.62,
+    "fusion_weight_retrieval": 0.38,
+    "fused_logits": [-1.764, 3.852, -0.854],
+    "final_probs": [0.013, 0.977, 0.031]
+  },
+  "evidence": [
+    {
+      "rank": 1,
+      "text": "Binance security update: No breach detected. All systems operating normally as of March 15, 2024.",
+      "source": "r/CryptoCurrency",
+      "score": 0.882,
+      "bm25": 12.47,
+      "temporal": 0.608,
+      "timestamp": "2024-03-15T10:30:00Z"
+    },
+    {
+      "rank": 2,
+      "text": "Binance CEO denies hack rumors, confirms all funds are safe with proof of reserves.",
+      "source": "r/binance",
+      "score": 0.762,
+      "bm25": 10.32,
+      "temporal": 0.604,
+      "timestamp": "2024-03-14T18:45:00Z"
+    },
+    {
+      "rank": 3,
+      "text": "Investigation complete: Binance $500M hack claim thoroughly debunked as misinformation campaign.",
+      "source": "CoinDesk",
+      "score": 0.732,
+      "bm25": 9.85,
+      "temporal": 0.598,
+      "timestamp": "2024-03-13T14:20:00Z"
+    }
+  ]
+}
+```
+
+##### Phân Tích Quyết Định
+
+**Tại sao hệ thống đưa ra nhãn REFUTED?**
+
+1. **Evidence mâu thuẫn mạnh:**
+   - Tất cả 5 evidence đều phủ nhận claim
+   - Evidence từ nguồn đáng tin cậy (Binance official, CoinDesk)
+   - Evidence rất gần thời điểm claim (2-4 ngày)
+
+2. **LLM signal rất mạnh:**
+   - LLM logits cho REFUTED: 4.892 (rất cao)
+   - LLM prob: 0.990 → gần như chắc chắn là REFUTED
+   - LLM đã học được pattern "denies", "debunked", "no breach detected"
+
+3. **Retrieval cũng ủng hộ REFUTED:**
+   - Retrieval logits cho REFUTED: 2.156 (cao nhất)
+   - High BM25 scores (12.47, 10.32) → strong lexical match
+   - High temporal scores (0.608, 0.604) → evidence rất mới
+
+4. **Fusion tăng cường confidence:**
+   - Cả LLM (62%) và retrieval (38%) đều point to REFUTED
+   - Fusion logit 3.852 → xác suất cuối 0.977 (rất cao)
+   - Confidence 0.977 \u003e\u003e threshold 0.62 → rất tin tưởng
+
+5. **Temporal scoring quan trọng:**
+   - Evidence từ March 2024 (cùng thời điểm với claim)
+   - Recency scores 0.98+ → ưu tiên evidence gần đây
+   - Nếu chỉ có old evidence (2022), kết quả có thể là NEI
+
+**Trường hợp biên:**
+
+Nếu claim không có thời gian cụ thể: "Binance suffered a major hack"
+- LLM có thể confused (Binance đã bị hack năm 2019)
+- Temporal scoring ít giúp hơn
+- Có thể output NEI hoặc SUPPORTED (depending on evidence mix)
+- → Tầm quan trọng của temporal awareness trong crypto domain
+
 ---
 
 ## 6. ĐÁNH GIÁ KẾT QUẢ

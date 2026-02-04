@@ -183,13 +183,14 @@ def main():
         logger.error("No documents loaded from MongoDB!")
         return
     
-    # Initialize retriever
+    # Initialize retriever with Cross-Encoder
     logger.info("Indexing knowledge base...")
     retriever = KnowledgeAugmentedRetriever(
         alpha=0.7,
         lambda_decay=0.1,
         gamma=0.5,
-        use_query_expansion=True
+        use_query_expansion=True,
+        use_cross_encoder=True  # Enable 4-stage pipeline
     )
     retriever.index_documents(kb_docs, text_field='text', id_field='id', timestamp_field='timestamp')
     

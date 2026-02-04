@@ -30,7 +30,6 @@ if TORCH_AVAILABLE:
         fused_logits: torch.Tensor
         lm_weight: float
         retrieval_weight: float
-        confidence: torch.Tensor
 
     class RetrievalMLP(nn.Module):
         """
@@ -107,14 +106,6 @@ if TORCH_AVAILABLE:
                 output_dim=num_classes
             )
             
-            # Confidence estimation head
-            self.confidence_head = nn.Sequential(
-                nn.Linear(num_classes * 2, 32),
-                nn.ReLU(),
-                nn.Linear(32, 1),
-                nn.Sigmoid()
-            )
-            
             logger.info(f"ConfidenceAwareFusion initialized: β={initial_beta}, λ={lambda_reg}, num_classes={num_classes}")
         
         def _inverse_sigmoid(self, x: float) -> float:
@@ -157,16 +148,11 @@ if TORCH_AVAILABLE:
             # This is p_final in the paper.
             final_probs = torch.softmax(fused_logits, dim=-1)
             
-            # Estimate confidence
-            combined_features = torch.cat([lm_logits, retrieval_logits], dim=-1)
-            confidence = self.confidence_head(combined_features)
-            
             return FusionOutput(
                 final_probs=final_probs,
                 fused_logits=fused_logits,
                 lm_weight=beta.item(),
-                retrieval_weight=(1 - beta).item(),
-                confidence=confidence
+                retrieval_weight=(1 - beta).item()
             )
         
         def compute_contrastive_loss(
