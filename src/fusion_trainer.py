@@ -288,7 +288,8 @@ def train_fusion_from_dataframe(
             
             if num_classes == 2:
                 # Binary: predictions from probabilities (final_probs[:, 0] = P(True))
-                preds = (output.final_probs[:, 0] > 0.5).long()  # 0 if P(True) > 0.5, else 1
+                # If P(True) > 0.5, predict label 0 (True), else predict label 1 (False)
+                preds = (output.final_probs[:, 0] <= 0.5).long()  # 1 if P(True) <= 0.5 (False), else 0 (True)
             else:
                 # Multi-class: argmax
                 preds = torch.argmax(fused_logits, dim=-1)
