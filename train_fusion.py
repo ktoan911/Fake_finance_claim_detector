@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--labeled_csv", type=str, required=True, help="Path to the labeled CSV file (text,evidence,label)")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
     parser.add_argument("--llm_batch_size", type=int, default=8, help="Batch size for LLM")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--model_path", type=str, default=os.getenv("LORA_MODEL_PATH") or os.getenv("LLM_MODEL_NAME", "meta-llama/Llama-3.1-8B"), help="Path to the model (LoRA or base model)")
     parser.add_argument("--device", type=str, default="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.system("nvidia-smi > /dev/null 2>&1") == 0 else "cpu", help="Device to use (cuda/cpu)")
     parser.add_argument("--save_path", type=str, default=os.getenv("FUSION_OUTPUT_PATH", "artifacts/fusion_model.pt"), help="Path to save the fusion model")
@@ -75,7 +76,8 @@ def main():
         model_name=args.model_path,
         device=args.device,
         batch_size=args.batch_size,
-        llm_batch_size = args.llm_batch_size
+        llm_batch_size=args.llm_batch_size,
+        epochs=args.epochs
     )
 
     train_fusion_from_dataframe(
