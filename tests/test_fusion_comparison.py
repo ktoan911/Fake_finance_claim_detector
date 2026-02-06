@@ -123,7 +123,7 @@ def precompute_all_data(
         batch_retrieval_features = []
         batch_retrieved_evidences = []
         for t in batch_texts:
-            # Note: _build_retrieval_features now uses candidate_pool_size=100 internally
+            # Note: _build_retrieval_features uses candidate_pool_size=500 by default
             feats, retrieved_evidence = _build_retrieval_features(retriever, t, top_k)
             batch_retrieval_features.append(feats)
             batch_retrieved_evidences.append(retrieved_evidence)

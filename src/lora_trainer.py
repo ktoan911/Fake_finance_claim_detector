@@ -151,7 +151,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     metrics = {
         "f1_macro": f1_score(true_labels, pred_labels, average="macro", zero_division=0),
         "f1_weighted": f1_score(true_labels, pred_labels, average="weighted", zero_division=0),
-        "f1_binary": f1_score(true_labels, pred_labels, average="binary", pos_label=0, zero_division=0),  # True as positive
+        "f1_binary": f1_score(true_labels, pred_labels, average="binary", pos_label=1, zero_division=0),  # False (scam) as positive
         "precision_macro": precision_score(true_labels, pred_labels, average="macro", zero_division=0),
         "recall_macro": recall_score(true_labels, pred_labels, average="macro", zero_division=0),
         "accuracy": accuracy_score(true_labels, pred_labels),
@@ -182,10 +182,15 @@ def _prepare_classification_dataset(
     targets = []
     
     def normalize_label(label_value) -> str:
-        """Normalize label to binary True/False."""
+        """Normalize label to binary True/False.
+        
+        Convention: 0=True (legitimate), 1=False (scam/fake)
+        Matches LABEL_TO_ID = {"True": 0, "False": 1}
+        """
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
-            if idx == 0:
+            # Standard binary: 1=True/Supported, 0=False/Scam
+            if idx == 1:
                 return "True"
             else:
                 return "False"
@@ -193,10 +198,10 @@ def _prepare_classification_dataset(
         label_upper = str(label_value).upper().strip()
         
         # Map all variants to True/False (binary classification)
-        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
+        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "1"]:
             return "True"
         # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
-        # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN
+        # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN, "0"
         else:
             return "False"
     
@@ -248,8 +253,12 @@ def _prepare_classification_dataset(
             # 3. Process evidence with smart truncation
             evidence_ids = []
             if available_for_evidence > 0:
-                # Split evidence by newline (preserved from csv_loader)
-                evidence_items = str(evidence_raw).split('\n')
+                # Support both newline separation (old) and ||| separation (CSV loader)
+                evidence_str = str(evidence_raw)
+                if '|||' in evidence_str:
+                    evidence_items = evidence_str.split('|||')
+                else:
+                    evidence_items = evidence_str.split('\n')
                 
                 current_evidence_ids = []
                 for i, item in enumerate(evidence_items):
@@ -263,10 +272,8 @@ def _prepare_classification_dataset(
                     if len(current_evidence_ids) + len(item_ids) <= available_for_evidence:
                         current_evidence_ids.extend(item_ids)
                     else:
-                        # Truncate the current item to fill remaining space
-                        remaining_space = available_for_evidence - len(current_evidence_ids)
-                        if remaining_space > 0:
-                            current_evidence_ids.extend(item_ids[:remaining_space])
+                        # Don't truncate mid-token - skip this item entirely to preserve semantic integrity
+                        # Truncating evidence mid-word can corrupt fact-checking context
                         break
                 
                 evidence_ids = current_evidence_ids

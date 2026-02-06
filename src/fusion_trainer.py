@@ -37,19 +37,27 @@ class FusionTrainingConfig:
 
 
 def _normalize_label(label_value) -> int:
-    """Convert label to integer ID for binary classification (True=0, False=1)."""
+    """Convert label to integer ID for binary classification (True=0, False=1).
+    
+    CRITICAL: Must match lora_trainer.py normalize_label exactly!
+    Convention: 1=True (legitimate), 0=False (scam/fake)
+    Maps to LABEL_TO_ID = {"True": 0, "False": 1}
+    """
     if isinstance(label_value, (int, float)):
         idx = int(label_value)
-        # Map: 0->True, anything else->False
-        return 0 if idx == 0 else 1
+        # Standard binary: 1=True/Supported, 0=False/Scam
+        if idx == 1:
+            return 0  # True
+        else:
+            return 1  # False
     
     label_upper = str(label_value).upper().strip()
     
     # Map all variants to binary True/False IDs
-    if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "0"]:
+    if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "1"]:
         return 0  # True
     # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
-    # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN
+    # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN, "0"
     else:
         return 1  # False
 
@@ -286,13 +294,8 @@ def train_fusion_from_dataframe(
             # Track metrics
             total_loss += loss.item()
             
-            if num_classes == 2:
-                # Binary: predictions from probabilities (final_probs[:, 0] = P(True))
-                # If P(True) > 0.5, predict label 0 (True), else predict label 1 (False)
-                preds = (output.final_probs[:, 0] <= 0.5).long()  # 1 if P(True) <= 0.5 (False), else 0 (True)
-            else:
-                # Multi-class: argmax
-                preds = torch.argmax(fused_logits, dim=-1)
+            # Get predictions using argmax (works for both binary and multi-class)
+            preds = torch.argmax(output.final_probs, dim=-1)
             
             correct += (preds == b_labels).sum().item()
             total += len(b_labels)

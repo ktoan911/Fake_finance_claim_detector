@@ -118,15 +118,10 @@ class LLMScorer:
         template_start_raw = template_parts[0]
         template_end_raw = template_parts[1]
         
-        # Reserve space for label tokens (True/False) + EOS
-        # Training uses: [BOS, prompt, label, EOS]
-        # Inference needs logits at position of last prompt token to predict label
-        # So we need to fit [BOS, prompt] into max_length - 1 (for label prediction space)
-        # But wait, we want to match training exactly.
-        # Training: input = [BOS, prompt, label, EOS] (length <= max_len)
-        # Inference: input = [BOS, prompt] (length <= max_len - 1)
-        # We reserve 2 tokens: 1 for potential label generation (though we don't generate), 1 for EOS safety
-        reserved_tokens = 2 
+        # CRITICAL: Match training's max_length exactly (no reserved tokens)
+        # Training: input = [BOS, prompt, label, EOS] fits in max_length
+        # Inference: input = [BOS, prompt] should use same available space
+        # Prediction position: last non-pad token predicts next token (the label) 
         
         for text, evidence_item in zip(texts, evidences):
             # 1. Prepare fixed parts
@@ -137,18 +132,22 @@ class LLMScorer:
             start_ids = self.tokenizer(template_start, add_special_tokens=True, truncation=False)["input_ids"]
             end_ids = self.tokenizer(template_end, add_special_tokens=False, truncation=False)["input_ids"]
             
-            # 2. Calculate available space for evidence
+            # 2. Calculate available space for evidence (match training)
             fixed_len = len(start_ids) + len(end_ids)
-            available_for_evidence = self.max_length - fixed_len - reserved_tokens
+            available_for_evidence = self.max_length - fixed_len
             
             # 3. Process evidence
             evidence_ids = []
             if available_for_evidence > 0:
-                # Handle both List[str] (from retriever) and str (from CSV with \n)
+                # Handle both List[str] (from retriever) and str (from CSV)
                 if isinstance(evidence_item, list):
                     evidence_list = evidence_item
                 elif isinstance(evidence_item, str):
-                    evidence_list = evidence_item.split('\n')
+                    # Support both newline separation (training) and ||| separation (CSV loader)
+                    if '|||' in evidence_item:
+                        evidence_list = evidence_item.split('|||')
+                    else:
+                        evidence_list = evidence_item.split('\n')
                 else:
                     evidence_list = []
                 
@@ -164,10 +163,8 @@ class LLMScorer:
                     if len(current_evidence_ids) + len(item_ids) <= available_for_evidence:
                         current_evidence_ids.extend(item_ids)
                     else:
-                        # Truncate current item to fill remaining space
-                        remaining = available_for_evidence - len(current_evidence_ids)
-                        if remaining > 0:
-                            current_evidence_ids.extend(item_ids[:remaining])
+                        # CRITICAL: Don't truncate mid-token - skip item entirely (match lora_trainer.py)
+                        # Truncating evidence mid-word corrupts semantic context for fact-checking
                         break
                 
                 evidence_ids = current_evidence_ids
