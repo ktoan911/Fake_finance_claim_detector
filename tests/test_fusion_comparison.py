@@ -479,7 +479,7 @@ def main():
     llm = LLMScorer(
         model_name=LORA_MODEL_PATH,
         device=DEVICE,
-        max_length=1024,
+        max_length=2048,
         labels=LABEL_LIST,
         prompt_template=PROMPT_TEMPLATE,
     )

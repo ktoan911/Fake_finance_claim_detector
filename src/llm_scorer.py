@@ -27,7 +27,7 @@ class LLMScorer:
         self,
         model_name: str,
         device: str = "cpu",
-        max_length: int = 1024,
+        max_length: int = 2048,
         labels: Optional[List[str]] = None,
         prompt_template: Optional[str] = None,
     ):

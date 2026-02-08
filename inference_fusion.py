@@ -199,7 +199,7 @@ def main():
     llm = LLMScorer(
         model_name=args.llm_model,
         device=args.device,
-        max_length=1024,
+        max_length=2048,
         labels=config.get('label_list', LABEL_LIST),
         prompt_template=PROMPT_TEMPLATE
     )

@@ -331,7 +331,7 @@ class MemoryCleanupCallback(TrainerCallback):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            logger.info(f"GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB / {torch.cuda.max_memory_allocated() / 1024**3:.2f}GB")
+            logger.info(f"GPU Memory: {torch.cuda.memory_allocated() / 2048**3:.2f}GB / {torch.cuda.max_memory_allocated() / 2048**3:.2f}GB")
     
     def on_step_end(self, args, state, control, **kwargs):
         """Periodically clean up memory during training."""
