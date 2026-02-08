@@ -128,7 +128,7 @@ class RetrievalResult:
     document_id: str
     text: str
     score: float
-    bm25_score: float
+    rrf_score: float  # Changed from bm25_score to rrf_score
     recency_score: float
     cyclicity_score: float
     timestamp: datetime
@@ -396,24 +396,23 @@ class QueryExpander:
 
 class KnowledgeAugmentedRetriever:
     """
-    Main retrieval system implementing Section 3.1 + Cross-Encoder.
+    Main retrieval system implementing hybrid RRF-based retrieval.
     
     Combines:
-    - BGE embeddings for semantic search (via FAISS) - Stage 1
-    - BM25 for lexical matching - Stage 2
+    - BGE embeddings for semantic search (via FAISS) - Stage 1a
+    - BM25 for lexical matching - Stage 1b
+    - Reciprocal Rank Fusion (RRF) to combine rankings - Stage 2
     - Temporal scoring for recency awareness - Stage 3
-    - Cross-Encoder for final accurate re-ranking - Stage 4
     """
     
     def __init__(
         self,
         embedding_model: str = "BAAI/bge-small-en-v1.5",
-        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
         gamma: float = 0.5,
         use_query_expansion: bool = True,
-        use_cross_encoder: bool = True,
+        rrf_k: int = 60,
         index_path: str = None
     ):
         """
@@ -421,15 +420,16 @@ class KnowledgeAugmentedRetriever:
         
         Args:
             embedding_model: Name of sentence transformer model
-            alpha: BM25 vs temporal weight (paper: 0.7)
-            lambda_decay: Recency decay factor (paper: 0.1)
-            gamma: Recency vs cyclicity mix (paper: 0.5)
-            use_query_expansion: Enable crypto query expansion
+            alpha: RRF vs temporal weight (default: 0.7)
+            lambda_decay: Recency decay factor (default: 0.1)
+            gamma: Recency vs cyclicity mix (default: 0.5)
+            use_query_expansion: Enable query expansion
+            rrf_k: RRF constant k (default: 60)
             index_path: Path to save/load FAISS index
         """
         self.alpha = alpha
         self.index_path = index_path
-        self.use_cross_encoder = use_cross_encoder
+        self.rrf_k = rrf_k
         
         # Initialize components
         self.temporal_scorer = TemporalScorer(
@@ -450,16 +450,7 @@ class KnowledgeAugmentedRetriever:
             self.encoder = None
             self.embedding_dim = 384  # Default
         
-        # Initialize Cross-Encoder for final re-ranking
-        self.cross_encoder = None
-        if use_cross_encoder and SENTENCE_TRANSFORMERS_AVAILABLE and CrossEncoder is not None:
-            try:
-                logger.info(f"Loading Cross-Encoder: {cross_encoder_model}")
-                self.cross_encoder = CrossEncoder(cross_encoder_model, max_length=512)
-                logger.info("✓ Cross-Encoder loaded successfully")
-            except Exception as e:
-                logger.warning(f"Failed to load Cross-Encoder: {e}. Proceeding without it.")
-                self.cross_encoder = None
+        # Cross-Encoder removed - using RRF-based hybrid retrieval instead
         
         # Storage
         self.documents = []
@@ -533,20 +524,18 @@ class KnowledgeAugmentedRetriever:
     def retrieve(
         self,
         query: str,
-        top_k: int = 5,
+        top_k: int = 10,
         use_temporal: bool = True,
         expand_query: bool = True,
         use_semantic: bool = True,
-        candidate_pool_size: int = None,
-        bm25_top_k: int = 100,
-        temporal_top_k: int = 50
+        rrf_top_k: int = 20
     ) -> List[RetrievalResult]:
 
         if not self.documents:
             logger.warning("No documents indexed")
             return []
         
-        # Update reference date to current query time (fix G)
+        # Update reference date to current query time
         self.temporal_scorer.reference_date = datetime.now(timezone.utc)
         
         # Query expansion
@@ -555,114 +544,86 @@ class KnowledgeAugmentedRetriever:
         else:
             expanded_query = query
         
-        # Stage 1: Get candidate pool via FAISS (dense retrieval)
-        # Paper: "dynamic databases indexed via FAISS"
-        if use_semantic and self.encoder is not None and self.faiss_index is not None:
-            if candidate_pool_size is None:
-                # Paper-faithful: score all documents
-                candidate_indices = set(range(len(self.documents)))
-            else:
-                # Practical: FAISS semantic search for top-N candidates
-                query_embedding = self.encoder.encode([expanded_query], convert_to_numpy=True)
-                faiss.normalize_L2(query_embedding)
-                
-                pool_size = min(candidate_pool_size, len(self.documents))
-                distances, indices = self.faiss_index.search(query_embedding, pool_size)
-                candidate_indices = set(indices[0].tolist())
-        else:
-            # No FAISS: score all documents
-            candidate_indices = set(range(len(self.documents)))
-        
-        # Stage 2: BM25 scoring
-        # Note: Using BM25Okapi (standard). Paper Eq.8 mentions BM25+.
+        # Stage 1a: BM25 scoring for all documents
         tokenized_query = self._tokenize(expanded_query)
         bm25_scores = self.bm25.get_scores(tokenized_query)
         
-        # Normalize BM25 to [0,1] for score stability
-        # (Paper doesn't specify normalization, but needed for α weighting)
-        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
-        bm25_scores_norm = bm25_scores / max_bm25
+        # Create BM25 rankings (higher score = lower rank number)
+        bm25_ranked = sorted(enumerate(bm25_scores), key=lambda x: x[1], reverse=True)
+        bm25_ranks = {idx: rank for rank, (idx, score) in enumerate(bm25_ranked)}
         
-        # Build group histories from FULL corpus (fix E)
-        # Paper: cyclicity should reflect full pattern history, not just candidates
+        # Stage 1b: FAISS semantic search (if available)
+        faiss_ranks = {}
+        if use_semantic and self.encoder is not None and self.faiss_index is not None:
+            query_embedding = self.encoder.encode([expanded_query], convert_to_numpy=True)
+            faiss.normalize_L2(query_embedding)
+            
+            # Search all documents to get complete ranking
+            n_docs = len(self.documents)
+            distances, indices = self.faiss_index.search(query_embedding, n_docs)
+            faiss_ranks = {idx: rank for rank, idx in enumerate(indices[0].tolist())}
+        else:
+            # No FAISS available: use uniform ranks
+            faiss_ranks = {i: i for i in range(len(self.documents))}
+        
+        # Stage 2: Reciprocal Rank Fusion (RRF)
+        # RRF(d) = 1/(k + rank_bm25(d)) + 1/(k + rank_dense(d))
+        rrf_scores = {}
+        for i in range(len(self.documents)):
+            bm25_rank = bm25_ranks.get(i, len(self.documents))
+            faiss_rank = faiss_ranks.get(i, len(self.documents))
+            rrf_scores[i] = (1.0 / (self.rrf_k + bm25_rank)) + (1.0 / (self.rrf_k + faiss_rank))
+        
+        # Sort by RRF score and take top rrf_top_k (default 20)
+        rrf_ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        rrf_candidates = rrf_ranked[:rrf_top_k]
+        
+        # Normalize RRF scores to [0,1] for final score calculation
+        max_rrf = max(score for idx, score in rrf_candidates) if rrf_candidates else 1.0
+        rrf_scores_norm = {idx: score / max_rrf for idx, score in rrf_candidates}
+        
+        # Build group histories from FULL corpus for cyclicity calculation
         docs_by_group = {}
-        for i, doc in enumerate(self.documents):  # Full corpus
+        for i, doc in enumerate(self.documents):
             group_key = doc["metadata"].get("type") or doc["metadata"].get("source") or "default"
             if group_key not in docs_by_group:
                 docs_by_group[group_key] = []
             docs_by_group[group_key].append((i, doc["timestamp"]))
         
-        #  Stage 3: Rerank candidates with Paper Eq.1 + Eq.8
+        # Stage 3: Temporal scoring on RRF candidates
         final_scores = []
         
-        for i in candidate_indices:
-            doc = self.documents[i]
+        for idx, rrf_score in rrf_candidates:
+            doc = self.documents[idx]
             
             if use_temporal:
-                # Get group-specific timestamps for cyclicity (Eq.8)
+                # Get group-specific timestamps for cyclicity
                 group_key = doc["metadata"].get("type") or doc["metadata"].get("source") or "default"
-                group_timestamps = [ts for idx, ts in docs_by_group.get(group_key, [])]
+                group_timestamps = [ts for idx_g, ts in docs_by_group.get(group_key, [])]
                 
-                # Calculate temporal score with group-based cyclicity + adaptive λ (Eq.9)
+                # Calculate temporal score with group-based cyclicity + adaptive λ
                 temporal, recency, cyclicity = self.temporal_scorer.calculate_temporal_score(
                     doc["timestamp"],
                     group_timestamps,
                     use_adaptive_lambda=True
                 )
-                # Paper Equation (1): Score = α·BM25 + (1-α)·Temporal
-                # where Temporal = γ·Recency + (1-γ)·Cyclicity from Eq.8
-                score = self.alpha * bm25_scores_norm[i] + (1 - self.alpha) * temporal
+                # Final Score = α × RRF + (1-α) × Temporal
+                score = self.alpha * rrf_scores_norm[idx] + (1 - self.alpha) * temporal
             else:
                 recency, cyclicity = 0.5, 0.5
-                score = bm25_scores_norm[i]
+                score = rrf_scores_norm[idx]
             
             final_scores.append({
-                "index": i,
+                "index": idx,
                 "score": score,
-                "bm25_score": bm25_scores_norm[i],
+                "rrf_score": rrf_scores_norm[idx],
                 "recency_score": recency,
                 "cyclicity_score": cyclicity
             })
         
-        # Stage 3.1: Sort by BM25+Temporal and get top bm25_top_k
+        # Sort by final score and take top_k (default 10)
         final_scores.sort(key=lambda x: x["score"], reverse=True)
-        bm25_temporal_results = final_scores[:bm25_top_k]
-        
-        # Stage 3.2: Further filter to temporal_top_k for Cross-Encoder
-        # (Temporal already included in score above)
-        cross_encoder_candidates = bm25_temporal_results[:temporal_top_k]
-        
-        # Stage 4: Cross-Encoder Final Re-ranking (most accurate)
-        if self.cross_encoder is not None and len(cross_encoder_candidates) > 0:
-            logger.debug(f"Applying Cross-Encoder re-ranking on {len(cross_encoder_candidates)} candidates")
-            
-            # Prepare pairs for Cross-Encoder
-            ce_pairs = []
-            ce_items = []
-            for item in cross_encoder_candidates:
-                doc = self.documents[item["index"]]
-                ce_pairs.append([query, doc["text"]])
-                ce_items.append(item)
-            
-            # Get Cross-Encoder scores
-            ce_scores = self.cross_encoder.predict(ce_pairs, show_progress_bar=False)
-            
-            # Update items with cross-encoder scores
-            for i, item in enumerate(ce_items):
-                item["cross_encoder_score"] = float(ce_scores[i])
-                # Blend Cross-Encoder with previous score (optional, or just use CE)
-                # Using pure CE score as it's most accurate
-                item["final_score"] = float(ce_scores[i])
-            
-            # Re-sort by Cross-Encoder score
-            ce_items.sort(key=lambda x: x["final_score"], reverse=True)
-            top_results = ce_items[:top_k]
-        else:
-            # No Cross-Encoder: use BM25+Temporal results
-            top_results = cross_encoder_candidates[:top_k]
-            for item in top_results:
-                item["cross_encoder_score"] = 0.0
-                item["final_score"] = item["score"]
+        top_results = final_scores[:top_k]
         
         # Build final results
         results = []
@@ -671,8 +632,8 @@ class KnowledgeAugmentedRetriever:
             results.append(RetrievalResult(
                 document_id=doc["id"],
                 text=doc["text"],
-                score=item["final_score"],
-                bm25_score=item["bm25_score"],
+                score=item["score"],
+                rrf_score=item["rrf_score"],  # Changed from bm25_score
                 recency_score=item["recency_score"],
                 cyclicity_score=item["cyclicity_score"],
                 timestamp=doc["timestamp"],

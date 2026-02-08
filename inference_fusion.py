@@ -97,14 +97,14 @@ def predict_claim(
     Returns:
         Dictionary with prediction results
     """
-    # 1. Retrieve evidence (FAISS filtering: top 500 candidates, then BM25 re-rank)
-    results = retriever.retrieve(claim, top_k=config['top_k'], candidate_pool_size=500)
+    # 1. Retrieve evidence (RRF hybrid: top 20 candidates, then Temporal scoring)
+    results = retriever.retrieve(claim, top_k=config['top_k'], rrf_top_k=20)
     
     # 2. Extract retrieval features
     features = []
     evidence_texts = []
     for r in results:
-        features.append([r.score, r.bm25_score, r.recency_score, r.cyclicity_score])
+        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score])
         evidence_texts.append(r.text)
     
     # Pad if needed
@@ -183,14 +183,14 @@ def main():
         logger.error("No documents loaded from MongoDB!")
         return
     
-    # Initialize retriever with Cross-Encoder
+    # Initialize retriever with RRF hybrid
     logger.info("Indexing knowledge base...")
     retriever = KnowledgeAugmentedRetriever(
         alpha=0.7,
         lambda_decay=0.1,
         gamma=0.5,
         use_query_expansion=True,
-        use_cross_encoder=True  # Enable 4-stage pipeline
+        rrf_k=60  # RRF constant
     )
     retriever.index_documents(kb_docs, text_field='text', id_field='id', timestamp_field='timestamp')
     

@@ -25,7 +25,7 @@ class FusionTrainingConfig:
     llm_batch_size: int = 4
     epochs: int = 3
     learning_rate: float = 1e-4
-    top_k: int = 5
+    top_k: int = 10
     alpha: float = 0.7
     lambda_decay: float = 0.1
     gamma: float = 0.5
@@ -66,16 +66,16 @@ def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever,
     text: str,
     top_k: int,
-    candidate_pool_size: int = 500
+    rrf_top_k: int = 20
 ) -> tuple:
     """Returns (features, retrieved_evidence_text)."""
-    # FAISS filtering: top 500 candidates, then BM25 re-rank to get top_k
-    results = retriever.retrieve(text, top_k=top_k, candidate_pool_size=candidate_pool_size)
+    # RRF hybrid: top 20 candidates, then Temporal scoring to get top_k
+    results = retriever.retrieve(text, top_k=top_k, rrf_top_k=rrf_top_k)
     features = []
     evidence_texts = []
     
     for r in results:
-        features.append([r.score, r.bm25_score, r.recency_score, r.cyclicity_score])
+        features.append([r.score, r.rrf_score, r.recency_score, r.cyclicity_score])
         evidence_texts.append(r.text)
     
     if len(features) < top_k:
@@ -121,13 +121,13 @@ def train_fusion_from_dataframe(
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
 
-    # Initialize retriever with Cross-Encoder
+    # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
         alpha=config.alpha,
         lambda_decay=config.lambda_decay,
         gamma=config.gamma,
         use_query_expansion=True,
-        use_cross_encoder=True  # Enable 4-stage pipeline
+        rrf_k=60  # RRF constant
     )
     retriever.index_documents(knowledge_base, text_field="text", timestamp_field="timestamp")
     logger.info(f"Indexed {len(knowledge_base)} documents in retriever")

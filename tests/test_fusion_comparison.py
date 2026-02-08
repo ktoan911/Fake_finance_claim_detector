@@ -83,7 +83,7 @@ def precompute_all_data(
     device: str = "cuda",
     batch_size: int = 8,
     llm_batch_size: int = 8,
-    top_k: int = 5
+    top_k: int = 10
 ) -> Dict:
     """
     Pre-compute ALL data needed for all tests in one pass.
