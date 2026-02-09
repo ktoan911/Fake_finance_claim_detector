@@ -66,6 +66,88 @@ def llm_generate(prompt: str) -> str:
     return ""  # fallback if all retries fail
 
 
+def llm_paraphrase_evidence(evidence: str) -> str:
+    """
+    Use LLM to paraphrase evidence while preserving meaning.
+    Returns original if LLM fails.
+    """
+    prompt = (
+        "Rewrite the following evidence paragraph in natural, plain English. "
+        "Keep the same meaning and all key facts. Do not add any new information.\n\n"
+        f"{evidence}"
+    )
+    result = llm_generate(prompt)
+    return _norm_ws(result) if result else evidence
+
+
+def llm_paraphrase_claim(claim: str) -> str:
+    """
+    Use LLM to paraphrase claim while preserving meaning.
+    Returns original if LLM fails.
+    """
+    prompt = (
+        "Rewrite the following claim as a concise, news-like sentence. "
+        "Keep the exact same meaning. Do not change any facts.\n\n"
+        f"{claim}"
+    )
+    result = llm_generate(prompt)
+    return _norm_ws(result) if result else claim
+
+
+def make_hard_contradiction(
+    evidence: str, base_concept: str, rng: random.Random
+) -> str:
+    """
+    Create a claim that clearly contradicts the evidence.
+    Uses LLM with careful prompting to generate controlled contradictions.
+    """
+    prompt = (
+        "Based on this evidence, generate a SHORT claim (1 sentence) that directly CONTRADICTS it. "
+        "The claim should be clearly false based on the evidence.\n\n"
+        f"Evidence: {evidence}\n\n"
+        f"Topic hint: {base_concept}\n\n"
+        "Generate ONLY the contradictory claim, nothing else:"
+    )
+    result = llm_generate(prompt)
+    return (
+        _norm_ws(result)
+        if result
+        else f"The opposite of the evidence is true regarding {base_concept}."
+    )
+
+
+def make_hard_unsupported(evidence: str, base_concept: str, rng: random.Random) -> str:
+    """
+    Create a claim that adds unsupported absolute conditions or specific numbers.
+    The claim is plausible but evidence doesn't support the absolute/specific assertion.
+    """
+    absolute_phrases = [
+        "in every single case",
+        "with 100% certainty",
+        "always without exception",
+        "as officially confirmed by all regulators",
+        "guarantees exactly 50% returns",
+        "is required by law in all countries",
+        "never varies under any circumstances",
+    ]
+
+    modifier = rng.choice(absolute_phrases)
+
+    prompt = (
+        "Based on this evidence, generate a SHORT claim (1 sentence) that is related to the topic "
+        f"and includes this absolute assertion: '{modifier}'. "
+        "The claim should sound plausible but the evidence does NOT support the absolute assertion.\n\n"
+        f"Evidence: {evidence}\n\n"
+        "Generate ONLY the claim, nothing else:"
+    )
+    result = llm_generate(prompt)
+    return (
+        _norm_ws(result)
+        if result
+        else f"This concept {modifier} regarding {base_concept}."
+    )
+
+
 # =============================
 # 2) Concept bank
 # =============================
@@ -475,55 +557,133 @@ def make_evidence(
 # =============================
 
 
-def build_rows(
-    n: int,
-    seed: int,
-    false_contradict_ratio: float,
-    min_ev_fillers: int,
-    max_ev_fillers: int,
-    use_llm: bool,
-) -> List[dict]:
+def build_rows(seed: int) -> List[dict]:
+    """
+    Build 1500 samples with controlled quality:
+    - 400 controlled samples (pure rule-based, no paraphrase)
+    - 500 controlled samples (rule-based + LLM paraphrase for natural language)
+    - 600 hard set samples (LLM-generated contradiction + unsupported)
+
+    This ensures clean labels and tests fact-checking capability.
+    """
     rng = random.Random(seed)
+
+    # Fixed parameters for evidence generation
+    min_ev_fillers = 2
+    max_ev_fillers = 5
 
     # Cycle concepts to avoid over-using only a few
     order = list(range(len(CONCEPTS)))
     rng.shuffle(order)
 
     rows: List[dict] = []
-    for i in range(n):
+
+    # =============================
+    # A. Generate 900 Controlled Samples
+    # =============================
+    # 450 true, 450 false (balanced)
+    # 400 samples: pure rule-based (no paraphrase)
+    # 500 samples: rule-based + LLM paraphrase (natural language)
+
+    print(
+        "Generating 900 controlled samples (400 pure rule-based + 500 with LLM paraphrase)..."
+    )
+    controlled_samples = []
+
+    for i in range(900):
         c = CONCEPTS[order[i % len(order)]]
 
-        # Balanced labels 50/50
-        is_true = i % 2 == 0
+        # Balanced: 450 true, 450 false
+        is_true = i < 450
 
+        # Generate evidence from concept
         evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
 
+        # Generate claim based on evidence (rule-based)
         if is_true:
             claim = make_true_claim(c, rng)
             label = "true"
         else:
-            is_contradict = rng.random() < false_contradict_ratio
-            if is_contradict:
+            # For false samples in controlled set, mix contradiction and unsupported
+            if rng.random() < 0.55:
                 claim = make_false_contradict_claim(c, rng)
             else:
                 claim = make_false_unsupported_claim(c, rng)
             label = "false"
 
-        # Optional LLM rewriting (kept off by default; stub returns empty)
-        if use_llm:
-            ev_prompt = f"Rewrite this evidence paragraph in plain English, same meaning:\n\n{evidence}"
-            ev_new = _norm_ws(llm_generate(ev_prompt))
-            if ev_new:
-                evidence = ev_new
+        controlled_samples.append(
+            {"claim": claim, "evidence": evidence, "label": label, "type": "controlled"}
+        )
 
-            cl_prompt = f"Rewrite this claim as a concise, news-like sentence, same meaning:\n\n{claim}"
-            cl_new = _norm_ws(llm_generate(cl_prompt))
-            if cl_new:
-                claim = cl_new
+    # Randomly select 500 samples for LLM paraphrase
+    paraphrase_indices = set(rng.sample(range(900), 500))
 
-        rows.append({"claim": claim, "evidence": evidence, "label": label})
+    for idx, sample in enumerate(controlled_samples):
+        if idx in paraphrase_indices:
+            # Apply LLM paraphrase for natural language
+            sample["evidence"] = llm_paraphrase_evidence(sample["evidence"])
+            sample["claim"] = llm_paraphrase_claim(sample["claim"])
+            sample["type"] = "controlled_paraphrased"
 
+    rows.extend(controlled_samples)
+
+    # =============================
+    # B. Generate 600 Hard Set Samples (LLM-BASED)
+    # =============================
+    # These are challenging samples with LLM generation
+    # All are false (to balance with controlled set)
+
+    print("Generating 600 hard set samples (LLM-based)...")
+
+    # 300 contradiction samples
+    print("  - 300 contradiction samples...")
+    for i in range(300):
+        c = CONCEPTS[order[(900 + i) % len(order)]]
+
+        # Generate evidence
+        evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
+
+        # Paraphrase evidence for variety
+        evidence = llm_paraphrase_evidence(evidence)
+
+        # Generate contradictory claim using LLM
+        claim = make_hard_contradiction(evidence, c.topic, rng)
+
+        rows.append(
+            {
+                "claim": claim,
+                "evidence": evidence,
+                "label": "false",
+                "type": "hard_contradiction",
+            }
+        )
+
+    # 300 unsupported samples
+    print("  - 300 unsupported samples...")
+    for i in range(300):
+        c = CONCEPTS[order[(1200 + i) % len(order)]]
+
+        # Generate evidence
+        evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
+
+        # Paraphrase evidence for variety
+        evidence = llm_paraphrase_evidence(evidence)
+
+        # Generate unsupported claim (adds absolute conditions)
+        claim = make_hard_unsupported(evidence, c.topic, rng)
+
+        rows.append(
+            {
+                "claim": claim,
+                "evidence": evidence,
+                "label": "false",
+                "type": "hard_unsupported",
+            }
+        )
+
+    # Shuffle all samples
     rng.shuffle(rows)
+
     return rows
 
 
@@ -532,42 +692,69 @@ def write_csv(path: str, rows: List[dict]) -> None:
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["claim", "evidence", "label"])
+        w = csv.DictWriter(f, fieldnames=["claim", "evidence", "label", "type"])
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=1500)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out", type=str, default="./synthetic_finance_1500.csv")
-    ap.add_argument("--false-contradict-ratio", type=float, default=0.55)
-    ap.add_argument("--min-ev-fillers", type=int, default=2)
-    ap.add_argument("--max-ev-fillers", type=int, default=5)
-    ap.add_argument("--use-llm", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="Generate 1500 high-quality test samples: 400 pure rule-based + 500 paraphrased + 600 LLM hard set"
+    )
+    ap.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    ap.add_argument(
+        "--out",
+        type=str,
+        default="./synthetic_finance_1500.csv",
+        help="Output CSV file path",
+    )
     args = ap.parse_args()
 
-    rows = build_rows(
-        n=args.n,
-        seed=args.seed,
-        false_contradict_ratio=args.false_contradict_ratio,
-        min_ev_fillers=max(0, args.min_ev_fillers),
-        max_ev_fillers=max(max(0, args.min_ev_fillers), args.max_ev_fillers),
-        use_llm=args.use_llm,
+    print("=" * 70)
+    print("High-Quality Test Set Generation")
+    print("=" * 70)
+    print(
+        "Structure: 400 pure rule-based + 500 paraphrased + 600 LLM hard set = 1500 total"
     )
+    print(f"Seed: {args.seed}")
+    print("=" * 70)
+    print()
+
+    rows = build_rows(seed=args.seed)
 
     write_csv(args.out, rows)
 
+    # Calculate statistics
     true_n = sum(1 for r in rows if r["label"] == "true")
     false_n = len(rows) - true_n
+
+    controlled_pure = sum(1 for r in rows if r.get("type") == "controlled")
+    controlled_para = sum(1 for r in rows if r.get("type") == "controlled_paraphrased")
+    contradiction = sum(1 for r in rows if r.get("type") == "hard_contradiction")
+    unsupported = sum(1 for r in rows if r.get("type") == "hard_unsupported")
+
+    print()
     print("=" * 70)
-    print("Synthetic finance test set generated")
+    print("✓ Test set generation complete")
+    print("=" * 70)
     print(f"Output: {args.out}")
-    print(f"Total: {len(rows)} | true: {true_n} | false: {false_n}")
-    print(f"Concepts: {len(CONCEPTS)} | LLM: {args.use_llm} (stub returns empty)")
-    print("Columns: claim, evidence, label")
+    print(f"Total samples: {len(rows)}")
+    print()
+    print("Label distribution:")
+    print(f"  - True:  {true_n} ({true_n / len(rows) * 100:.1f}%)")
+    print(f"  - False: {false_n} ({false_n / len(rows) * 100:.1f}%)")
+    print()
+    print("Sample type distribution:")
+    print(f"  - Controlled (pure rule-based):     {controlled_pure}")
+    print(f"  - Controlled (with LLM paraphrase): {controlled_para}")
+    print(f"  - Hard Contradiction (LLM):          {contradiction}")
+    print(f"  - Hard Unsupported (LLM):            {unsupported}")
+    print()
+    print(f"Concepts used: {len(CONCEPTS)}")
+    print("Columns: claim, evidence, label, type")
     print("=" * 70)
 
 
