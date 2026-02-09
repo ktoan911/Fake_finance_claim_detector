@@ -42,9 +42,11 @@ class FusionTrainingConfig:
 def _normalize_label(label_value) -> int:
     """Convert label to integer ID for binary classification (True=0, False=1).
 
-    CRITICAL: Must match lora_trainer.py normalize_label exactly!
-    Convention: 1=True (legitimate), 0=False (scam/fake)
-    Maps to LABEL_TO_ID = {"True": 0, "False": 1}
+    Label Convention (matches config.py and csv_loader.py):
+      - Input: numeric 1 or string "1" → Output: ID 0 (True/Supported)
+      - Input: numeric 0 or string "0" → Output: ID 1 (False/Refuted)
+
+    Maps to: LABEL_TO_ID = {"True": 0, "False": 1}
     """
     if isinstance(label_value, (int, float)):
         idx = int(label_value)
