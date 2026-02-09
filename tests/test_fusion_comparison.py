@@ -464,13 +464,13 @@ def main():
     # Load fusion model
     fusion, retrieval_encoder, config = load_fusion_model(FUSION_MODEL_PATH, DEVICE)
     
-    # Initialize retriever with Cross-Encoder
+    # Initialize retriever with RRF hybrid retrieval
     retriever = KnowledgeAugmentedRetriever(
         alpha=0.7,
         lambda_decay=0.1,
         gamma=0.5,
         use_query_expansion=True,
-        use_cross_encoder=True  # Enable 4-stage pipeline for testing
+        rrf_k=60  # RRF constant
     )
     retriever.index_documents(knowledge_base, text_field="text", timestamp_field="timestamp")
     logger.info(f"✓ Indexed {len(knowledge_base)} documents")
