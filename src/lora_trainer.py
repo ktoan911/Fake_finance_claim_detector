@@ -201,29 +201,26 @@ def _prepare_classification_dataset(
     targets = []
 
     def normalize_label(label_value) -> str:
-        """Normalize label to binary True/False string.
+        """Convert CSV_Loader integer ID to string label for LLM training.
 
-        Label Convention (matches config.py and csv_loader.py):
-          - Input: numeric 1 or string "1" → Output: "True" → ID 0
-          - Input: numeric 0 or string "0" → Output: "False" → ID 1
+        CSV_Loader Convention:
+          - ID 0 = True (supported/legitimate)
+          - ID 1 = False (refuted/fake)
 
-        Matches: LABEL_TO_ID = {"True": 0, "False": 1}
+        This function converts those IDs to strings for LLM training targets.
         """
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
-            # Standard binary: 1=True/Supported, 0=False/Scam
-            if idx == 1:
-                return "True"
+            # CSV_Loader outputs: 0=True, 1=False
+            if idx == 0:
+                return "True"  # ID 0 → True
             else:
-                return "False"
+                return "False"  # ID 1 → False
 
+        # Should not reach here if CSV_Loader working correctly
         label_upper = str(label_value).upper().strip()
-
-        # Map all variants to True/False (binary classification)
-        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "1"]:
+        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE"]:
             return "True"
-        # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
-        # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN, "0"
         else:
             return "False"
 

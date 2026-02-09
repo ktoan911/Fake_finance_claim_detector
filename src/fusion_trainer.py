@@ -167,7 +167,9 @@ def train_fusion_from_dataframe(
     # Prepare data
     texts = labeled_df["text"].tolist()
     gold_evidences = labeled_df["evidence"].tolist()
-    labels = [_normalize_label(l) for l in labeled_df["label"].tolist()]
+    # CSVLabeledLoader already normalized labels (true→0, false→1)
+    # Do NOT call _normalize_label again or labels will be flipped!
+    labels = labeled_df["label"].tolist()
 
     logger.info(f"Training samples: {len(texts)}")
     logger.info(
