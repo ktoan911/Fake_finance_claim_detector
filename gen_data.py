@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import logging
 import os
 import random
 import re
@@ -58,11 +59,17 @@ def llm_generate(prompt: str) -> str:
             text = (resp.choices[0].message.content or "").strip()
             return text
 
-        except Exception:
+        except Exception as e:
+            # Log detailed error information
+            logging.error(
+                f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {str(e)}"
+            )
             # basic exponential backoff
             sleep_s = min(60.0, (2**attempt) + random.random())
+            logging.warning(f"Retrying in {sleep_s:.1f} seconds...")
             time.sleep(sleep_s)
 
+    logging.error("LLM generation failed after all retries")
     return ""  # fallback if all retries fail
 
 
@@ -585,46 +592,93 @@ def build_rows(seed: int) -> List[dict]:
     # 400 samples: pure rule-based (no paraphrase)
     # 500 samples: rule-based + LLM paraphrase (natural language)
 
+    logging.info("=" * 70)
+    logging.info("Phase 1: Generating 900 controlled samples")
+    logging.info("  - 400 pure rule-based + 500 with LLM paraphrase")
+    logging.info("=" * 70)
     print(
         "Generating 900 controlled samples (400 pure rule-based + 500 with LLM paraphrase)..."
     )
     controlled_samples = []
 
     for i in range(900):
-        c = CONCEPTS[order[i % len(order)]]
+        try:
+            c = CONCEPTS[order[i % len(order)]]
 
-        # Balanced: 450 true, 450 false
-        is_true = i < 450
+            # Balanced: 450 true, 450 false
+            is_true = i < 450
 
-        # Generate evidence from concept
-        evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
+            # Generate evidence from concept
+            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
 
-        # Generate claim based on evidence (rule-based)
-        if is_true:
-            claim = make_true_claim(c, rng)
-            label = "true"
-        else:
-            # For false samples in controlled set, mix contradiction and unsupported
-            if rng.random() < 0.55:
-                claim = make_false_contradict_claim(c, rng)
+            # Generate claim based on evidence (rule-based)
+            if is_true:
+                claim = make_true_claim(c, rng)
+                label = "true"
             else:
-                claim = make_false_unsupported_claim(c, rng)
-            label = "false"
+                # For false samples in controlled set, mix contradiction and unsupported
+                if rng.random() < 0.55:
+                    claim = make_false_contradict_claim(c, rng)
+                else:
+                    claim = make_false_unsupported_claim(c, rng)
+                label = "false"
 
-        controlled_samples.append(
-            {"claim": claim, "evidence": evidence, "label": label, "type": "controlled"}
-        )
+            controlled_samples.append(
+                {
+                    "claim": claim,
+                    "evidence": evidence,
+                    "label": label,
+                    "type": "controlled",
+                }
+            )
+
+            # Log progress every 50 samples
+            if (i + 1) % 50 == 0:
+                logging.info(
+                    f"  ✓ Generated {i + 1}/900 controlled samples ({(i + 1) / 900 * 100:.1f}%)"
+                )
+                print(
+                    f"  Progress: {i + 1}/900 controlled samples ({(i + 1) / 900 * 100:.1f}%)"
+                )
+
+        except Exception as e:
+            logging.error(f"Error generating controlled sample {i + 1}: {str(e)}")
+            logging.warning(f"Skipping sample {i + 1} and continuing...")
+            continue
 
     # Randomly select 500 samples for LLM paraphrase
+    logging.info(
+        "\nApplying LLM paraphrase to 500 randomly selected controlled samples..."
+    )
     paraphrase_indices = set(rng.sample(range(900), 500))
+    paraphrase_count = 0
 
     for idx, sample in enumerate(controlled_samples):
         if idx in paraphrase_indices:
-            # Apply LLM paraphrase for natural language
-            sample["evidence"] = llm_paraphrase_evidence(sample["evidence"])
-            sample["claim"] = llm_paraphrase_claim(sample["claim"])
-            sample["type"] = "controlled_paraphrased"
+            try:
+                # Apply LLM paraphrase for natural language
+                sample["evidence"] = llm_paraphrase_evidence(sample["evidence"])
+                sample["claim"] = llm_paraphrase_claim(sample["claim"])
+                sample["type"] = "controlled_paraphrased"
+                paraphrase_count += 1
 
+                # Log progress every 50 paraphrased samples
+                if paraphrase_count % 50 == 0:
+                    logging.info(
+                        f"  ✓ Paraphrased {paraphrase_count}/500 samples ({paraphrase_count / 500 * 100:.1f}%)"
+                    )
+                    print(
+                        f"  Progress: Paraphrased {paraphrase_count}/500 samples ({paraphrase_count / 500 * 100:.1f}%)"
+                    )
+
+            except Exception as e:
+                logging.error(f"Error paraphrasing sample {idx}: {str(e)}")
+                logging.warning(f"Keeping original text for sample {idx}")
+                continue
+
+    logging.info(
+        f"✓ Phase 1 complete: Generated {len(controlled_samples)} controlled samples"
+    )
     rows.extend(controlled_samples)
 
     # =============================
@@ -633,56 +687,98 @@ def build_rows(seed: int) -> List[dict]:
     # These are challenging samples with LLM generation
     # All are false (to balance with controlled set)
 
+    logging.info("\n" + "=" * 70)
+    logging.info("Phase 2: Generating 600 hard set samples (LLM-based)")
+    logging.info("=" * 70)
     print("Generating 600 hard set samples (LLM-based)...")
 
     # 300 contradiction samples
+    logging.info("Phase 2a: Generating 300 contradiction samples...")
     print("  - 300 contradiction samples...")
     for i in range(300):
-        c = CONCEPTS[order[(900 + i) % len(order)]]
+        try:
+            c = CONCEPTS[order[(900 + i) % len(order)]]
 
-        # Generate evidence
-        evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
+            # Generate evidence
+            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
 
-        # Paraphrase evidence for variety
-        evidence = llm_paraphrase_evidence(evidence)
+            # Paraphrase evidence for variety
+            evidence = llm_paraphrase_evidence(evidence)
 
-        # Generate contradictory claim using LLM
-        claim = make_hard_contradiction(evidence, c.topic, rng)
+            # Generate contradictory claim using LLM
+            claim = make_hard_contradiction(evidence, c.topic, rng)
 
-        rows.append(
-            {
-                "claim": claim,
-                "evidence": evidence,
-                "label": "false",
-                "type": "hard_contradiction",
-            }
-        )
+            rows.append(
+                {
+                    "claim": claim,
+                    "evidence": evidence,
+                    "label": "false",
+                    "type": "hard_contradiction",
+                }
+            )
+
+            # Log progress every 50 samples
+            if (i + 1) % 50 == 0:
+                logging.info(
+                    f"  ✓ Generated {i + 1}/300 contradiction samples ({(i + 1) / 300 * 100:.1f}%)"
+                )
+                print(
+                    f"  Progress: {i + 1}/300 contradiction samples ({(i + 1) / 300 * 100:.1f}%)"
+                )
+
+        except Exception as e:
+            logging.error(f"Error generating contradiction sample {i + 1}: {str(e)}")
+            logging.warning(f"Skipping contradiction sample {i + 1} and continuing...")
+            continue
+
+    logging.info("✓ Phase 2a complete: Generated 300 contradiction samples")
 
     # 300 unsupported samples
+    logging.info("\nPhase 2b: Generating 300 unsupported samples...")
     print("  - 300 unsupported samples...")
     for i in range(300):
-        c = CONCEPTS[order[(1200 + i) % len(order)]]
+        try:
+            c = CONCEPTS[order[(1200 + i) % len(order)]]
 
-        # Generate evidence
-        evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
+            # Generate evidence
+            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
 
-        # Paraphrase evidence for variety
-        evidence = llm_paraphrase_evidence(evidence)
+            # Paraphrase evidence for variety
+            evidence = llm_paraphrase_evidence(evidence)
 
-        # Generate unsupported claim (adds absolute conditions)
-        claim = make_hard_unsupported(evidence, c.topic, rng)
+            # Generate unsupported claim (adds absolute conditions)
+            claim = make_hard_unsupported(evidence, c.topic, rng)
 
-        rows.append(
-            {
-                "claim": claim,
-                "evidence": evidence,
-                "label": "false",
-                "type": "hard_unsupported",
-            }
-        )
+            rows.append(
+                {
+                    "claim": claim,
+                    "evidence": evidence,
+                    "label": "false",
+                    "type": "hard_unsupported",
+                }
+            )
+
+            # Log progress every 50 samples
+            if (i + 1) % 50 == 0:
+                logging.info(
+                    f"  ✓ Generated {i + 1}/300 unsupported samples ({(i + 1) / 300 * 100:.1f}%)"
+                )
+                print(
+                    f"  Progress: {i + 1}/300 unsupported samples ({(i + 1) / 300 * 100:.1f}%)"
+                )
+
+        except Exception as e:
+            logging.error(f"Error generating unsupported sample {i + 1}: {str(e)}")
+            logging.warning(f"Skipping unsupported sample {i + 1} and continuing...")
+            continue
+
+    logging.info("✓ Phase 2b complete: Generated 300 unsupported samples")
 
     # Shuffle all samples
+    logging.info("\nShuffling all samples for randomization...")
     rng.shuffle(rows)
+    logging.info(f"✓ All phases complete: Total {len(rows)} samples generated")
+    logging.info("=" * 70)
 
     return rows
 
@@ -711,7 +807,29 @@ def main() -> None:
         default="./synthetic_finance_1500.csv",
         help="Output CSV file path",
     )
+    ap.add_argument(
+        "--log",
+        type=str,
+        default="./gen_data.log",
+        help="Log file path for detailed logging",
+    )
     args = ap.parse_args()
+
+    # Configure logging
+    log_format = "%(asctime)s - %(levelname)s - %(message)s"
+
+    # Create file handler for detailed logging (INFO and above)
+    file_handler = logging.FileHandler(args.log, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(log_format))
+
+    # Create console handler for errors and warnings only
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(logging.Formatter(log_format))
+
+    # Configure root logger
+    logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
 
     print("=" * 70)
     print("High-Quality Test Set Generation")
@@ -720,8 +838,16 @@ def main() -> None:
         "Structure: 400 pure rule-based + 500 paraphrased + 600 LLM hard set = 1500 total"
     )
     print(f"Seed: {args.seed}")
+    print(f"Log file: {args.log}")
     print("=" * 70)
     print()
+
+    logging.info("=" * 70)
+    logging.info("Starting data generation process")
+    logging.info(f"Seed: {args.seed}")
+    logging.info(f"Output file: {args.out}")
+    logging.info(f"Log file: {args.log}")
+    logging.info("=" * 70)
 
     rows = build_rows(seed=args.seed)
 
@@ -756,6 +882,29 @@ def main() -> None:
     print(f"Concepts used: {len(CONCEPTS)}")
     print("Columns: claim, evidence, label, type")
     print("=" * 70)
+    
+    # Log final statistics
+    logging.info("")
+    logging.info("=" * 70)
+    logging.info("✓ Test set generation complete")
+    logging.info("=" * 70)
+    logging.info(f"Output file: {args.out}")
+    logging.info(f"Total samples generated: {len(rows)}")
+    logging.info("")
+    logging.info("Label distribution:")
+    logging.info(f"  - True:  {true_n} ({true_n / len(rows) * 100:.1f}%)")
+    logging.info(f"  - False: {false_n} ({false_n / len(rows) * 100:.1f}%)")
+    logging.info("")
+    logging.info("Sample type distribution:")
+    logging.info(f"  - Controlled (pure rule-based):     {controlled_pure}")
+    logging.info(f"  - Controlled (with LLM paraphrase): {controlled_para}")
+    logging.info(f"  - Hard Contradiction (LLM):         {contradiction}")
+    logging.info(f"  - Hard Unsupported (LLM):           {unsupported}")
+    logging.info("")
+    logging.info(f"Concepts used: {len(CONCEPTS)}")
+    logging.info("Columns: claim, evidence, label, type")
+    logging.info("=" * 70)
+    logging.info("Data generation process completed successfully!")
 
 
 if __name__ == "__main__":
