@@ -109,7 +109,10 @@ def main():
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of samples for testing"
     )
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument(
+        "--llm_batch_size", type=int, default=1, help="LLM inference batch size"
+    )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -217,13 +220,25 @@ def main():
         batch_gold_evidences = gold_evidences[i : i + args.batch_size]
         batch_retrieved_evidences = all_retrieved_evidences[i : i + args.batch_size]
 
-        # A. Mode: Retrieval Evidence
-        batch_logits_ret = llm.score_logits(batch_texts, batch_retrieved_evidences)
-        logits_retrieval.append(batch_logits_ret)
+        # A. Mode: Retrieval Evidence (Micro-batching)
+        sub_logits_ret = []
+        for j in range(0, len(batch_texts), args.llm_batch_size):
+            sub_texts = batch_texts[j : j + args.llm_batch_size]
+            sub_evs = batch_retrieved_evidences[j : j + args.llm_batch_size]
+            sub_logits_ret.append(llm.score_logits(sub_texts, sub_evs))
 
-        # B. Mode: Gold Evidence
-        batch_logits_gold = llm.score_logits(batch_texts, batch_gold_evidences)
-        logits_gold.append(batch_logits_gold)
+        if sub_logits_ret:
+            logits_retrieval.append(torch.cat(sub_logits_ret, dim=0))
+
+        # B. Mode: Gold Evidence (Micro-batching)
+        sub_logits_gold = []
+        for j in range(0, len(batch_texts), args.llm_batch_size):
+            sub_texts = batch_texts[j : j + args.llm_batch_size]
+            sub_evs = batch_gold_evidences[j : j + args.llm_batch_size]
+            sub_logits_gold.append(llm.score_logits(sub_texts, sub_evs))
+
+        if sub_logits_gold:
+            logits_gold.append(torch.cat(sub_logits_gold, dim=0))
 
     tensor_logits_retrieval = torch.cat(logits_retrieval, dim=0).to(args.device)
     tensor_logits_gold = torch.cat(logits_gold, dim=0).to(args.device)
