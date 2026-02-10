@@ -39,34 +39,6 @@ class FusionTrainingConfig:
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
 
 
-def _normalize_label(label_value) -> int:
-    """Convert label to integer ID for binary classification (True=0, False=1).
-
-    Label Convention (matches config.py and csv_loader.py):
-      - Input: numeric 1 or string "1" → Output: ID 0 (True/Supported)
-      - Input: numeric 0 or string "0" → Output: ID 1 (False/Refuted)
-
-    Maps to: LABEL_TO_ID = {"True": 0, "False": 1}
-    """
-    if isinstance(label_value, (int, float)):
-        idx = int(label_value)
-        # Standard binary: 1=True/Supported, 0=False/Scam
-        if idx == 1:
-            return 0  # True
-        else:
-            return 1  # False
-
-    label_upper = str(label_value).upper().strip()
-
-    # Map all variants to binary True/False IDs
-    if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE", "1"]:
-        return 0  # True
-    # Everything else maps to False (including NEI, NEUTRAL, UNKNOWN)
-    # This includes: FALSE, REFUTED, SCAM, NEUTRAL, NEI, NOT, UNKNOWN, "0"
-    else:
-        return 1  # False
-
-
 def _build_retrieval_features(
     retriever: KnowledgeAugmentedRetriever, text: str, top_k: int, rrf_top_k: int = 20
 ) -> tuple:
@@ -283,12 +255,12 @@ def train_fusion_from_dataframe(
             if num_classes == 2:
                 # Binary classification: use BCEWithLogitsLoss
                 # fused_logits: [B] (single logit per sample)
-                # labels need to be float [B] with values 0.0 or 1.0
-                # Label 0 = True, Label 1 = False, so we need to flip for BCE
-                # BCE expects: 1.0 for positive class (True), 0.0 for negative class (False)
+                # Convert label IDs to BCE targets:
+                # - Label ID 0 (True) → BCE target 1.0 (positive class)
+                # - Label ID 1 (False) → BCE target 0.0 (negative class)
                 target_binary = (
                     b_labels == 0
-                ).float()  # Convert: 0->1.0 (True), 1->0.0 (False)
+                ).float()  # Convert: 0→1.0 (True), 1→0.0 (False)
                 ce_loss = F.binary_cross_entropy_with_logits(
                     fused_logits, target_binary
                 )
