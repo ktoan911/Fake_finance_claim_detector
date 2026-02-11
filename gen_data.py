@@ -71,6 +71,7 @@ def llm_generate(
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
+                timeout=60.0,  # Client-side timeout (seconds)
                 # response_format={"type": "json_object"} if json_mode else None # distinct API might not support
             )
 
@@ -729,7 +730,7 @@ def make_evidence(
 # =============================
 
 
-def build_rows(seed: int) -> List[dict]:
+def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     """
     Build 1500 samples with controlled quality:
     - 900 Controlled (450 True, 450 False)
@@ -741,6 +742,10 @@ def build_rows(seed: int) -> List[dict]:
 
     Total: 750 True, 750 False (Perfectly Balanced)
     """
+    if checkpoint_path:
+        logging.info(
+            f"Checkpointing enabled. Saving to {checkpoint_path} every 50 samples."
+        )
     rng = random.Random(seed)
     seen_hashes = set()
 
@@ -803,6 +808,8 @@ def build_rows(seed: int) -> List[dict]:
             if (i + 1) % 50 == 0:
                 logging.info(f"  ✓ Generated {i + 1}/900 controlled samples")
                 print(f"  Progress: {i + 1}/900 controlled samples")
+                if checkpoint_path:
+                    write_csv(checkpoint_path, rows + controlled_samples)
 
         except Exception as e:
             logging.error(f"Error generating controlled sample {i + 1}: {str(e)}")
@@ -839,6 +846,8 @@ def build_rows(seed: int) -> List[dict]:
                 if paraphrase_count > 0 and paraphrase_count % 50 == 0:
                     logging.info(f"  ✓ Paraphrased {paraphrase_count} samples")
                     print(f"  Progress: Paraphrased {paraphrase_count} samples")
+                    if checkpoint_path:
+                        write_csv(checkpoint_path, rows + controlled_samples)
 
             except Exception as e:
                 logging.error(f"Error paraphrasing sample {idx}: {str(e)}")
@@ -892,6 +901,8 @@ def build_rows(seed: int) -> List[dict]:
             if count % 50 == 0:
                 logging.info(f"  ✓ Generated {count}/300 Hard True")
                 print(f"  Progress: {count}/300 Hard True")
+                if checkpoint_path:
+                    write_csv(checkpoint_path, rows)
 
         except Exception as e:
             logging.error(f"Error in Phase 2a: {e}")
@@ -926,6 +937,8 @@ def build_rows(seed: int) -> List[dict]:
             if count % 50 == 0:
                 logging.info(f"  ✓ Generated {count}/150 Hard Contradiction")
                 print(f"  Progress: {count}/150 Hard Contradiction")
+                if checkpoint_path:
+                    write_csv(checkpoint_path, rows)
 
         except Exception as e:
             logging.error(f"Error in Phase 2b: {e}")
@@ -960,6 +973,8 @@ def build_rows(seed: int) -> List[dict]:
             if count % 50 == 0:
                 logging.info(f"  ✓ Generated {count}/150 Hard Unsupported")
                 print(f"  Progress: {count}/150 Hard Unsupported")
+                if checkpoint_path:
+                    write_csv(checkpoint_path, rows)
 
         except Exception as e:
             logging.error(f"Error in Phase 2c: {e}")
@@ -1038,7 +1053,7 @@ def main() -> None:
     logging.info(f"Log file: {args.log}")
     logging.info("=" * 70)
 
-    rows = build_rows(seed=args.seed)
+    rows = build_rows(seed=args.seed, checkpoint_path=args.out)
 
     write_csv(args.out, rows)
 
