@@ -86,7 +86,21 @@ def llm_generate(
                     json_str = text
 
                 # Parse to verify
-                data = json.loads(json_str)
+                try:
+                    data = json.loads(json_str)
+                except json.JSONDecodeError as e:
+                    # If LLM returns multiple JSONs or trailing text
+                    if "Extra data" in str(e):
+                        try:
+                            data = json.loads(json_str[: e.pos])
+                        except Exception:
+                            logging.error(
+                                f"JSON parsing failed even after recovery: {e}"
+                            )
+                            raise e
+                    else:
+                        raise e
+
                 return data.get("claim", "")
 
             return text
