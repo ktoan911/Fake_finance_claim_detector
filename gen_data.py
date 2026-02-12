@@ -746,15 +746,15 @@ def make_evidence(
 
 def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     """
-    Build 1500 samples with controlled quality:
-    - 900 Controlled (450 True, 450 False)
-      - Includes ~500 paraphrased
-    - 600 Hard Set (LLM-generated)
-      - 300 Hard True (Complex/Tricky)
-      - 150 Hard Contradiction
-      - 150 Hard Unsupported (Absolute/Fake stats)
+    Build 1000 samples with controlled quality:
+    - 600 Controlled (300 True, 300 False)
+      - Includes ~350 paraphrased
+    - 400 Hard Set (LLM-generated)
+      - 200 Hard True (Complex/Tricky)
+      - 100 Hard Contradiction
+      - 100 Hard Unsupported (Absolute/Fake stats)
 
-    Total: 750 True, 750 False (Perfectly Balanced)
+    Total: 500 True, 500 False (Perfectly Balanced)
     """
     if checkpoint_path:
         logging.info(
@@ -777,19 +777,19 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     # A. Generate 900 Controlled Samples
     # =============================
     logging.info("=" * 70)
-    logging.info("Phase 1: Generating 900 controlled samples")
-    logging.info("  - 450 True / 450 False")
+    logging.info("Phase 1: Generating 600 controlled samples")
+    logging.info("  - 300 True / 300 False")
     logging.info("=" * 70)
-    print("Generating 900 controlled samples...")
+    print("Generating 600 controlled samples...")
 
     controlled_samples = []
 
-    for i in range(900):
+    for i in range(600):
         try:
             c = CONCEPTS[order[i % len(order)]]
 
-            # Balanced: 450 true, 450 false
-            is_true = i < 450
+            # Balanced: 300 true, 300 false
+            is_true = i < 300
 
             # Generate evidence from concept
             evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
@@ -820,8 +820,8 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             )
 
             if (i + 1) % 50 == 0:
-                logging.info(f"  ✓ Generated {i + 1}/900 controlled samples")
-                print(f"  Progress: {i + 1}/900 controlled samples")
+                logging.info(f"  ✓ Generated {i + 1}/600 controlled samples")
+                print(f"  Progress: {i + 1}/600 controlled samples")
                 if checkpoint_path:
                     write_csv(checkpoint_path, rows + controlled_samples)
 
@@ -829,11 +829,11 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Error generating controlled sample {i + 1}: {str(e)}")
             continue
 
-    # Randomly select 500 samples for LLM paraphrase
+    # Randomly select 350 samples for LLM paraphrase
     logging.info(
-        "\nApplying LLM paraphrase to 500 randomly selected controlled samples..."
+        "\nApplying LLM paraphrase to 350 randomly selected controlled samples..."
     )
-    paraphrase_indices = set(rng.sample(range(900), 500))
+    paraphrase_indices = set(rng.sample(range(600), 350))
     paraphrase_count = 0
 
     for idx, sample in enumerate(controlled_samples):
@@ -874,20 +874,20 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     # B. Generate 600 Hard Set Samples (LLM-BASED)
     # =============================
     logging.info("\n" + "=" * 70)
-    logging.info("Phase 2: Generating 600 hard set samples (LLM-based)")
-    logging.info("  - 300 Hard True (Complex Paraphrase)")
-    logging.info("  - 150 Hard Contradiction")
-    logging.info("  - 150 Hard Unsupported")
+    logging.info("Phase 2: Generating 400 hard set samples (LLM-based)")
+    logging.info("  - 200 Hard True (Complex Paraphrase)")
+    logging.info("  - 100 Hard Contradiction")
+    logging.info("  - 100 Hard Unsupported")
     logging.info("=" * 70)
-    print("Generating 600 hard set samples...")
+    print("Generating 400 hard set samples...")
 
-    # 1. Hard True (300)
-    logging.info("Phase 2a: Generating 300 Hard True samples...")
-    print("  - 300 Hard True samples...")
+    # 1. Hard True (200)
+    logging.info("Phase 2a: Generating 200 Hard True samples...")
+    print("  - 200 Hard True samples...")
     count = 0
     attempts = 0
     # Use while loop to ensure we get enough valid samples
-    while count < 300 and attempts < 600:
+    while count < 200 and attempts < 400:
         attempts += 1
         try:
             c = CONCEPTS[order[attempts % len(order)]]
@@ -913,8 +913,8 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             count += 1
 
             if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/300 Hard True")
-                print(f"  Progress: {count}/300 Hard True")
+                logging.info(f"  ✓ Generated {count}/200 Hard True")
+                print(f"  Progress: {count}/200 Hard True")
                 if checkpoint_path:
                     write_csv(checkpoint_path, rows)
 
@@ -922,11 +922,11 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Error in Phase 2a: {e}")
             continue
 
-    # 2. Hard Contradiction (150)
-    logging.info("\nPhase 2b: Generating 150 Hard Contradiction samples...")
-    print("  - 150 Hard Contradiction samples...")
+    # 2. Hard Contradiction (100)
+    logging.info("\nPhase 2b: Generating 100 Hard Contradiction samples...")
+    print("  - 100 Hard Contradiction samples...")
     count = 0
-    while count < 150 and attempts < 1000:
+    while count < 100 and attempts < 1000:
         attempts += 1
         try:
             c = CONCEPTS[order[attempts % len(order)]]
@@ -949,8 +949,8 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             count += 1
 
             if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/150 Hard Contradiction")
-                print(f"  Progress: {count}/150 Hard Contradiction")
+                logging.info(f"  ✓ Generated {count}/100 Hard Contradiction")
+                print(f"  Progress: {count}/100 Hard Contradiction")
                 if checkpoint_path:
                     write_csv(checkpoint_path, rows)
 
@@ -958,11 +958,11 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Error in Phase 2b: {e}")
             continue
 
-    # 3. Hard Unsupported (150)
-    logging.info("\nPhase 2c: Generating 150 Hard Unsupported samples...")
-    print("  - 150 Hard Unsupported samples...")
+    # 3. Hard Unsupported (100)
+    logging.info("\nPhase 2c: Generating 100 Hard Unsupported samples...")
+    print("  - 100 Hard Unsupported samples...")
     count = 0
-    while count < 150 and attempts < 1400:
+    while count < 100 and attempts < 1400:
         attempts += 1
         try:
             c = CONCEPTS[order[attempts % len(order)]]
@@ -985,8 +985,8 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             count += 1
 
             if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/150 Hard Unsupported")
-                print(f"  Progress: {count}/150 Hard Unsupported")
+                logging.info(f"  ✓ Generated {count}/100 Hard Unsupported")
+                print(f"  Progress: {count}/100 Hard Unsupported")
                 if checkpoint_path:
                     write_csv(checkpoint_path, rows)
 
@@ -1016,7 +1016,7 @@ def write_csv(path: str, rows: List[dict]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Generate 1500 high-quality test samples: 900 Controlled + 600 Hard Set"
+        description="Generate 1000 high-quality test samples: 600 Controlled + 400 Hard Set"
     )
     ap.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
@@ -1024,7 +1024,7 @@ def main() -> None:
     ap.add_argument(
         "--out",
         type=str,
-        default="./synthetic_finance_1500.csv",
+        default="./synthetic_finance_1000.csv",
         help="Output CSV file path",
     )
     ap.add_argument(
@@ -1054,7 +1054,7 @@ def main() -> None:
     print("=" * 70)
     print("High-Quality Test Set Generation")
     print("=" * 70)
-    print("Structure: 900 Controlled + 600 Hard Set (Balanced)")
+    print("Structure: 600 Controlled + 400 Hard Set (Balanced)")
     print(f"Seed: {args.seed}")
     print(f"Log file: {args.log}")
     print("=" * 70)
