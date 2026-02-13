@@ -893,7 +893,7 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Paraphrase error sample {idx}: {e}")
         return idx, None, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         futures = {
             executor.submit(process_paraphrase, idx, controlled_samples[idx]): idx
             for idx in paraphrase_indices
@@ -967,7 +967,7 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
                 time.sleep(1)
         return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         futures = [executor.submit(process_hard_sample, item) for item in indexed_tasks]
 
         completed = 0
