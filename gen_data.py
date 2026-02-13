@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import difflib
 import hashlib
@@ -9,6 +10,7 @@ import logging
 import os
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import List
@@ -71,7 +73,7 @@ def llm_generate(
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
-                timeout=60.0,  # Client-side timeout (seconds)
+                timeout=90.0,  # Client-side timeout (increased)
                 # response_format={"type": "json_object"} if json_mode else None # distinct API might not support
             )
 
@@ -116,7 +118,11 @@ def llm_generate(
 
 
 def validate_claim(
-    claim: str, evidence: str, seen_hashes: set, check_similarity: bool = True
+    claim: str,
+    evidence: str,
+    seen_hashes: set,
+    lock: threading.Lock = None,
+    check_similarity: bool = True,
 ) -> bool:
     """
     Quality Gate:
@@ -132,18 +138,17 @@ def validate_claim(
     # Cleaning
     claim = _norm_ws(claim)
 
-    # 1. Length Gate
+    # 1. Length Gate (Strict < 50 words)
     words = claim.split()
-    if len(words) < 8 or len(words) > 60:
+    if len(words) < 5 or len(words) > 50:
         logging.warning(f"Rejecting claim (length {len(words)}): {claim}")
         return False
 
-    # 2. Leakage Gate
     forbidden = [
         "evidence:",
-        "based on",
-        "according to",
-        "this claim",
+        # "based on",  # Too strict
+        # "according to", # Too strict
+        # "this claim", # Too strict
         "false because",
         "true because",
         "is supported by",
@@ -170,11 +175,21 @@ def validate_claim(
             logging.warning(f"Rejecting claim (similarity {ratio:.2f}): {claim}")
             return False
 
-    # 5. Deduplication
+    # 5. Deduplication (Atomic with Lock)
     h = hashlib.md5(claim.encode("utf-8")).hexdigest()
-    if h in seen_hashes:
-        logging.warning(f"Rejecting claim (duplicate): {claim}")
-        return False
+
+    if lock:
+        with lock:
+            if h in seen_hashes:
+                logging.warning(f"Rejecting claim (duplicate): {claim}")
+                return False
+            seen_hashes.add(h)
+    else:
+        # Fallback for single-thread (or unsafe)
+        if h in seen_hashes:
+            logging.warning(f"Rejecting claim (duplicate): {claim}")
+            return False
+        seen_hashes.add(h)
 
     return True
 
@@ -225,25 +240,35 @@ def llm_paraphrase_evidence(evidence: str) -> str:
 
 
 def llm_paraphrase_claim(
-    claim: str, evidence: str, expected_label: str, seen_hashes: set
+    claim: str,
+    evidence: str,
+    expected_label: str,
+    seen_hashes: set,
+    lock: threading.Lock,
 ) -> str:
     """
     Use LLM to paraphrase claim + drift check + quality gate.
     """
     prompt = (
-        "Rephrase this claim to be a concise financial news headline or statement. "
+        "Rephrase this claim to be a concise financial news headline or statement (under 40 words). "
         "Keep the meaning EXACTLY the same. Do not add facts.\n\n"
+        "Examples:\n"
+        "Original: The company decided to reduce its workforce by 10% to cut costs.\n"
+        "Rephrased: Firm announces 10% staff reduction to improve efficiency.\n\n"
         f"Original: {claim}"
     )
 
     # Try up to 2 times
     for _ in range(2):
-        new_claim = llm_generate(prompt, json_mode=True)
+        # Disable json_mode for simpler text return
+        new_claim = llm_generate(prompt, json_mode=False)
         if not new_claim:
             continue
 
-        # Quality Gate
-        if not validate_claim(new_claim, evidence, seen_hashes, check_similarity=True):
+        # Quality Gate (Pass lock for atomic dedup)
+        if not validate_claim(
+            new_claim, evidence, seen_hashes, lock, check_similarity=True
+        ):
             continue
 
         # Drift Check
@@ -257,28 +282,39 @@ def llm_paraphrase_claim(
 
 
 def make_hard_contradiction(
-    evidence: str, base_concept: str, rng: random.Random, seen_hashes: set
+    evidence: str,
+    base_concept: str,
+    rng: random.Random,
+    seen_hashes: set,
+    lock: threading.Lock,
 ) -> str:
     """
     Create a claim that clearly contradicts the evidence.
     """
     prompt = (
-        "Based on this evidence, generate a single sentence claim that DIRECTLY CONTRADICTS the evidence. "
+        "Based on this evidence, generate a single short sentence claim (under 40 words) that DIRECTLY CONTRADICTS the evidence. "
         "The claim must be false given the evidence.\n\n"
+        "Examples:\n"
+        "Evidence: Inflation reduces purchasing power.\n"
+        "Claim: Inflation increases the value of money over time.\n\n"
         f"Evidence: {evidence}\n"
         f"Topic: {base_concept}\n"
     )
 
     for _ in range(3):
-        claim = llm_generate(prompt, json_mode=True)
-        if validate_claim(claim, evidence, seen_hashes, check_similarity=False):
+        claim = llm_generate(prompt, json_mode=False)
+        if validate_claim(claim, evidence, seen_hashes, lock, check_similarity=False):
             return claim
 
     return f"The opposite of the evidence is true regarding {base_concept}."
 
 
 def make_hard_unsupported(
-    evidence: str, base_concept: str, rng: random.Random, seen_hashes: set
+    evidence: str,
+    base_concept: str,
+    rng: random.Random,
+    seen_hashes: set,
+    lock: threading.Lock,
 ) -> str:
     """
     Create a claim that adds unsupported absolute conditions, specific numbers, or causal leaps.
@@ -293,22 +329,29 @@ def make_hard_unsupported(
     pattern = rng.choice(patterns)
 
     prompt = (
-        f"Based on this evidence, generate a plausible-sounding but UNSUPPORTED claim.\n"
+        f"Based on this evidence, generate a plausible-sounding but UNSUPPORTED claim (under 40 words).\n"
         f"Style: {pattern}.\n"
+        "Examples:\n"
+        "Evidence: The company reported a 5% increase in revenue.\n"
+        "Claim: The company is guaranteed to double its revenue next year due to secret government contracts.\n\n"
         f"Evidence: {evidence}\n"
         "The claim should use concepts from the evidence but add specific details/absolutes NOT found in the text."
     )
 
     for _ in range(3):
-        claim = llm_generate(prompt, json_mode=True)
-        if validate_claim(claim, evidence, seen_hashes, check_similarity=True):
+        claim = llm_generate(prompt, json_mode=False)
+        if validate_claim(claim, evidence, seen_hashes, lock, check_similarity=True):
             return claim
 
     return f"This concept regarding {base_concept} is guaranteed to yield 100% returns."
 
 
 def make_hard_true(
-    evidence: str, base_concept: str, rng: random.Random, seen_hashes: set
+    evidence: str,
+    base_concept: str,
+    rng: random.Random,
+    seen_hashes: set,
+    lock: threading.Lock,
 ) -> str:
     """
     generate a complex TRUE claim (entailed by evidence) to balance the hard set.
@@ -321,14 +364,17 @@ def make_hard_true(
     pattern = rng.choice(patterns)
 
     prompt = (
-        f"Generate a single sentence claim that is FULLY SUPPORTED by the evidence.\n"
+        f"Generate a single sentence claim (under 40 words) that is FULLY SUPPORTED by the evidence.\n"
         f"Style: {pattern}.\n"
+        "Examples:\n"
+        "Evidence: Bond prices fall when interest rates rise.\n"
+        "Claim: An increase in interest rates typically leads to a decline in bond prices.\n\n"
         f"Evidence: {evidence}\n"
     )
 
     for _ in range(3):
-        claim = llm_generate(prompt, json_mode=True)
-        if validate_claim(claim, evidence, seen_hashes, check_similarity=True):
+        claim = llm_generate(prompt, json_mode=False)
+        if validate_claim(claim, evidence, seen_hashes, lock, check_similarity=True):
             return claim
 
     # Fallback to simple extraction
@@ -774,7 +820,7 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     rows: List[dict] = []
 
     # =============================
-    # A. Generate 900 Controlled Samples
+    # A. Generate 600 Controlled Samples
     # =============================
     logging.info("=" * 70)
     logging.info("Phase 1: Generating 600 controlled samples")
@@ -784,16 +830,12 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
 
     controlled_samples = []
 
+    # 1. Generate Base Samples (Fast, Rule-based)
     for i in range(600):
         try:
             c = CONCEPTS[order[i % len(order)]]
-
-            # Balanced: 300 true, 300 false
             is_true = i < 300
-
-            # Generate evidence from concept
             evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
-
             # Generate claim based on evidence (rule-based)
             if is_true:
                 claim = make_true_claim(c, rng)
@@ -808,7 +850,12 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
 
             # Track hash
             h = hashlib.md5(claim.encode("utf-8")).hexdigest()
-            seen_hashes.add(h)
+            seen_hashes.add(
+                h
+            )  # Single thread here, no lock needed yet or use lock if desired
+            # We can use lock to be consistent, but Phase 1 part 1 is sequential.
+            # However, seen_hashes is shared later.
+            # Safe to just add since parallel part hasn't started yet.
 
             controlled_samples.append(
                 {
@@ -818,181 +865,125 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
                     "type": "controlled",
                 }
             )
-
-            if (i + 1) % 50 == 0:
-                logging.info(f"  ✓ Generated {i + 1}/600 controlled samples")
-                print(f"  Progress: {i + 1}/600 controlled samples")
-                if checkpoint_path:
-                    write_csv(checkpoint_path, rows + controlled_samples)
-
         except Exception as e:
-            logging.error(f"Error generating controlled sample {i + 1}: {str(e)}")
-            continue
+            logging.error(f"Error generating controlled sample {i}: {e}")
 
-    # Randomly select 350 samples for LLM paraphrase
-    logging.info(
-        "\nApplying LLM paraphrase to 350 randomly selected controlled samples..."
-    )
-    paraphrase_indices = set(rng.sample(range(600), 350))
-    paraphrase_count = 0
+    # 2. Parallel Paraphrase (350 samples)
+    logging.info("\nParaphrasing 350 samples in parallel...")
+    print("Paraphrasing 350 samples in parallel using 10 workers...")
 
-    for idx, sample in enumerate(controlled_samples):
-        if idx in paraphrase_indices:
-            try:
-                # Apply LLM paraphrase with checks
-                # Need to use the helper that does validation/drift check
-                org_claim = sample["claim"]
-                new_claim = llm_paraphrase_claim(
-                    org_claim, sample["evidence"], sample["label"], seen_hashes
-                )
+    paraphrase_indices = set(rng.sample(range(len(controlled_samples)), 350))
+    hash_lock = threading.Lock()
 
-                # Update hash if changed
-                if new_claim != org_claim:
-                    sample["claim"] = new_claim
-                    sample["type"] = "controlled_paraphrased"
+    def process_paraphrase(idx, sample):
+        try:
+            org_claim = sample["claim"]
+            # Pass lock to llm_paraphrase_claim
+            new_claim = llm_paraphrase_claim(
+                org_claim,
+                sample["evidence"],
+                sample["label"],
+                seen_hashes,
+                hash_lock,
+            )
+            # Validation/Dedup already handled inside llm_paraphrase_claim
+            if new_claim != org_claim:
+                return idx, new_claim, "controlled_paraphrased"
+        except Exception as e:
+            logging.error(f"Paraphrase error sample {idx}: {e}")
+        return idx, None, None
 
-                    # Update seen_hashes (remove old? No, keep it to avoid regression)
-                    h = hashlib.md5(new_claim.encode("utf-8")).hexdigest()
-                    seen_hashes.add(h)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(process_paraphrase, idx, controlled_samples[idx]): idx
+            for idx in paraphrase_indices
+        }
 
-                    paraphrase_count += 1
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            idx, new_claim, new_type = future.result()
+            if new_claim:
+                controlled_samples[idx]["claim"] = new_claim
+                controlled_samples[idx]["type"] = new_type
 
-                if paraphrase_count > 0 and paraphrase_count % 50 == 0:
-                    logging.info(f"  ✓ Paraphrased {paraphrase_count} samples")
-                    print(f"  Progress: Paraphrased {paraphrase_count} samples")
-                    if checkpoint_path:
-                        write_csv(checkpoint_path, rows + controlled_samples)
+            completed += 1
+            if completed % 50 == 0:
+                print(f"  Paraphrased {completed}/350 samples")
+                logging.info(f"  ✓ Paraphrased {completed}/350 samples")
 
-            except Exception as e:
-                logging.error(f"Error paraphrasing sample {idx}: {str(e)}")
-                continue
+    if checkpoint_path:
+        write_csv(checkpoint_path, rows + controlled_samples)
 
-    logging.info(f"✓ Phase 1 complete: {len(controlled_samples)} samples")
     rows.extend(controlled_samples)
+    logging.info(f"✓ Phase 1 complete: {len(rows)} samples")
 
     # =============================
-    # B. Generate 600 Hard Set Samples (LLM-BASED)
+    # B. Generate 400 Hard Set Samples (Parallel)
     # =============================
-    logging.info("\n" + "=" * 70)
-    logging.info("Phase 2: Generating 400 hard set samples (LLM-based)")
-    logging.info("  - 200 Hard True (Complex Paraphrase)")
-    logging.info("  - 100 Hard Contradiction")
-    logging.info("  - 100 Hard Unsupported")
-    logging.info("=" * 70)
-    print("Generating 400 hard set samples...")
+    logging.info("\nPhase 2: Generating 400 hard set samples (Parallel)")
+    print("\nGenerating 400 hard set samples (Parallel)...")
 
-    # 1. Hard True (200)
-    logging.info("Phase 2a: Generating 200 Hard True samples...")
-    print("  - 200 Hard True samples...")
-    count = 0
-    attempts = 0
-    # Use while loop to ensure we get enough valid samples
-    while count < 200 and attempts < 400:
-        attempts += 1
-        try:
-            c = CONCEPTS[order[attempts % len(order)]]
-            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
-            evidence = llm_paraphrase_evidence(
-                evidence
-            )  # Paraphrase evidence for hard set
+    # We need: 200 Hard True, 100 Hard Contradiction, 100 Hard Unsupported
+    tasks = []
+    # (function, count, type_label, label_val)
+    tasks.extend([(make_hard_true, "hard_true", "true")] * 200)
+    tasks.extend([(make_hard_contradiction, "hard_contradiction", "false")] * 100)
+    tasks.extend([(make_hard_unsupported, "hard_unsupported", "false")] * 100)
 
-            claim = make_hard_true(evidence, c.topic, rng, seen_hashes)
+    # Shuffle tasks so we don't hammer one type first
+    rng.shuffle(tasks)
 
-            # Track hash
-            h = hashlib.md5(claim.encode("utf-8")).hexdigest()
-            seen_hashes.add(h)
+    # Add index to tasks to allow deterministic seeding per worker
+    indexed_tasks = list(enumerate(tasks))  # (index, (func, type, label))
 
-            rows.append(
-                {
+    generated_hard_samples = []
+
+    def process_hard_sample(item):
+        idx, (func, type_label, label_val) = item
+        # Create LOCAL RNG using seed + index
+        local_rng = random.Random(seed + idx + 10000)
+
+        # Retry loop inside worker to ensure we get a sample
+        for _ in range(5):
+            try:
+                # Pick random concept using LOCAL rng
+                c = local_rng.choice(CONCEPTS)
+                evidence = make_evidence(c, local_rng, min_ev_fillers, max_ev_fillers)
+                evidence = llm_paraphrase_evidence(evidence)
+
+                # Generate claim (pass lock and local_rng)
+                claim = func(evidence, c.topic, local_rng, seen_hashes, hash_lock)
+
+                # Hashes updated inside func->validate_claim (atomic)
+
+                return {
                     "claim": claim,
                     "evidence": evidence,
-                    "label": "true",
-                    "type": "hard_true",
+                    "label": label_val,
+                    "type": type_label,
                 }
-            )
-            count += 1
+            except Exception as e:
+                logging.error(f"Hard sample gen error: {e}")
+                time.sleep(1)
+        return None
 
-            if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/200 Hard True")
-                print(f"  Progress: {count}/200 Hard True")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_hard_sample, item) for item in indexed_tasks]
+
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res:
+                generated_hard_samples.append(res)
+
+            completed += 1
+            if completed % 50 == 0:
+                print(f"  Generated {completed}/{len(tasks)} hard samples")
+                logging.info(f"  ✓ Generated {completed}/{len(tasks)} hard samples")
                 if checkpoint_path:
-                    write_csv(checkpoint_path, rows)
+                    write_csv(checkpoint_path, rows + generated_hard_samples)
 
-        except Exception as e:
-            logging.error(f"Error in Phase 2a: {e}")
-            continue
-
-    # 2. Hard Contradiction (100)
-    logging.info("\nPhase 2b: Generating 100 Hard Contradiction samples...")
-    print("  - 100 Hard Contradiction samples...")
-    count = 0
-    while count < 100 and attempts < 1000:
-        attempts += 1
-        try:
-            c = CONCEPTS[order[attempts % len(order)]]
-            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
-            evidence = llm_paraphrase_evidence(evidence)
-
-            claim = make_hard_contradiction(evidence, c.topic, rng, seen_hashes)
-
-            h = hashlib.md5(claim.encode("utf-8")).hexdigest()
-            seen_hashes.add(h)
-
-            rows.append(
-                {
-                    "claim": claim,
-                    "evidence": evidence,
-                    "label": "false",
-                    "type": "hard_contradiction",
-                }
-            )
-            count += 1
-
-            if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/100 Hard Contradiction")
-                print(f"  Progress: {count}/100 Hard Contradiction")
-                if checkpoint_path:
-                    write_csv(checkpoint_path, rows)
-
-        except Exception as e:
-            logging.error(f"Error in Phase 2b: {e}")
-            continue
-
-    # 3. Hard Unsupported (100)
-    logging.info("\nPhase 2c: Generating 100 Hard Unsupported samples...")
-    print("  - 100 Hard Unsupported samples...")
-    count = 0
-    while count < 100 and attempts < 1400:
-        attempts += 1
-        try:
-            c = CONCEPTS[order[attempts % len(order)]]
-            evidence = make_evidence(c, rng, min_ev_fillers, max_ev_fillers)
-            evidence = llm_paraphrase_evidence(evidence)
-
-            claim = make_hard_unsupported(evidence, c.topic, rng, seen_hashes)
-
-            h = hashlib.md5(claim.encode("utf-8")).hexdigest()
-            seen_hashes.add(h)
-
-            rows.append(
-                {
-                    "claim": claim,
-                    "evidence": evidence,
-                    "label": "false",
-                    "type": "hard_unsupported",
-                }
-            )
-            count += 1
-
-            if count % 50 == 0:
-                logging.info(f"  ✓ Generated {count}/100 Hard Unsupported")
-                print(f"  Progress: {count}/100 Hard Unsupported")
-                if checkpoint_path:
-                    write_csv(checkpoint_path, rows)
-
-        except Exception as e:
-            logging.error(f"Error in Phase 2c: {e}")
-            continue
+    rows.extend(generated_hard_samples)
 
     # Shuffle
     logging.info("\nShuffling all samples...")
