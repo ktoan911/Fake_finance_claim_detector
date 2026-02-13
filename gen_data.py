@@ -20,15 +20,27 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Initialize once (avoid re-creating client for every call)
+# Initialize clients for round-robin usage
 MEGALLM_BASE_URL = os.getenv("MEGALLM_BASE_URL", "https://ai.megallm.io/v1")
-MEGALLM_API_KEY = os.getenv("MEGALLM_API_KEY", "")  # set via env for safety
 MEGALLM_MODEL = os.getenv("MEGALLM_MODEL", "deepseek-r1-distill-llama-70b")
 
-client = OpenAI(
-    base_url=MEGALLM_BASE_URL,
-    api_key=MEGALLM_API_KEY,
-)
+# Collect keys from env (support MEGALLM_API_KEY and MEGALLM_API_KEY_2)
+api_keys = []
+if k1 := os.getenv("MEGALLM_API_KEY"):
+    api_keys.append(k1)
+if k2 := os.getenv("MEGALLM_API_KEY_2"):
+    api_keys.append(k2)
+
+# Allow comma-separated keys in MEGALLM_API_KEY as well
+if not api_keys and (keys_str := os.getenv("MEGALLM_API_KEY")):
+    api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+
+if not api_keys:
+    logging.warning("No API keys found in env! Expect failures.")
+    api_keys = [""]  # Fallback to empty to allow init (will fail on generate)
+
+clients = [OpenAI(base_url=MEGALLM_BASE_URL, api_key=key) for key in api_keys]
+logging.info(f"Loaded {len(clients)} API key(s). Workers will match key count.")
 
 
 def llm_generate(
@@ -54,6 +66,9 @@ def llm_generate(
 
     for attempt in range(max_retries):
         try:
+            # Round-robin or random selection of client to distribute load
+            client = random.choice(clients)
+
             resp = client.chat.completions.create(
                 model=MEGALLM_MODEL,
                 messages=[
@@ -869,8 +884,10 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Error generating controlled sample {i}: {e}")
 
     # 2. Parallel Paraphrase (350 samples)
-    logging.info("\nParaphrasing 350 samples in parallel...")
-    print("Paraphrasing 350 samples in parallel using 10 workers...")
+    # Use max_workers = len(clients) to respect rate limits per key
+    max_w = len(clients) if len(clients) > 0 else 1
+    logging.info(f"Paraphrasing 350 samples in parallel using {max_w} workers...")
+    print(f"Paraphrasing 350 samples in parallel using {max_w} workers...")
 
     paraphrase_indices = set(rng.sample(range(len(controlled_samples)), 350))
     hash_lock = threading.Lock()
@@ -893,7 +910,7 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
             logging.error(f"Paraphrase error sample {idx}: {e}")
         return idx, None, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
         futures = {
             executor.submit(process_paraphrase, idx, controlled_samples[idx]): idx
             for idx in paraphrase_indices
@@ -921,7 +938,9 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
     # B. Generate 400 Hard Set Samples (Parallel)
     # =============================
     logging.info("\nPhase 2: Generating 400 hard set samples (Parallel)")
-    print("\nGenerating 400 hard set samples (Parallel)...")
+    # Use max_workers = len(clients)
+    max_w = len(clients) if len(clients) > 0 else 1
+    print(f"\nGenerating 400 hard set samples (Parallel {max_w} workers)...")
 
     # We need: 200 Hard True, 100 Hard Contradiction, 100 Hard Unsupported
     tasks = []
@@ -967,9 +986,8 @@ def build_rows(seed: int, checkpoint_path: str = None) -> List[dict]:
                 time.sleep(1)
         return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
         futures = [executor.submit(process_hard_sample, item) for item in indexed_tasks]
-
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
