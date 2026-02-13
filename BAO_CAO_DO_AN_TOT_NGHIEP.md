@@ -200,6 +200,22 @@ Temporal(d) = γ · Recency(d) + (1 - γ) · Cyclicity(d)
 
 Với `γ` = 0.5 (cân bằng giữa recency và pattern detection)
 
+#### 2.2.5. Reciprocal Rank Fusion (RRF)
+
+RRF là thuật toán phổ biến để kết hợp kết quả từ nhiều hệ thống tìm kiếm khác nhau mà không cần chuẩn hóa điểm số (score normalization). RRF hoạt động dựa trên thứ hạng (rank) của tài liệu:
+
+```
+RRF(d) = Σ (1 / (k + rank_i(d)))
+```
+
+Trong đó:
+- `rank_i(d)`: Thứ hạng của tài liệu `d` trong hệ thống tìm kiếm `i`.
+- `k`: Hằng số làm mượt (thường k=60).
+
+**Ưu điểm:**
+- Mạnh mẽ (Robust): Nếu một tài liệu có thứ hạng cao trong một hệ thống nhưng thấp trong hệ thống khác, nó vẫn có điểm RRF tốt.
+- Không phụ thuộc scale: Không bị ảnh hưởng bởi thang đo điểm số khác nhau của BM25 (không giới hạn) và Vector Similarity (0-1).
+
 ### 2.3. Large Language Models và LoRA Fine-tuning
 
 #### 2.3.1. Causal Language Models
@@ -518,26 +534,22 @@ INPUT: Claim Text
                ▼
 ┌─────────────────────────────────────┐
 │ 3. Evidence Retrieval               │
-│    ┌─────────────────────────────┐  │
-│    │ 3a. Semantic Search (FAISS) │  │
-│    │     → Candidate pool (100)  │  │
-│    └──────────┬──────────────────┘  │
-│               │                     │
-│    ┌──────────▼──────────────────┐  │
-│    │ 3b. BM25 Scoring            │  │
-│    └──────────┬──────────────────┘  │
-│               │                     │
-│    ┌──────────▼──────────────────┐  │
-│    │ 3c. Temporal Scoring        │  │
-│    │     - Recency (exp decay)   │  │
-│    │     - Cyclicity (FFT)       │  │
-│    └──────────┬──────────────────┘  │
-│               │                     │
-│    ┌──────────▼──────────────────┐  │
-│    │ 3d. Final Ranking           │  │
-│    │     Score = α·BM25 +        │  │
-│    │            (1-α)·Temporal   │  │
-│    └──────────┬──────────────────┘  │
+│    ┌──────────────┐  ┌────────────┐ │
+│    │ 3a. Semantic │  │ 3b. BM25   │ │
+│    │     Search   │  │    Search  │ │
+│    └──────┬───────┘  └──────┬─────┘ │
+│           │                 │       │
+│           ▼                 ▼       │
+│    ┌──────────────────────────────┐ │
+│    │ 3c. Reciprocal Rank Fusion   │ │
+│    │     (RRF)                    │ │
+│    └──────────────┬───────────────┘ │
+│                   │                 │
+│    ┌──────────────▼───────────────┐ │
+│    │ 3d. Temporal Scoring         │ │
+│    │     Final = α·RRF +          │ │
+│    │             (1-α)·Temporal   │ │
+│    └──────────────┬───────────────┘ │
 └───────────────┼─────────────────────┘
                 │
                 ▼ Top-K Evidence
@@ -635,8 +647,10 @@ class KnowledgeAugmentedRetriever:
         query: str,
         top_k: int = 5
     ) -> List[RetrievalResult]:
-        # Stage 1: Semantic search (FAISS) → candidates
-        # Stage 2: BM25 scoring
+        # Stage 1: Parallel Search
+        #   - 1a. Semantic search (FAISS)
+        #   - 1b. Lexical search (BM25)
+        # Stage 2: Reciprocal Rank Fusion (RRF)
         # Stage 3: Temporal scoring (recency + cyclicity)
         # Stage 4: Final ranking và return top-k
 ```
@@ -932,27 +946,39 @@ text,evidence,label,timestamp
 **Giải pháp đề xuất:**
 Kết hợp **hybrid retrieval** với **temporal-aware scoring** và **cycle detection**.
 
-#### 4.1.2. Hybrid Retrieval Strategy
+#### 4.1.2. Hybrid Retrieval Strategy (Reciprocal Rank Fusion)
 
-**Stage 1: Candidate Generation (Semantic Search)**
-- Sử dụng FAISS với BGE embeddings
-- Generate candidate pool: top-100 semantically similar documents
-- Mục đích: Recall cao, lọc bỏ documents hoàn toàn không liên quan
+**Chiến lược RRF (Reciprocal Rank Fusion):**
+Thay vì sử dụng mô hình cascade (lọc tuần tự), hệ thống triển khai chiến lược **Parallel Retrieval** kết hợp với **Reciprocal Rank Fusion (RRF)** để tận dụng tối đa điểm mạnh của cả hai phương pháp tìm kiếm mà không bị phụ thuộc vào thứ tự lọc.
 
-**Stage 2: Lexical Reranking (BM25)**
-- Áp dụng BM25 trên candidate pool
-- Normalize scores về [0, 1]
-- Mục đích: Precision cao cho exact keyword matches
+**Stage 1: Parallel Retrieval**
+Hệ thống thực hiện song song hai truy vấn:
+1.  **Lexical Search (BM25)**: Tìm kiếm dựa trên từ khóa chính xác, hiệu quả với các thuật ngữ chuyên ngành (ví dụ: "ETF", "SEC").
+2.  **Semantic Search (Vector)**: Sử dụng BGE embeddings (BAAI/bge-small-en-v1.5) và FAISS để tìm kiếm dựa trên ngữ nghĩa, giúp bắt được các claim được diễn giải khác đi (paraphrased).
 
-**Equation 1 (Base Scoring):**
+**Stage 2: Fusion (RRF)**
+Kết quả từ hai luồng trên được kết hợp bằng thuật toán RRF. RRF đánh giá độ quan trọng của một tài liệu dựa trên thứ hạng của nó trong các hệ thống tìm kiếm thành phần.
+
+**Equation 1 (RRF Score):**
 ```
-Score(q, dᵢ) = α · BM25_norm(q, dᵢ) + (1 - α) · Temporal(dᵢ)
+RRF_score(d) = 1 / (k + rank_bm25(d)) + 1 / (k + rank_semantic(d))
+```
+Trong đó:
+- `rank_bm25(d)`: Thứ hạng của document `d` theo BM25.
+- `rank_semantic(d)`: Thứ hạng của document `d` theo Semantic Search.
+- `k`: Hằng số làm mượt (thường k=60) để tránh việc một hệ thống thống trị kết quả.
+
+**Stage 3: Temporal Integration**
+Điểm số RRF sau đó được chuẩn hóa và kết hợp với Temporal Score để tạo thành điểm số cuối cùng.
+
+**Equation 2 (Final Score):**
+```
+Final_Score(d) = α · Norm(RRF_score(d)) + (1 - α) · Temporal(d)
 ```
 
 **Hyperparameter α:**
-- `α = 0.7`: Ưu tiên content relevance (BM25) hơn temporal factor
-- Lý do: Trong crypto, content accuracy quan trọng hơn recency một chút
-- Trade-off: α cao → ổn định nhưng ít reactive với tin mới
+- `α = 0.7`: Ưu tiên độ phù hợp nội dung (RRF) hơn yếu tố thời gian.
+- `Norm(RRF_score)`: Min-Max normalization của điểm RRF về khoảng [0, 1].
 
 #### 4.1.3. Temporal Scoring Enhancement
 
@@ -993,7 +1019,7 @@ def calculate_cyclicity(timestamps: List[datetime]) -> float:
 - FFT detect dominant frequencies trong time series
 - High cyclicity → likely recurring scam → boost score nếu query match pattern
 
-**Equation 2 (Enhanced Temporal):**
+**Equation 3 (Enhanced Temporal):**
 ```
 Temporal(dᵢ) = γ · Recency(dᵢ) + (1 - γ) · Cyclicity(dᵢ)
 ```

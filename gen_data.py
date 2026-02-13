@@ -94,6 +94,9 @@ def llm_generate(
 
             text = (resp.choices[0].message.content or "").strip()
 
+            # Filters <think> tags from models like DeepSeek
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
             if json_mode:
                 # Try to find JSON blob if wrapped in markdown code blocks
                 match = re.search(r"\{.*\}", text, re.DOTALL)
