@@ -402,33 +402,51 @@ if TORCH_AVAILABLE:
             total_loss = 0.0
             num_batches = 0
 
+            # Automatic Mixed Precision to save GPU memory
+            scaler = (
+                torch.amp.GradScaler(device=self.device)
+                if self.device == "cuda"
+                else None
+            )
+
             for batch in dataloader:
-                anchor_emb = self.model.encode(batch["anchor"])
-                positive_emb = self.model.encode(batch["positive"])
-
-                negatives = batch["negatives"]
-                # Transpose the list of negatives to group by negative index
-                # If negatives was [N_neg][B], zip(*negatives) makes it [B][N_neg]
-                # If negatives was [B][N_neg], zip(*negatives) makes it [N_neg][B]
-                # Assuming default collate makes it [B][N_neg] (list of lists, each inner list is negatives for one sample)
-                # Then zip(*negatives) makes it [N_neg][B] (list of tuples, each tuple is the k-th negative across all samples)
-                negatives_by_k = list(zip(*negatives))
-
-                neg_embs_list = []
-                for neg_texts_k in negatives_by_k:
-                    # Encode the k-th negative for all samples in the batch
-                    neg_embs_list.append(self.model.encode(list(neg_texts_k)))
-
-                # Stack to [B, N_neg, Dim]
-                negative_embs = torch.stack(neg_embs_list, dim=1)
-
-                loss = self.model.compute_contrastive_loss(
-                    anchor_emb, positive_emb, negative_embs
-                )
-
                 self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+
+                with (
+                    torch.amp.autocast(device_type=self.device)
+                    if scaler
+                    else torch.autocast(device_type=self.device, enabled=False)
+                ):
+                    anchor_emb = self.model.encode(batch["anchor"])
+                    positive_emb = self.model.encode(batch["positive"])
+
+                    negatives = batch["negatives"]
+                    # Transpose the list of negatives to group by negative index
+                    negatives_by_k = list(zip(*negatives))
+
+                    neg_embs_list = []
+                    for neg_texts_k in negatives_by_k:
+                        # Encode the k-th negative for all samples in the batch
+                        neg_embs_list.append(self.model.encode(list(neg_texts_k)))
+
+                    # Stack to [B, N_neg, Dim]
+                    negative_embs = torch.stack(neg_embs_list, dim=1)
+
+                    loss = self.model.compute_contrastive_loss(
+                        anchor_emb, positive_emb, negative_embs
+                    )
+
+                if scaler:
+                    scaler.scale(loss).backward()
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
+
+                # Proactive garbage collection for extreme OOM cases
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
 
                 total_loss += loss.item()
                 num_batches += 1
