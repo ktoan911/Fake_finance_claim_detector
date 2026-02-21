@@ -58,6 +58,12 @@ def main():
         "--batch_size", type=int, default=16, help="Training batch size"
     )
     parser.add_argument(
+        "--max_length",
+        type=int,
+        default=512,
+        help="Maximum sequence length for tokenizer",
+    )
+    parser.add_argument(
         "--epochs", type=int, default=3, help="Number of training epochs"
     )
     parser.add_argument(
@@ -132,7 +138,10 @@ def main():
     # NOTE: freeze_base=False allows the base transformer to be fully finetuned during the contrastive learning process
     # instead of just training the linear projection head, leading to better representations.
     model = ContrastiveEmbeddingModel(
-        base_model_name=args.model_name, lambda_reg=0.001, freeze_base=False
+        base_model_name=args.model_name,
+        lambda_reg=0.001,
+        freeze_base=False,
+        max_length=args.max_length,
     )
     model = model.to(args.device)
 

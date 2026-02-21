@@ -257,14 +257,28 @@ if TORCH_AVAILABLE:
             embedding_dim: int = 384,
             lambda_reg: float = 0.001,
             freeze_base: bool = True,
+            max_length: int = 512,
         ):
             super().__init__()
 
             self.lambda_reg = lambda_reg
             self.embedding_dim = embedding_dim
+            # Strict memory cap on attention matrices
+            self.max_length = max_length
 
             if SENTENCE_TRANSFORMERS_AVAILABLE:
                 self.encoder = SentenceTransformer(base_model_name)
+
+                # If doing long sequences, enable gradient checkpointing to save VRAM
+                if max_length > 512 and not freeze_base:
+                    if hasattr(
+                        self.encoder[0].auto_model, "gradient_checkpointing_enable"
+                    ):
+                        logger.warning(
+                            f"Max length {max_length} is large! Enabling Gradient Checkpointing to save VRAM."
+                        )
+                        self.encoder[0].auto_model.gradient_checkpointing_enable()
+
                 if freeze_base:
                     for param in self.encoder.parameters():
                         param.requires_grad = False
@@ -297,8 +311,18 @@ if TORCH_AVAILABLE:
                 if self.training and any(
                     p.requires_grad for p in self.encoder.parameters()
                 ):
-                    # Tokenize
+                    # Tokenize with strict mapping to prevent OOM
                     features = self.encoder.tokenize(texts)
+
+                    if hasattr(self.encoder.tokenizer, "pad_token_id"):
+                        features = self.encoder.tokenizer(
+                            texts,
+                            padding=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_tensors="pt",
+                        )
+
                     features = {k: v.to(device) for k, v in features.items()}
                     # Forward pass through base model to get gradients
                     out_features = self.encoder(features)
