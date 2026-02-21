@@ -134,6 +134,7 @@ def main():
     model = ContrastiveEmbeddingModel(
         base_model_name=args.model_name, lambda_reg=0.001, freeze_base=False
     )
+    model = model.to(args.device)
 
     # 2. Initialize Dataset
     logger.info(
