@@ -55,6 +55,12 @@ def main():
         default=os.getenv("FUSION_OUTPUT_PATH", "artifacts/fusion_model.pt"),
         help="Path to save the fusion model",
     )
+    parser.add_argument(
+        "--retriever_model",
+        type=str,
+        default="BAAI/bge-small-en-v1.5",
+        help="Path to trained dense retrieval model",
+    )
 
     args = parser.parse_args()
 
@@ -103,6 +109,7 @@ def main():
 
     fusion_config = FusionTrainingConfig(
         model_name=args.model_path,
+        retriever_model=args.retriever_model,
         device=args.device,
         batch_size=args.batch_size,
         llm_batch_size=args.llm_batch_size,

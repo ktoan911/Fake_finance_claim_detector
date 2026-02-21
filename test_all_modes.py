@@ -109,6 +109,12 @@ def main():
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of samples for testing"
     )
+    parser.add_argument(
+        "--retriever_model",
+        type=str,
+        default=None,
+        help="Override trained dense retrieval model path. If not provided, will use the one used during fusion training.",
+    )
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
     parser.add_argument(
         "--llm_batch_size", type=int, default=1, help="LLM inference batch size"
@@ -157,9 +163,19 @@ def main():
         f"Built temporary KB with {len(kb_docs)} unique documents from test set evidence (deduplicated)"
     )
 
+    # Fusion Model
+    retrieval_encoder, fusion_layer, fusion_config = load_fusion_model(
+        args.fusion_model, args.device
+    )
+    top_k = fusion_config.get("top_k", 10)
+    retriever_model = args.retriever_model or fusion_config.get(
+        "retriever_model", "BAAI/bge-small-en-v1.5"
+    )
+
     # 2. Initialize Components
     # Retriever
-    retriever = KnowledgeAugmentedRetriever(rrf_k=60)
+    logger.info(f"Using retriever model: {retriever_model}")
+    retriever = KnowledgeAugmentedRetriever(embedding_model=retriever_model, rrf_k=60)
     retriever.index_documents(kb_docs, text_field="text", timestamp_field="timestamp")
 
     # LLM Scorer
@@ -170,12 +186,6 @@ def main():
         labels=LABEL_LIST,  # ['True', 'False']
         prompt_template=PROMPT_TEMPLATE,
     )
-
-    # Fusion Model
-    retrieval_encoder, fusion_layer, fusion_config = load_fusion_model(
-        args.fusion_model, args.device
-    )
-    top_k = fusion_config.get("top_k", 10)
 
     # 3. Running Inference
     results_summary = []

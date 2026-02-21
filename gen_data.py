@@ -220,8 +220,8 @@ def check_entailment(claim: str, evidence: str, expected_label: str) -> bool:
         "Verify the relationship between the CLAIM and the EVIDENCE.\n"
         f"EVIDENCE: {evidence}\n"
         f"CLAIM: {claim}\n\n"
-        "Does the evidence SUPPORT, CONTRADICT, or provide NOT_ENOUGH_INFO for the claim?\n"
-        "Return ONLY one word: SUPPORTED, CONTRADICTED, or NEUTRAL."
+        "Does the evidence SUPPORT or CONTRADICT the claim?\n"
+        "Return ONLY one word: SUPPORTED or CONTRADICTED."
     )
 
     result = llm_generate(prompt, json_mode=False).upper().strip()
@@ -229,10 +229,8 @@ def check_entailment(claim: str, evidence: str, expected_label: str) -> bool:
     # Map result to label
     if "SUPPORT" in result:
         predicted = "true"
-    elif "CONTRADICT" in result:
-        predicted = "false"
     else:
-        predicted = "neutral"
+        predicted = "false"
 
     matches = predicted == expected_label
     if not matches:

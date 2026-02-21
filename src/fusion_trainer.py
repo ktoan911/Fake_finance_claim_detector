@@ -37,6 +37,7 @@ class FusionTrainingConfig:
         "retrieved"  # "gold" or "retrieved" - per paper, should be "retrieved"
     )
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
+    retriever_model: str = "BAAI/bge-small-en-v1.5"
 
 
 def _build_retrieval_features(
@@ -97,6 +98,7 @@ def train_fusion_from_dataframe(
 
     # Initialize retriever with RRF hybrid
     retriever = KnowledgeAugmentedRetriever(
+        embedding_model=config.retriever_model,
         alpha=config.alpha,
         lambda_decay=config.lambda_decay,
         gamma=config.gamma,
@@ -305,6 +307,7 @@ def train_fusion_from_dataframe(
             "beta": fusion.beta.item(),
             "config": {
                 "model_name": config.model_name,
+                "retriever_model": config.retriever_model,
                 "top_k": config.top_k,
                 "num_classes": num_classes,
                 "initial_beta": config.initial_beta,
