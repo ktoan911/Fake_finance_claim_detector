@@ -140,6 +140,44 @@ if TORCH_AVAILABLE:
             triplets = []
             scam_types = list(self.scams_by_type.keys())
 
+            # Optimization: Pre-compute similarity for all scammers at once if hard negative mining is enabled
+            if self.legit_embeddings is not None and len(self.legitimate_samples) > 0:
+                logger.info(
+                    "Computing similarities for Hard Negative Mining in batch..."
+                )
+                # Encode all unique scam texts to find hard negatives faster
+                all_scam_texts = list({s["text"] for s in self.scam_samples})
+                # Max context length warning, split into batches if too large
+                batch_size = 256
+                scam_embs_list = []
+                for i in range(0, len(all_scam_texts), batch_size):
+                    batch_texts = all_scam_texts[i : i + batch_size]
+                    batch_embs = self.embedding_model.encode(
+                        batch_texts, normalize=True
+                    ).cpu()
+                    scam_embs_list.append(batch_embs)
+
+                scam_embs = torch.cat(scam_embs_list, dim=0)  # [Num_Scams, Dim]
+
+                # Compute full similarity matrix: [Num_Scams, Num_Legit]
+                sim_matrix = F.cosine_similarity(
+                    scam_embs.unsqueeze(1), self.legit_embeddings.unsqueeze(0), dim=2
+                )
+
+                # Fetch top-k indices mapping
+                top_k = min(20, len(self.legitimate_samples))
+                top_k_indices_matrix = torch.topk(
+                    sim_matrix, k=top_k, dim=1
+                ).indices  # [Num_Scams, K]
+
+                # Dictionary for fast lookup
+                self.hard_negative_lookup = {
+                    text: top_k_indices_matrix[i]
+                    for i, text in enumerate(all_scam_texts)
+                }
+            else:
+                self.hard_negative_lookup = {}
+
             for _ in range(num_triplets):
                 anchor_type = np.random.choice(scam_types)
                 anchor_samples = self.scams_by_type[anchor_type]
@@ -175,19 +213,8 @@ if TORCH_AVAILABLE:
                 negatives = []
 
                 # Try to mine hard negatives
-                if self.legit_embeddings is not None:
-                    # Find legitimate sample that is semantically similar to anchor
-                    anchor_emb = self.embedding_model.encode(
-                        [anchor_text], normalize=True
-                    ).cpu()
-
-                    # Compute cosine similarity
-                    sims = F.cosine_similarity(anchor_emb, self.legit_embeddings, dim=1)
-
-                    # Select top-k similar but not identical
-                    top_k_indices = torch.topk(
-                        sims, k=min(20, len(self.legitimate_samples))
-                    ).indices
+                if anchor_text in self.hard_negative_lookup:
+                    top_k_indices = self.hard_negative_lookup[anchor_text]
 
                     # Add hard negatives
                     num_hard = int(self.num_negatives * self.hard_negative_ratio)
@@ -426,6 +453,9 @@ if TORCH_AVAILABLE:
             total_loss = 0.0
             num_batches = 0
 
+            # Gradient Accumulation Steps
+            accum_steps = 4
+
             # Automatic Mixed Precision to save GPU memory
             scaler = (
                 torch.amp.GradScaler(device=self.device)
@@ -433,49 +463,60 @@ if TORCH_AVAILABLE:
                 else None
             )
 
-            for batch in dataloader:
-                self.optimizer.zero_grad()
+            for step, batch in enumerate(dataloader):
+                # 1. Prepare flat text list to encode everything in ONE pass
+                anchors: List[str] = batch["anchor"]
+                positives: List[str] = batch["positive"]
+                negatives: List[List[str]] = batch["negatives"]  # [B][N_neg]
+
+                B = len(anchors)
+                N_neg = len(negatives[0]) if B > 0 else 0
+
+                # Flatten negatives: [B * N_neg]
+                neg_flat = [negatives[i][j] for i in range(B) for j in range(N_neg)]
+
+                # Combine all texts
+                all_texts = anchors + positives + neg_flat
 
                 with (
                     torch.amp.autocast(device_type=self.device)
                     if scaler
                     else torch.autocast(device_type=self.device, enabled=False)
                 ):
-                    anchor_emb = self.model.encode(batch["anchor"])
-                    positive_emb = self.model.encode(batch["positive"])
+                    # One big encode: [2B + B*N_neg, Dim]
+                    all_embs = self.model.encode(all_texts)
 
-                    negatives = batch["negatives"]
-                    # Transpose the list of negatives to group by negative index
-                    negatives_by_k = list(zip(*negatives))
+                    # Extract slices
+                    anchor_emb = all_embs[0:B]
+                    positive_emb = all_embs[B : 2 * B]
+                    neg_emb_flat = all_embs[2 * B :]
+                    negative_embs = neg_emb_flat.view(B, N_neg, -1)  # [B, N_neg, Dim]
 
-                    neg_embs_list = []
-                    for neg_texts_k in negatives_by_k:
-                        # Encode the k-th negative for all samples in the batch
-                        neg_embs_list.append(self.model.encode(list(neg_texts_k)))
-
-                    # Stack to [B, N_neg, Dim]
-                    negative_embs = torch.stack(neg_embs_list, dim=1)
-
+                    # Compute loss
                     loss = self.model.compute_contrastive_loss(
                         anchor_emb, positive_emb, negative_embs
                     )
 
+                    # Scale down loss for gradient accumulation
+                    loss = loss / accum_steps
+
                 if scaler:
                     scaler.scale(loss).backward()
-                    scaler.step(self.optimizer)
-                    scaler.update()
+
+                    if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                        self.optimizer.zero_grad(set_to_none=True)
                 else:
                     loss.backward()
-                    self.optimizer.step()
+                    if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
 
-                # Proactive garbage collection for extreme OOM cases
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-
-                total_loss += loss.item()
+                total_loss += float(loss.item()) * accum_steps
                 num_batches += 1
 
-            return total_loss / num_batches
+            return total_loss / max(num_batches, 1)
 
         def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
             """Evaluate embedding quality"""
