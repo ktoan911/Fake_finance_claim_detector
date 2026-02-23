@@ -377,6 +377,18 @@ if TORCH_AVAILABLE:
                 if hasattr(self.encoder, "max_seq_length"):
                     self.encoder.max_seq_length = max_length
 
+                # CRITICAL: also set on the inner Transformer module directly,
+                # because SentenceTransformer's setter sometimes doesn't propagate
+                # to encoder[0].max_seq_length (the module that actually tokenizes)
+                try:
+                    if hasattr(self.encoder[0], "max_seq_length"):
+                        self.encoder[0].max_seq_length = max_length
+                    # Also update the underlying HuggingFace tokenizer model_max_length
+                    if hasattr(self.encoder[0], "tokenizer"):
+                        self.encoder[0].tokenizer.model_max_length = max_length
+                except Exception:
+                    pass  # encoder[0] indexing may fail for some ST versions
+
                 # Explicitly enforce device placement before anything else
                 self.encoder.to(encoder_device)
 
@@ -451,15 +463,31 @@ if TORCH_AVAILABLE:
 
             # Ordinary frozen execution (micro-batched on CPU for safety)
             outs = []
+            # Get the actual HuggingFace tokenizer for guaranteed truncation.
+            # ST's encoder.tokenize() sometimes ignores max_seq_length, so we
+            # call the underlying tokenizer directly with explicit truncation args.
+            try:
+                hf_tokenizer = self.encoder[0].tokenizer
+            except (IndexError, AttributeError):
+                hf_tokenizer = getattr(self.encoder, "tokenizer", None)
+
             with torch.no_grad():
                 for i in range(0, len(texts), self.encode_batch_size):
                     chunk = texts[i : i + self.encode_batch_size]
 
-                    # Use SentenceTransformer's own tokenize() which already respects
-                    # self.encoder.max_seq_length = self.max_length set in __init__.
-                    # This avoids the direct tokenizer call ambiguities that caused
-                    # "size of tensor a (898) must match tensor b (512)" crashes.
-                    features = self.encoder.tokenize(chunk)
+                    if hf_tokenizer is not None:
+                        # Use HF tokenizer directly with strict truncation — guaranteed safe
+                        features = hf_tokenizer(
+                            chunk,
+                            padding=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_tensors="pt",
+                        )
+                    else:
+                        # Last resort: rely on ST tokenize() with max_seq_length set above
+                        features = self.encoder.tokenize(chunk)
+
                     features = {
                         k: v.to(self.encoder_device) for k, v in features.items()
                     }
