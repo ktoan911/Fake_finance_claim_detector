@@ -161,7 +161,13 @@ def main():
     )
 
     dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_triplets
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_triplets,
+        num_workers=0,  # IMPORTANT: avoid forking and multiplying RAM via Dataset copies
+        pin_memory=False,  # CPU encoder doesn't benefit from pinned memory
+        persistent_workers=False,
     )
 
     # 3. Initialize Trainer
