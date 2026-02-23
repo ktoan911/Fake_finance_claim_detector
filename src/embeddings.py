@@ -377,17 +377,32 @@ if TORCH_AVAILABLE:
                 if hasattr(self.encoder, "max_seq_length"):
                     self.encoder.max_seq_length = max_length
 
-                # CRITICAL: also set on the inner Transformer module directly,
-                # because SentenceTransformer's setter sometimes doesn't propagate
-                # to encoder[0].max_seq_length (the module that actually tokenizes)
+                # CRITICAL: auto-cap max_length at the model's hard limit.
+                # BERT-based models (bge-small etc.) have exactly 512 position
+                # embeddings — passing anything larger causes a guaranteed crash.
+                try:
+                    model_max_pos = self.encoder[
+                        0
+                    ].auto_model.config.max_position_embeddings
+                    if max_length > model_max_pos:
+                        logger.warning(
+                            f"--max_length {max_length} exceeds model's "
+                            f"max_position_embeddings ({model_max_pos}). "
+                            f"Auto-capping to {model_max_pos}."
+                        )
+                        max_length = model_max_pos
+                        self.max_length = max_length
+                except Exception:
+                    pass  # Best-effort; proceed with user-supplied value
+
+                # Propagate capped value to all tokenizer layers
                 try:
                     if hasattr(self.encoder[0], "max_seq_length"):
                         self.encoder[0].max_seq_length = max_length
-                    # Also update the underlying HuggingFace tokenizer model_max_length
                     if hasattr(self.encoder[0], "tokenizer"):
                         self.encoder[0].tokenizer.model_max_length = max_length
                 except Exception:
-                    pass  # encoder[0] indexing may fail for some ST versions
+                    pass
 
                 # Explicitly enforce device placement before anything else
                 self.encoder.to(encoder_device)
