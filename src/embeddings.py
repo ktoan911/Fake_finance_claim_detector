@@ -357,13 +357,45 @@ if TORCH_AVAILABLE:
             with torch.no_grad():
                 for i in range(0, len(texts), self.encode_batch_size):
                     chunk = texts[i : i + self.encode_batch_size]
-                    emb = self.encoder.encode(
-                        chunk,
-                        convert_to_tensor=True,
-                        show_progress_bar=False,
-                        batch_size=self.encode_batch_size,
-                        normalize_embeddings=False,
-                    )
+
+                    # BUGFIX: Handle SentenceTransformer not honoring max_seq_length occasionally
+                    # Force it via internal tokenization to guarantee truncation
+                    if hasattr(self.encoder, "tokenizer") and hasattr(
+                        self.encoder.tokenizer, "pad_token_id"
+                    ):
+                        features = self.encoder.tokenizer(
+                            chunk,
+                            padding=True,
+                            truncation=True,
+                            max_length=self.max_length,
+                            return_tensors="pt",
+                        )
+                        # We must move it to the correct device immediately
+                        features = {
+                            k: v.to(self.encoder_device) for k, v in features.items()
+                        }
+                        out_features = self.encoder.forward(features)
+                        # SentenceTransformers internal structures use ['sentence_embedding'] by default
+                        # but some models use ['token_embeddings']. We take safe fallback.
+                        if "sentence_embedding" in out_features:
+                            emb = out_features["sentence_embedding"]
+                        else:
+                            # Mean pooling fallback
+                            token_embs = out_features["token_embeddings"]
+                            mask = out_features["attention_mask"].unsqueeze(-1)
+                            emb = (token_embs * mask).sum(1) / torch.clamp(
+                                mask.sum(1), min=1e-9
+                            )
+                    else:
+                        # Fallback to default encode if tokenizer isn't accessible
+                        emb = self.encoder.encode(
+                            chunk,
+                            convert_to_tensor=True,
+                            show_progress_bar=False,
+                            batch_size=self.encode_batch_size,
+                            normalize_embeddings=False,
+                        )
+
                     outs.append(emb)
             return torch.cat(outs, dim=0)
 
