@@ -131,60 +131,56 @@ if TORCH_AVAILABLE:
                     legit_texts, normalize=True
                 ).cpu()
 
-            # Generate triplets
-            self.triplets = self._generate_triplets(num_triplets)
-            logger.info(f"Created dataset with {len(self.triplets)} triplets")
+            # Generate triplets on the fly instead of storing strings in RAM
+            self.num_triplets = num_triplets
+            logger.info(
+                f"Dataset ready to lazily generate {self.num_triplets} triplets via __getitem__"
+            )
 
-        def _generate_triplets(self, num_triplets: int) -> List[TripletSample]:
-            """Generate triplet samples with hard negative mining"""
-            triplets = []
+        def _topk_legit_for_scam(
+            self, scam_emb: torch.Tensor, k: int = 20, block: int = 4096
+        ):
+            """
+            Optimized chunked hard negative mining to prevent OOM
+            scam_emb: [1, D] or [D] on CPU, normalized
+            self.legit_embeddings: [L, D] on CPU, normalized
+            Return: indices [k]
+            """
+            best_scores = torch.full((k,), -1e9, device="cpu")
+            best_idx = torch.full((k,), -1, dtype=torch.long, device="cpu")
+
+            L = self.legit_embeddings.size(0)
+            scam_emb_flat = scam_emb.view(-1)
+
+            for start in range(0, L, block):
+                end = min(start + block, L)
+                chunk = self.legit_embeddings[start:end]  # [b, D]
+                scores = torch.mv(chunk, scam_emb_flat)  # cosine = dot (đã normalize)
+
+                # lấy topk trong block
+                tk = min(k, scores.numel())
+                s, idx = torch.topk(scores, k=tk)
+                idx = idx + start
+
+                # merge vào best hiện tại
+                all_scores = torch.cat([best_scores, s])
+                all_idx = torch.cat([best_idx, idx])
+                best_scores, pos = torch.topk(all_scores, k=k)
+                best_idx = all_idx[pos]
+
+            return best_idx
+
+        def __len__(self) -> int:
+            return self.num_triplets
+
+        def __getitem__(self, idx: int) -> Dict[str, Union[str, List[str]]]:
             scam_types = list(self.scams_by_type.keys())
 
-            # Optimization: Pre-compute similarity for all scammers at once if hard negative mining is enabled
-            if self.legit_embeddings is not None and len(self.legitimate_samples) > 0:
-                logger.info(
-                    "Computing similarities for Hard Negative Mining in batch..."
-                )
-                # Encode all unique scam texts to find hard negatives faster
-                all_scam_texts = list({s["text"] for s in self.scam_samples})
-                # Max context length warning, split into batches if too large
-                batch_size = 256
-                scam_embs_list = []
-                for i in range(0, len(all_scam_texts), batch_size):
-                    batch_texts = all_scam_texts[i : i + batch_size]
-                    batch_embs = self.embedding_model.encode(
-                        batch_texts, normalize=True
-                    ).cpu()
-                    scam_embs_list.append(batch_embs)
-
-                scam_embs = torch.cat(scam_embs_list, dim=0)  # [Num_Scams, Dim]
-
-                # Compute full similarity matrix: [Num_Scams, Num_Legit]
-                sim_matrix = F.cosine_similarity(
-                    scam_embs.unsqueeze(1), self.legit_embeddings.unsqueeze(0), dim=2
-                )
-
-                # Fetch top-k indices mapping
-                top_k = min(20, len(self.legitimate_samples))
-                top_k_indices_matrix = torch.topk(
-                    sim_matrix, k=top_k, dim=1
-                ).indices  # [Num_Scams, K]
-
-                # Dictionary for fast lookup
-                self.hard_negative_lookup = {
-                    text: top_k_indices_matrix[i]
-                    for i, text in enumerate(all_scam_texts)
-                }
-            else:
-                self.hard_negative_lookup = {}
-
-            for _ in range(num_triplets):
+            # Loop until we successfully form a triplet
+            while True:
                 anchor_type = np.random.choice(scam_types)
                 anchor_samples = self.scams_by_type[anchor_type]
 
-                # We need at least 1 sample.
-                # If using Claim-Evidence, 1 is enough.
-                # If using Claim-Claim (fallback), we need 2.
                 if not anchor_samples:
                     continue
 
@@ -200,21 +196,28 @@ if TORCH_AVAILABLE:
                     using_evidence = True
                 elif len(anchor_samples) >= 2:
                     # Fallback: Metric Learning (Cluster same scam types)
-                    # Pick another sample of same type
                     pos_idx = np.random.choice(
                         [i for i in range(len(anchor_samples)) if i != anchor_idx]
                     )
                     positive_text = anchor_samples[pos_idx]["text"]
                     using_evidence = False
                 else:
-                    # Cannot form pair
                     continue
 
                 negatives = []
 
-                # Try to mine hard negatives
-                if anchor_text in self.hard_negative_lookup:
-                    top_k_indices = self.hard_negative_lookup[anchor_text]
+                # Try to mine hard negatives on-the-fly
+                if self.legit_embeddings is not None:
+                    # Find legitimate sample that is semantically similar to anchor
+                    with torch.no_grad():
+                        anchor_emb = self.embedding_model.encode(
+                            [anchor_text], normalize=True
+                        ).cpu()
+
+                    # Call optimized chunked search instead of full matrix
+                    top_k_indices = self._topk_legit_for_scam(
+                        anchor_emb, k=min(20, len(self.legitimate_samples))
+                    )
 
                     # Add hard negatives
                     num_hard = int(self.num_negatives * self.hard_negative_ratio)
@@ -233,7 +236,6 @@ if TORCH_AVAILABLE:
                             neg_type = np.random.choice(other_types)
                             neg_sample = np.random.choice(self.scams_by_type[neg_type])
 
-                            # If we are doing Claim-Evidence, try to pick Evidence as negative too
                             if (
                                 using_evidence
                                 and "evidence" in neg_sample
@@ -252,24 +254,12 @@ if TORCH_AVAILABLE:
                             np.random.choice(self.legitimate_samples)["text"]
                         )
 
-                triplets.append(
-                    TripletSample(
-                        anchor=anchor_text, positive=positive_text, negatives=negatives
-                    )
-                )
-
-            return triplets
-
-        def __len__(self) -> int:
-            return len(self.triplets)
-
-        def __getitem__(self, idx: int) -> Dict[str, Union[str, List[str]]]:
-            triplet = self.triplets[idx]
-            return {
-                "anchor": triplet.anchor,
-                "positive": triplet.positive,
-                "negatives": triplet.negatives,
-            }
+                # If we successfully made it here, return the dictionary triplet directly
+                return {
+                    "anchor": anchor_text,
+                    "positive": positive_text,
+                    "negatives": negatives,
+                }
 
     class ContrastiveEmbeddingModel(nn.Module):
         """
