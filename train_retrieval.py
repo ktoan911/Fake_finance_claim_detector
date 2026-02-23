@@ -135,13 +135,15 @@ def main():
     logger.info(
         f"Initializing ContrastiveEmbeddingModel tightly wrapping {args.model_name}..."
     )
-    # NOTE: freeze_base=False allows the base transformer to be fully finetuned during the contrastive learning process
-    # instead of just training the linear projection head, leading to better representations.
+    # NOTE: freeze_base=True and encoder_device="cpu" forces the heavy base transformer to run on
+    # system RAM in micro-batches while only the linear projection head runs on GPU, avoiding OOM.
     model = ContrastiveEmbeddingModel(
         base_model_name=args.model_name,
         lambda_reg=0.001,
-        freeze_base=False,
+        freeze_base=True,
         max_length=args.max_length,
+        encoder_device="cpu",
+        encode_batch_size=args.batch_size,
     )
     model = model.to(args.device)
 

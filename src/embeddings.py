@@ -284,7 +284,9 @@ if TORCH_AVAILABLE:
             embedding_dim: int = 384,
             lambda_reg: float = 0.001,
             freeze_base: bool = True,
-            max_length: int = 512,
+            max_length: int = 256,
+            encoder_device: str = "cpu",
+            encode_batch_size: int = 16,
         ):
             super().__init__()
 
@@ -292,9 +294,16 @@ if TORCH_AVAILABLE:
             self.embedding_dim = embedding_dim
             # Strict memory cap on attention matrices
             self.max_length = max_length
+            self.encoder_device = encoder_device
+            self.encode_batch_size = encode_batch_size
 
             if SENTENCE_TRANSFORMERS_AVAILABLE:
-                self.encoder = SentenceTransformer(base_model_name)
+                self.encoder = SentenceTransformer(
+                    base_model_name, device=encoder_device
+                )
+
+                if hasattr(self.encoder, "max_seq_length"):
+                    self.encoder.max_seq_length = max_length
 
                 # If doing long sequences, enable gradient checkpointing to save VRAM
                 if max_length > 512 and not freeze_base:
@@ -323,45 +332,57 @@ if TORCH_AVAILABLE:
                 f"ContrastiveEmbeddingModel initialized: dim={self.embedding_dim}, λ={lambda_reg}"
             )
 
+        def _encode_base_microbatch(self, texts: List[str]) -> torch.Tensor:
+            """
+            Encode base embeddings in micro-batches to control peak memory.
+            Runs on self.encoder_device (CPU recommended).
+            """
+            if self.encoder is None:
+                return torch.randn(len(texts), self.embedding_dim)
+
+            # If we are training and base is not frozen, we need gradients
+            if self.training and any(
+                p.requires_grad for p in self.encoder.parameters()
+            ):
+                device = next(self.projection.parameters()).device
+                # Tokenize with strict mapping to prevent OOM
+                features = self.encoder.tokenize(texts)
+
+                if hasattr(self.encoder.tokenizer, "pad_token_id"):
+                    features = self.encoder.tokenizer(
+                        texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors="pt",
+                    )
+
+                features = {k: v.to(device) for k, v in features.items()}
+                # Forward pass through base model to get gradients
+                out_features = self.encoder(features)
+                return out_features["sentence_embedding"]
+
+            # Ordinary frozen execution (micro-batched on CPU for safety)
+            outs = []
+            with torch.no_grad():
+                for i in range(0, len(texts), self.encode_batch_size):
+                    chunk = texts[i : i + self.encode_batch_size]
+                    emb = self.encoder.encode(
+                        chunk,
+                        convert_to_tensor=True,
+                        show_progress_bar=False,
+                        batch_size=self.encode_batch_size,
+                        normalize_embeddings=False,
+                    )
+                    outs.append(emb)
+            return torch.cat(outs, dim=0)
+
         def encode(self, texts: List[str], normalize: bool = True) -> torch.Tensor:
             """Encode texts to embeddings."""
-            device = next(self.projection.parameters()).device
+            proj_device = next(self.projection.parameters()).device
 
-            if self.encoder is not None:
-                # If we are training and base is not frozen, we need gradients
-                # SentenceTransformer encode by default uses no_grad(), so we must bypass it
-                # or use its deeper forward methods.
-                # However, an easier way to get gradients from HuggingFace models inside SentenceTransformer
-                # is to pass tokenized input directly to the core transformer model.
-
-                # As a workaround to sentence-transformers' `.encode()` which is hardcoded for inference:
-                if self.training and any(
-                    p.requires_grad for p in self.encoder.parameters()
-                ):
-                    # Tokenize with strict mapping to prevent OOM
-                    features = self.encoder.tokenize(texts)
-
-                    if hasattr(self.encoder.tokenizer, "pad_token_id"):
-                        features = self.encoder.tokenizer(
-                            texts,
-                            padding=True,
-                            truncation=True,
-                            max_length=self.max_length,
-                            return_tensors="pt",
-                        )
-
-                    features = {k: v.to(device) for k, v in features.items()}
-                    # Forward pass through base model to get gradients
-                    out_features = self.encoder(features)
-                    base_embeddings = out_features["sentence_embedding"]
-                else:
-                    with torch.no_grad():
-                        base_embeddings = self.encoder.encode(
-                            texts, convert_to_tensor=True, show_progress_bar=False
-                        )
-                        base_embeddings = base_embeddings.to(device)
-            else:
-                base_embeddings = torch.randn(len(texts), self.embedding_dim).to(device)
+            base_embeddings = self._encode_base_microbatch(texts)
+            base_embeddings = base_embeddings.to(proj_device, non_blocking=True)
 
             projected = self.projection(base_embeddings)
 
