@@ -701,9 +701,13 @@ if TORCH_AVAILABLE:
 
         def train_epoch(self, dataloader: DataLoader) -> float:
             """Train for one epoch"""
+            import time as _time
+
             self.model.train()
             total_loss = 0.0
             num_batches = 0
+            total_steps = len(dataloader)
+            log_every = max(1, min(50, total_steps // 5))  # log ~5 times per epoch
 
             # Gradient Accumulation Steps
             accum_steps = 4
@@ -714,6 +718,12 @@ if TORCH_AVAILABLE:
                 if self.device == "cuda"
                 else None
             )
+
+            logger.info(
+                f"[train_epoch] {total_steps} steps | accum={accum_steps} | "
+                f"effective_batch={self.batch_size * accum_steps} | device={self.device}"
+            )
+            t_epoch_start = _time.time()
 
             for step, batch in enumerate(dataloader):
                 # 1. Prepare flat text list to encode everything in ONE pass
@@ -759,26 +769,53 @@ if TORCH_AVAILABLE:
                         scaler.step(self.optimizer)
                         scaler.update()
                         self.optimizer.zero_grad(set_to_none=True)
+                        logger.debug(
+                            f"  [step {step + 1}] grad update | loss={float(loss.item()) * accum_steps:.4f}"
+                        )
                 else:
                     loss.backward()
                     if (step + 1) % accum_steps == 0 or (step + 1) == len(dataloader):
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
+                        logger.debug(
+                            f"  [step {step + 1}] grad update | loss={float(loss.item()) * accum_steps:.4f}"
+                        )
 
-                total_loss += float(loss.item()) * accum_steps
+                batch_loss = float(loss.item()) * accum_steps
+                total_loss += batch_loss
                 num_batches += 1
 
-            return total_loss / max(num_batches, 1)
+                # Log progress every log_every steps
+                if (step + 1) % log_every == 0 or (step + 1) == total_steps:
+                    elapsed = _time.time() - t_epoch_start
+                    avg_so_far = total_loss / num_batches
+                    steps_per_sec = (step + 1) / max(elapsed, 1e-6)
+                    eta = (total_steps - step - 1) / max(steps_per_sec, 1e-6)
+                    logger.info(
+                        f"  step {step + 1:>4}/{total_steps} | "
+                        f"loss={batch_loss:.4f} | avg={avg_so_far:.4f} | "
+                        f"elapsed={elapsed:.1f}s | ETA={eta:.1f}s"
+                    )
+
+            epoch_time = _time.time() - t_epoch_start
+            avg_loss = total_loss / max(num_batches, 1)
+            logger.info(
+                f"[train_epoch done] avg_loss={avg_loss:.4f} | "
+                f"batches={num_batches} | time={epoch_time:.1f}s"
+            )
+            return avg_loss
 
         def evaluate(self, dataloader: DataLoader) -> Dict[str, float]:
             """Evaluate embedding quality"""
             self.model.eval()
+            logger.info("[evaluate] Running evaluation on dataloader...")
 
             pos_similarities = []
             neg_similarities = []
+            total_eval_steps = len(dataloader)
 
             with torch.no_grad():
-                for batch in dataloader:
+                for eval_step, batch in enumerate(dataloader):
                     anchor_emb = self.model.encode(batch["anchor"])
                     positive_emb = self.model.encode(batch["positive"])
 
@@ -796,6 +833,12 @@ if TORCH_AVAILABLE:
                     pos_similarities.extend(pos_sim.cpu().numpy().tolist())
                     neg_similarities.extend(neg_sim.cpu().numpy().tolist())
 
+                    if (eval_step + 1) % max(1, total_eval_steps // 4) == 0:
+                        logger.debug(
+                            f"  [eval] step {eval_step + 1}/{total_eval_steps} | "
+                            f"samples so far: {len(pos_similarities)}"
+                        )
+
             pos_similarities = np.array(pos_similarities)
             neg_similarities = np.array(neg_similarities)
 
@@ -808,6 +851,16 @@ if TORCH_AVAILABLE:
                 "target_neg_distance": 1 - np.mean(neg_similarities),
             }
 
+            logger.info(
+                f"\n[evaluate results]\n"
+                f"  Samples evaluated  : {len(pos_similarities)}\n"
+                f"  mean_pos_similarity: {metrics['mean_pos_similarity']:.4f}  (muốn -> 1.0)\n"
+                f"  mean_neg_similarity: {metrics['mean_neg_similarity']:.4f}  (muốn -> 0.0)\n"
+                f"  pos_neg_gap        : {metrics['pos_neg_gap']:.4f}  (muốn tăng)\n"
+                f"  separation_rate    : {metrics['separation_rate']:.4f}  (% pos > neg, muốn -> 1.0)\n"
+                f"  target_pos_dist    : {metrics['target_pos_distance']:.4f}\n"
+                f"  target_neg_dist    : {metrics['target_neg_distance']:.4f}"
+            )
             return metrics
 
 else:

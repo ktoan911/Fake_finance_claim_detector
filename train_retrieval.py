@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# train_retrieval.py — with detailed logging
 """
 Train the dense retrieval model using the custom Contrastive Learning pipeline
 defined in src.embeddings.
@@ -15,6 +16,7 @@ import argparse
 import ast
 import os
 import re
+import time
 
 import pandas as pd
 import torch
@@ -90,24 +92,47 @@ def load_finfact_dataset(csv_path: str):
 
     records = []
     skipped = 0
-    for _, row in df.iterrows():
+    total_rows = len(df)
+    logger.info(f"Parsing {total_rows} rows from CSV...")
+
+    for idx, (_, row) in enumerate(df.iterrows()):
         claim = str(row["claim"]).strip()
         if not claim or claim.lower() == "nan":
             skipped += 1
             continue
 
         if pd.isna(row["evidence"]):
+            logger.debug(f"  Row {idx}: skipped (NaN evidence)")
             skipped += 1
             continue
 
         evs = parse_evidence_list(row["evidence"])
         if not evs:
+            logger.debug(f"  Row {idx}: skipped (no valid evidence sentences)")
             skipped += 1
             continue
 
         records.append({"claim": claim, "evidences": evs})
 
-    logger.info(f"Loaded {len(records)} records ({skipped} skipped) from {csv_path}")
+        if (idx + 1) % 500 == 0:
+            logger.info(
+                f"  Parsed {idx + 1}/{total_rows} rows | kept={len(records)} skipped={skipped}"
+            )
+
+    all_evs = [ev for r in records for ev in r["evidences"]]
+    ev_counts = [len(r["evidences"]) for r in records]
+    logger.info(
+        f"\n{'=' * 50}\n"
+        f"  CSV loaded: {csv_path}\n"
+        f"  Total rows      : {total_rows}\n"
+        f"  Kept records    : {len(records)}\n"
+        f"  Skipped         : {skipped}\n"
+        f"  Total sentences : {len(all_evs)}\n"
+        f"  Avg ev/claim    : {len(all_evs) / max(1, len(records)):.1f}\n"
+        f"  Min ev/claim    : {min(ev_counts) if ev_counts else 0}\n"
+        f"  Max ev/claim    : {max(ev_counts) if ev_counts else 0}\n"
+        f"{'=' * 50}"
+    )
     return records
 
 
@@ -185,19 +210,17 @@ def main():
     args = parser.parse_args()
 
     # 1. Load data
+    t0 = time.time()
     logger.info(f"Loading dataset from {args.csv}")
     records = load_finfact_dataset(args.csv)
+    logger.info(f"Data loading took {time.time() - t0:.1f}s")
 
     if len(records) < 2:
         logger.error("Need at least 2 records to build negatives. Aborting.")
         return
 
-    # Log some stats
-    total_ev = sum(len(r["evidences"]) for r in records)
     logger.info(
-        f"  Records  : {len(records)}\n"
-        f"  Total ev : {total_ev}\n"
-        f"  Avg ev/rec: {total_ev / len(records):.1f}"
+        f"Device: {args.device} | epochs={args.epochs} | batch={args.batch_size} | triplets/epoch={args.num_triplets}"
     )
 
     # 2. Initialize model
@@ -242,19 +265,50 @@ def main():
     )
 
     # 5. Training loop
-    logger.info(f"Starting training for {args.epochs} epochs on {args.device}...")
+    logger.info(f"\n{'=' * 50}")
+    logger.info(
+        f"Starting training: {args.epochs} epochs | {args.num_triplets} triplets/epoch | device={args.device}"
+    )
+    logger.info(f"{'=' * 50}")
+    train_start = time.time()
+    history = []
+
     for epoch in range(args.epochs):
+        epoch_start = time.time()
+        logger.info(f"\n--- Epoch {epoch + 1}/{args.epochs} ---")
         avg_loss = trainer.train_epoch(dataloader)
+        epoch_time = time.time() - epoch_start
 
         if epoch == args.epochs - 1:
+            logger.info("Running final evaluation...")
             metrics = trainer.evaluate(dataloader)
             logger.info(
                 f"Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f} | "
+                f"Time: {epoch_time:.1f}s | "
                 f"Pos-Neg Gap: {metrics['pos_neg_gap']:.4f} | "
-                f"Separation: {metrics['separation_rate']:.4f}"
+                f"Separation: {metrics['separation_rate']:.4f} | "
+                f"Pos sim: {metrics['mean_pos_similarity']:.4f} | "
+                f"Neg sim: {metrics['mean_neg_similarity']:.4f}"
+            )
+            history.append(
+                {
+                    **{"epoch": epoch + 1, "loss": avg_loss, "time": epoch_time},
+                    **metrics,
+                }
             )
         else:
-            logger.info(f"Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f}")
+            logger.info(
+                f"Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f} | Time: {epoch_time:.1f}s"
+            )
+            history.append({"epoch": epoch + 1, "loss": avg_loss, "time": epoch_time})
+
+    total_time = time.time() - train_start
+    logger.info(f"\n{'=' * 50}")
+    logger.info(
+        f"Training complete | Total time: {total_time:.1f}s ({total_time / 60:.1f} min)"
+    )
+    logger.info("Loss history: " + " -> ".join(f"{h['loss']:.4f}" for h in history))
+    logger.info(f"{'=' * 50}")
 
     # 6. Save model
     os.makedirs(args.output_dir, exist_ok=True)
