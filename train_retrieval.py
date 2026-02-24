@@ -1,44 +1,130 @@
 #!/usr/bin/env python3
 """
 Train the dense retrieval model using the custom Contrastive Learning pipeline
-defined in src.embeddings. Extends the base SentenceTransformer (bge-small)
-with a custom projection layer and Multiple Negatives + Hard Negatives Mining.
+defined in src.embeddings.
+
+Dataset: data/finfact_raw_truefalse.csv
+  - claim   : the claim text (anchor)
+  - evidence : Python-list string of evidence sentences (positives)
+
+Goal: Given a claim, the retriever should rank its supporting evidence
+      sentences higher than evidence from other claims.
 """
 
 import argparse
+import ast
 import os
+import re
 
 import pandas as pd
 import torch
 from loguru import logger
 from torch.utils.data import DataLoader
 
-from src.csv_loader import CSVLabeledLoader
-
 try:
     from src.embeddings import (
         SENTENCE_TRANSFORMERS_AVAILABLE,
         TORCH_AVAILABLE,
         ContrastiveEmbeddingModel,
-        CryptoEmbeddingDataset,
         CryptoEmbeddingTrainer,
+        RetrievalDataset,
     )
 except ImportError as e:
     raise ImportError(f"Could not import embedding modules: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_evidence_list(raw: str) -> list[str]:
+    """
+    Parse the evidence column which may be stored as:
+      1. A Python list literal: ['sentence 1', 'sentence 2', ...]
+      2. A plain multi-sentence string separated by period / newline
+    Returns a de-duplicated list of non-empty strings (min 10 chars).
+    """
+    raw = str(raw).strip()
+    sentences = []
+
+    # Try ast.literal_eval first (handles proper Python list literals)
+    try:
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, list):
+            sentences = [str(s).strip() for s in parsed]
+        else:
+            sentences = [str(parsed).strip()]
+    except (ValueError, SyntaxError):
+        # Fallback: split on newlines or double-spaces
+        parts = re.split(r"\n{1,}|\.\s{2,}", raw)
+        sentences = [p.strip() for p in parts]
+
+    # Filter short / empty strings
+    sentences = [s for s in sentences if len(s) >= 10]
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for s in sentences:
+        key = s.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    return unique
+
+
+def load_finfact_dataset(csv_path: str):
+    """
+    Load finfact_raw_truefalse.csv and return list of
+    {'claim': str, 'evidences': List[str]} dicts.
+    Only rows with at least one valid evidence sentence are kept.
+    """
+    df = pd.read_csv(csv_path)
+
+    required = {"claim", "evidence"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"CSV is missing required columns: {missing}. Found: {df.columns.tolist()}"
+        )
+
+    records = []
+    skipped = 0
+    for _, row in df.iterrows():
+        claim = str(row["claim"]).strip()
+        if not claim or claim.lower() == "nan":
+            skipped += 1
+            continue
+
+        if pd.isna(row["evidence"]):
+            skipped += 1
+            continue
+
+        evs = parse_evidence_list(row["evidence"])
+        if not evs:
+            skipped += 1
+            continue
+
+        records.append({"claim": claim, "evidences": evs})
+
+    logger.info(f"Loaded {len(records)} records ({skipped} skipped) from {csv_path}")
+    return records
+
+
 def collate_triplets(batch):
     """
-    Custom collate function for CryptoEmbeddingDataset.
-    Expected batch is a list of dicts:
-    {"anchor": str, "positive": str, "negatives": List[str]}
+    Custom collate for RetrievalDataset.
+    Each item: {'anchor': str, 'positive': str, 'negatives': List[str]}
     """
     anchors = [item["anchor"] for item in batch]
     positives = [item["positive"] for item in batch]
-    # List of lists [B, num_negatives]
-    negatives = [item["negatives"] for item in batch]
-
+    negatives = [item["negatives"] for item in batch]  # List[List[str]]
     return {"anchor": anchors, "positive": positives, "negatives": negatives}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -48,11 +134,19 @@ def main():
         )
 
     parser = argparse.ArgumentParser(
-        description="Fine-tune Retrieval Model using Custom Pipeline"
+        description="Fine-tune Retrieval Model on finfact_raw_truefalse.csv"
     )
-    parser.add_argument("--csv", type=str, required=True, help="Path to training CSV")
     parser.add_argument(
-        "--model_name", type=str, default="BAAI/bge-small-en-v1.5", help="Base model"
+        "--csv",
+        type=str,
+        default="data/finfact_raw_truefalse.csv",
+        help="Path to training CSV (claim/evidence columns)",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="BAAI/bge-small-en-v1.5",
+        help="Base SentenceTransformer model",
     )
     parser.add_argument(
         "--batch_size", type=int, default=16, help="Training batch size"
@@ -64,13 +158,16 @@ def main():
         help="Maximum sequence length for tokenizer",
     )
     parser.add_argument(
-        "--epochs", type=int, default=3, help="Number of training epochs"
+        "--epochs", type=int, default=5, help="Number of training epochs"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=1e-4, help="Learning rate"
+        "--learning_rate", type=float, default=2e-4, help="Learning rate"
     )
     parser.add_argument(
-        "--num_triplets", type=int, default=5000, help="Number of triplets to generate"
+        "--num_triplets",
+        type=int,
+        default=8000,
+        help="Number of (anchor, positive, negatives) triplets to sample per epoch",
     )
     parser.add_argument(
         "--num_negatives", type=int, default=3, help="Negatives per anchor"
@@ -82,61 +179,29 @@ def main():
         help="Directory to save the trained model",
     )
 
-    # Device setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    parser.add_argument(
-        "--device", type=str, default=device, help="Device to train on (cuda/cpu)"
-    )
+    parser.add_argument("--device", type=str, default=device, help="Device (cuda/cpu)")
 
     args = parser.parse_args()
 
-    logger.info(f"Loading data from {args.csv}")
-    df = CSVLabeledLoader(args.csv).load()
+    # 1. Load data
+    logger.info(f"Loading dataset from {args.csv}")
+    records = load_finfact_dataset(args.csv)
 
-    scam_samples = []
-    legit_samples = []
-
-    # Split dataset based on label
-    # In Fake Crypto Claim Detector: False (scam/refuted) = 1, True (legitimate/supported) = 0
-    for _, row in df.iterrows():
-        claim = str(row["text"]).strip()
-        evidence_full = str(row["evidence"]).strip()
-        label = row["label"]
-
-        if not claim or not evidence_full or pd.isna(row["evidence"]):
-            continue
-
-        # Support multiple evidence segments split by "|||"
-        # Create separate sample entries for each evidence snippet
-        evidences = [
-            e.strip() for e in evidence_full.split("|||") if len(e.strip()) > 10
-        ]
-
-        for ev in evidences:
-            sample = {
-                "text": claim,
-                "evidence": ev,
-                "scam_type": "default",  # Can be expanded if CSV contains more metadata
-            }
-            if label == 1:
-                scam_samples.append(sample)
-            elif label == 0:
-                legit_samples.append(sample)
-
-    logger.info(
-        f"Loaded {len(scam_samples)} scam entries and {len(legit_samples)} legit entries."
-    )
-
-    if len(scam_samples) == 0 or len(legit_samples) == 0:
-        logger.error("Need both scam and legitimate samples to train contrastively.")
+    if len(records) < 2:
+        logger.error("Need at least 2 records to build negatives. Aborting.")
         return
 
-    # 1. Initialize custom Model
+    # Log some stats
+    total_ev = sum(len(r["evidences"]) for r in records)
     logger.info(
-        f"Initializing ContrastiveEmbeddingModel tightly wrapping {args.model_name}..."
+        f"  Records  : {len(records)}\n"
+        f"  Total ev : {total_ev}\n"
+        f"  Avg ev/rec: {total_ev / len(records):.1f}"
     )
-    # NOTE: freeze_base=True and encoder_device="cpu" forces the heavy base transformer to run on
-    # system RAM in micro-batches while only the linear projection head runs on GPU, avoiding OOM.
+
+    # 2. Initialize model
+    logger.info(f"Initializing ContrastiveEmbeddingModel ({args.model_name})...")
     model = ContrastiveEmbeddingModel(
         base_model_name=args.model_name,
         lambda_reg=0.001,
@@ -147,17 +212,15 @@ def main():
     )
     model = model.to(args.device)
 
-    # 2. Initialize Dataset
+    # 3. Build dataset
     logger.info(
-        f"Building Dataset with {args.num_triplets} triplets and Hard Negative Mining..."
+        f"Building RetrievalDataset with {args.num_triplets} triplets "
+        f"and {args.num_negatives} negatives each..."
     )
-    dataset = CryptoEmbeddingDataset(
-        scam_samples=scam_samples,
-        legitimate_samples=legit_samples,
+    dataset = RetrievalDataset(
+        records=records,
         num_triplets=args.num_triplets,
         num_negatives=args.num_negatives,
-        hard_negative_ratio=0.5,
-        embedding_model=model,  # Use Model for hard negative mining
     )
 
     dataloader = DataLoader(
@@ -165,12 +228,12 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_triplets,
-        num_workers=0,  # IMPORTANT: avoid forking and multiplying RAM via Dataset copies
-        pin_memory=False,  # CPU encoder doesn't benefit from pinned memory
+        num_workers=0,
+        pin_memory=False,
         persistent_workers=False,
     )
 
-    # 3. Initialize Trainer
+    # 4. Initialize trainer
     trainer = CryptoEmbeddingTrainer(
         model=model,
         learning_rate=args.learning_rate,
@@ -178,29 +241,28 @@ def main():
         device=args.device,
     )
 
-    # 4. Train Loop
+    # 5. Training loop
     logger.info(f"Starting training for {args.epochs} epochs on {args.device}...")
     for epoch in range(args.epochs):
         avg_loss = trainer.train_epoch(dataloader)
 
-        # Only evaluate every few epochs or on the last one to save time
         if epoch == args.epochs - 1:
             metrics = trainer.evaluate(dataloader)
             logger.info(
                 f"Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f} | "
-                + f"Pos-Neg Gap: {metrics['pos_neg_gap']:.4f} | Separation: {metrics['separation_rate']:.4f}"
+                f"Pos-Neg Gap: {metrics['pos_neg_gap']:.4f} | "
+                f"Separation: {metrics['separation_rate']:.4f}"
             )
         else:
             logger.info(f"Epoch {epoch + 1}/{args.epochs} | Loss: {avg_loss:.4f}")
 
-    # 5. Save the Fine-Tuned Base Model (so sentence-transformers can natively load it later without projection artifacts!)
+    # 6. Save model
     os.makedirs(args.output_dir, exist_ok=True)
 
     if hasattr(model, "encoder") and model.encoder is not None:
-        logger.info(f"Saving fine-tuned base SentenceTransformer to {args.output_dir}")
+        logger.info(f"Saving fine-tuned SentenceTransformer to {args.output_dir}")
         model.encoder.save(args.output_dir)
 
-        # Also save the custom projection state_dict just in case we need it for advanced inference later
         torch.save(
             model.projection.state_dict(),
             os.path.join(args.output_dir, "custom_projection.pt"),

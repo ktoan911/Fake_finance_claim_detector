@@ -590,6 +590,93 @@ if TORCH_AVAILABLE:
 
             return contrastive_loss + reg_loss
 
+    class RetrievalDataset(TorchDataset):
+        """
+        Dataset for training a retrieval model on claim-evidence pairs.
+
+        Format of ``records``:
+            [
+              {"claim": "...", "evidences": ["sentence 1", "sentence 2", ...]},
+              ...
+            ]
+
+        Each triplet:
+          anchor   = claim text
+          positive = one randomly sampled evidence sentence from that claim
+          negatives = evidence sentences sampled from *other* claims
+
+        This is a drop-in replacement for CryptoEmbeddingDataset when the
+        training data comes from finfact_raw_truefalse.csv (claim / evidence
+        columns) rather than the scam/legit split used by CryptoEmbeddingDataset.
+        """
+
+        def __init__(
+            self,
+            records: List[Dict],
+            num_triplets: int = 8000,
+            num_negatives: int = 3,
+        ):
+            """
+            Args:
+                records: list of dicts with keys "claim" and "evidences"
+                num_triplets: total samples __len__ reports (lazy generation)
+                num_negatives: how many negative evidence sentences per anchor
+            """
+            self.records = records
+            self.num_triplets = num_triplets
+            self.num_negatives = num_negatives
+
+            # Pre-build a flat list of (record_idx, sentence) for fast negative sampling
+            self._all_sentences: List[tuple] = []  # (record_idx, sentence)
+            for i, rec in enumerate(records):
+                for ev in rec["evidences"]:
+                    self._all_sentences.append((i, ev))
+
+            logger.info(
+                f"RetrievalDataset | records={len(records)} | "
+                f"total_sentences={len(self._all_sentences)} | "
+                f"num_triplets={num_triplets}"
+            )
+
+        def __len__(self) -> int:
+            return self.num_triplets
+
+        def __getitem__(self, idx: int) -> Dict[str, Union[str, List[str]]]:
+            # Pick a random record as anchor
+            anchor_idx = np.random.randint(0, len(self.records))
+            anchor_rec = self.records[anchor_idx]
+
+            # Anchor = claim text
+            anchor_text = anchor_rec["claim"]
+
+            # Positive = one of its evidence sentences
+            positive_text = anchor_rec["evidences"][
+                np.random.randint(0, len(anchor_rec["evidences"]))
+            ]
+
+            # Negatives = evidence sentences from *other* records
+            negatives: List[str] = []
+            attempts = 0
+            while (
+                len(negatives) < self.num_negatives
+                and attempts < self.num_negatives * 20
+            ):
+                attempts += 1
+                neg_global_idx = np.random.randint(0, len(self._all_sentences))
+                neg_rec_idx, neg_sentence = self._all_sentences[neg_global_idx]
+                if neg_rec_idx != anchor_idx:
+                    negatives.append(neg_sentence)
+
+            # Safety: if we couldn't find enough, reuse what we have
+            while len(negatives) < self.num_negatives:
+                negatives.append(negatives[0] if negatives else positive_text)
+
+            return {
+                "anchor": anchor_text,
+                "positive": positive_text,
+                "negatives": negatives,
+            }
+
     class CryptoEmbeddingTrainer:
         """Trainer for contrastive embedding fine-tuning."""
 
@@ -730,6 +817,12 @@ else:
 
         def __init__(self, *args, **kwargs):
             logger.warning("CryptoEmbeddingDataset requires PyTorch")
+
+    class RetrievalDataset:
+        """Placeholder when PyTorch is not available"""
+
+        def __init__(self, *args, **kwargs):
+            logger.warning("RetrievalDataset requires PyTorch")
 
     class ContrastiveEmbeddingModel:
         """Placeholder when PyTorch is not available"""
