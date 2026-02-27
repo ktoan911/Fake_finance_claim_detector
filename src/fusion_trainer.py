@@ -251,24 +251,10 @@ def train_fusion_from_dataframe(
 
             # Fusion: β·pLM + (1-β)·MLP(pret) per Eq.2
             output = fusion(b_llm_logits, retrieval_features)
-            fused_logits = output.fused_logits
 
-            # Loss computation
-            if num_classes == 2:
-                # Binary classification: use BCEWithLogitsLoss
-                # fused_logits: [B] (single logit per sample)
-                # Convert label IDs to BCE targets:
-                # - Label ID 0 (True) → BCE target 1.0 (positive class)
-                # - Label ID 1 (False) → BCE target 0.0 (negative class)
-                target_binary = (
-                    b_labels == 0
-                ).float()  # Convert: 0→1.0 (True), 1→0.0 (False)
-                ce_loss = F.binary_cross_entropy_with_logits(
-                    fused_logits, target_binary
-                )
-            else:
-                # Multi-class: use CrossEntropyLoss
-                ce_loss = F.cross_entropy(fused_logits, b_labels)
+            # Loss computation: F.cross_entropy on raw logits [B, num_classes]
+            # fused_logits is now [B, 2] for binary and [B, C] for multi-class
+            ce_loss = F.cross_entropy(output.fused_logits, b_labels)
 
             # Add beta regularization (L = CE + λ||β||²)
             beta_reg = fusion.lambda_reg * (fusion.beta**2)
