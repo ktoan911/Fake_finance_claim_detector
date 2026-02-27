@@ -436,12 +436,12 @@ def train_lora_classification(
         if os.path.exists(os.path.join(checkpoint_path, "tokenizer_config.json")):
             logger.info("Loading tokenizer from checkpoint...")
             tokenizer = AutoTokenizer.from_pretrained(
-                checkpoint_path, use_fast=False, trust_remote_code=True
+                checkpoint_path, trust_remote_code=True
             )
         else:
             logger.info("Loading tokenizer from base model...")
             tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name, use_fast=False, trust_remote_code=True
+                config.model_name, trust_remote_code=True
             )
 
         if tokenizer.pad_token is None:
@@ -482,7 +482,7 @@ def train_lora_classification(
             logger.info(f"Creating new LoRA model from {config.model_name}")
 
         tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, use_fast=False, trust_remote_code=True
+            config.model_name, trust_remote_code=True
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
