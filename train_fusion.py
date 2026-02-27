@@ -36,9 +36,8 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LORA_MODEL_PATH")
-        or os.getenv("LLM_MODEL_NAME", "meta-llama/Llama-3.1-8B"),
-        help="Path to the model (LoRA or base model)",
+        default=os.getenv("LORA_MODEL_PATH", "artifacts/lora_llm"),
+        help="Path to the LoRA-trained model (default: artifacts/lora_llm)",
     )
     parser.add_argument(
         "--device",
@@ -58,8 +57,8 @@ def main():
     parser.add_argument(
         "--retriever_model",
         type=str,
-        default="BAAI/bge-small-en-v1.5",
-        help="Path to trained dense retrieval model",
+        default=os.getenv("RETRIEVER_MODEL_PATH", "artifacts/retriever_model"),
+        help="Path to trained dense retrieval model (default: artifacts/retriever_model)",
     )
 
     args = parser.parse_args()

@@ -21,4 +21,4 @@ Claim: {claim}
 
 Evidence: {evidence}
 
-Verdict:"""
+Verdict: """

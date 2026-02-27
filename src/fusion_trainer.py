@@ -30,7 +30,9 @@ class FusionTrainingConfig:
     alpha: float = 0.7
     lambda_decay: float = 0.1
     gamma: float = 0.5
-    initial_beta: float = 0.5
+    initial_beta: float = (
+        0.8  # Trust trained LLM more initially; retrieval MLP starts random
+    )
     lambda_reg: float = 0.01  # Only used in fusion layer, not doubled
     max_length: int = 2048
     evidence_mode: str = (
@@ -38,6 +40,9 @@ class FusionTrainingConfig:
     )
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
     retriever_model: str = "BAAI/bge-small-en-v1.5"
+    use_class_weights: bool = (
+        True  # Address class imbalance with inverse-frequency weighting
+    )
 
 
 def _build_retrieval_features(
@@ -137,6 +142,9 @@ def train_fusion_from_dataframe(
     # Optimizer for fusion components only (LLM is frozen)
     params = list(retrieval_encoder.parameters()) + list(fusion.parameters())
     optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs, eta_min=1e-6
+    )
 
     # Prepare data
     texts = labeled_df["text"].tolist()
@@ -146,9 +154,21 @@ def train_fusion_from_dataframe(
     labels = labeled_df["label"].tolist()
 
     logger.info(f"Training samples: {len(texts)}")
+
+    # Compute class weights to handle imbalance (e.g. False=62%, True=38%)
+    label_array = np.array(labels)
+    label_counts = np.bincount(label_array, minlength=num_classes)
     logger.info(
-        f"Label distribution: {dict(zip(*np.unique(labels, return_counts=True)))}"
+        f"Label distribution: { {config.label_list[i]: int(label_counts[i]) for i in range(num_classes)} }"
     )
+    if config.use_class_weights:
+        weights = len(labels) / (num_classes * label_counts.astype(np.float32))
+        class_weights = torch.tensor(weights, dtype=torch.float32).to(config.device)
+        logger.info(
+            f"Class weights (inverse-freq): { {config.label_list[i]: round(float(class_weights[i]), 3) for i in range(num_classes)} }"
+        )
+    else:
+        class_weights = None
 
     # --- PRE-COMPUTATION PHASE ---
     logger.info("Starting pre-computation of retrieval features and LLM logits...")
@@ -254,7 +274,9 @@ def train_fusion_from_dataframe(
 
             # Loss computation: F.cross_entropy on raw logits [B, num_classes]
             # fused_logits is now [B, 2] for binary and [B, C] for multi-class
-            ce_loss = F.cross_entropy(output.fused_logits, b_labels)
+            ce_loss = F.cross_entropy(
+                output.fused_logits, b_labels, weight=class_weights
+            )
 
             # Add beta regularization (L = CE + λ||β||²)
             beta_reg = fusion.lambda_reg * (fusion.beta**2)
@@ -278,9 +300,38 @@ def train_fusion_from_dataframe(
         avg_loss = total_loss / max(1, num_batches)
         accuracy = correct / total if total > 0 else 0
         beta_val = fusion.beta.item()
-        logger.info(
-            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - acc: {accuracy:.4f} - β: {beta_val:.4f}"
+
+        # Per-class accuracy for debugging (helps detect majority-class collapse)
+        all_preds = []
+        all_targets = []
+        with torch.no_grad():
+            for i in range(0, dataset_size, config.batch_size):
+                batch_indices = indices[i : i + config.batch_size]
+                b_retrieval = tensor_retrieval[batch_indices].to(config.device)
+                b_llm_logits = tensor_llm_logits[batch_indices].to(config.device)
+                b_labels_eval = tensor_labels[batch_indices]
+                retrieval_features_eval = retrieval_encoder(b_retrieval)
+                output_eval = fusion(b_llm_logits, retrieval_features_eval)
+                preds_eval = torch.argmax(output_eval.final_probs, dim=-1).cpu()
+                all_preds.append(preds_eval)
+                all_targets.append(b_labels_eval)
+        all_preds = torch.cat(all_preds)
+        all_targets = torch.cat(all_targets)
+        per_class_acc = [
+            ((all_preds == i) & (all_targets == i)).sum().item()
+            / max(1, (all_targets == i).sum().item())
+            for i in range(num_classes)
+        ]
+        per_class_str = ", ".join(
+            f"{config.label_list[i]}: {per_class_acc[i]:.3f}"
+            for i in range(num_classes)
         )
+
+        current_lr = scheduler.get_last_lr()[0]
+        logger.info(
+            f"Epoch {epoch + 1}/{config.epochs} - loss: {avg_loss:.4f} - acc: {accuracy:.4f} - β: {beta_val:.4f} - lr: {current_lr:.2e} - per_class: [{per_class_str}]"
+        )
+        scheduler.step()
 
     # Save model
     import os
