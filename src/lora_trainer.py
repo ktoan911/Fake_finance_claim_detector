@@ -432,17 +432,11 @@ def train_lora_classification(
                 f"Invalid checkpoint: missing adapter_config.json in {checkpoint_path}"
             )
 
-        # Load tokenizer from checkpoint (if available) or base model
-        if os.path.exists(os.path.join(checkpoint_path, "tokenizer_config.json")):
-            logger.info("Loading tokenizer from checkpoint...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                checkpoint_path, trust_remote_code=True
-            )
-        else:
-            logger.info("Loading tokenizer from base model...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.model_name, trust_remote_code=True
-            )
+        # Always load tokenizer from base model to avoid Peft corrupted tokenizer_config.json issues with Qwen
+        logger.info("Loading tokenizer from base model...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name, trust_remote_code=True
+        )
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

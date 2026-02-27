@@ -39,18 +39,6 @@ class LLMScorer:
 
         self.device = device
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True
-        )
-
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # CRITICAL: Match training's padding side
-        # Training does manual RIGHT padding (append PAD tokens to the right)
-        # Must set explicitly as some models default to left padding
-        self.tokenizer.padding_side = "right"
-
         # Check if model_name is a LoRA adapter
         import os
 
@@ -62,6 +50,10 @@ class LLMScorer:
             )
             config = PeftConfig.from_pretrained(model_name)
             base_model_path = config.base_model_name_or_path
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                base_model_path, trust_remote_code=True
+            )
 
             # Load base model
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -76,6 +68,9 @@ class LLMScorer:
             self.model = PeftModel.from_pretrained(self.model, model_name)
         else:
             logger.info(f"Loading standard model: {model_name}")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16
@@ -84,6 +79,14 @@ class LLMScorer:
                 device_map="auto",
                 low_cpu_mem_usage=True,
             )
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # CRITICAL: Match training's padding side
+        # Training does manual RIGHT padding (append PAD tokens to the right)
+        # Must set explicitly as some models default to left padding
+        self.tokenizer.padding_side = "right"
 
         self.model.eval()
 
