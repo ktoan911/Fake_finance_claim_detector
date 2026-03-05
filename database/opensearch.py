@@ -24,7 +24,7 @@ class OpenSearchKB:
     def __init__(
         self,
         host: str = os.getenv("OP_HOST"),
-        port: int = os.getenv("OP_PORT"),
+        port: int = int(os.getenv("OP_PORT")),
         auth: Tuple[str, str] = (
             os.getenv("OP_AUTH_USERNAME"),
             os.getenv("OP_AUTH_PASSWORD"),

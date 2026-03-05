@@ -17,9 +17,15 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
+from dotenv import load_dotenv
 from readability import Document
 from requests.adapters import HTTPAdapter
+from sentence_transformers import SentenceTransformer
 from urllib3.util.retry import Retry
+
+from database.opensearch import OpenSearchKB
+
+load_dotenv()
 
 # -----------------------------
 # Config
@@ -73,6 +79,7 @@ MAX_SLEEP = 0.45
 MAX_SITEMAP_DEPTH = 3
 MAX_SITEMAPS_PER_SOURCE = 80
 MAX_SITEMAP_URLS_PER_SOURCE = 3000
+SAVE_BATCH_SIZE = 5
 
 # Extensions bị bỏ qua (không phải HTML)
 NON_HTML_EXTENSIONS = {
@@ -618,11 +625,9 @@ def append_seen(path: str, keys: Iterable[str]) -> None:
             f.write(k + "\n")
 
 
-def append_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+def save_articles_batch(source: str, out_dir: str, rows: List[Dict[str, Any]]) -> None:
+    kb = OpenSearchKB(index_name=os.getenv("OP_KB_NAME"), embedding_dim=768)
+    return kb.insert_many(rows)
 
 
 # -----------------------------
@@ -634,6 +639,7 @@ def crawl_source(
     source: str,
     out_dir: str,
     since_dt: Optional[datetime] = None,
+    encoder: Optional[SentenceTransformer] = None,
 ) -> int:
     """Crawl one source. Return number of articles saved.
 
@@ -653,7 +659,6 @@ def crawl_source(
     session = build_session()
 
     seen_path = os.path.join(out_dir, f"seen_{source}.txt")
-    out_path = os.path.join(out_dir, f"articles_{source}.jsonl")
     seen = load_seen(seen_path)
 
     discovered: List[Dict[str, Any]] = []
@@ -690,8 +695,9 @@ def crawl_source(
     items = list(uniq.values())
 
     # 2) Fetch + extract
-    saved_rows: List[Dict[str, Any]] = []
-    new_seen: List[str] = []
+    pending_rows: List[Dict[str, Any]] = []
+    pending_seen: List[str] = []
+    saved_count = 0
 
     for it in items:
         url = it["link"].strip()
@@ -765,23 +771,40 @@ def crawl_source(
                 "text": text,
                 "content_hash": content_hash,
                 "fetched_at": now_utc_iso(),
+                "embedding": None,
             }
 
-            saved_rows.append(row)
-            new_seen.append(url_key)
+            pending_rows.append(row)
+            pending_seen.append(url_key)
+
+            if len(pending_rows) >= SAVE_BATCH_SIZE:
+                text_list = [it["text"] for it in pending_rows]
+                embeddings = encoder.encode(text_list)
+                for i, row in enumerate(pending_rows):
+                    row["embedding"] = embeddings[i].tolist()
+                save_articles_batch(source, out_dir, pending_rows)
+                append_seen(seen_path, pending_seen)
+                saved_count += len(pending_rows)
+                pending_rows = []
+                pending_seen = []
 
         except Exception:
             skip_stats["fetch_errors"] += 1
 
-    if saved_rows:
-        append_jsonl(out_path, saved_rows)
-        append_seen(seen_path, new_seen)
+    if pending_rows:
+        text_list = [it["text"] for it in pending_rows]
+        embeddings = encoder.encode(text_list)
+        for i, row in enumerate(pending_rows):
+            row["embedding"] = embeddings[i].tolist()
+        save_articles_batch(source, out_dir, pending_rows)
+        append_seen(seen_path, pending_seen)
+        saved_count += len(pending_rows)
 
     skipped_total = sum(skip_stats.values())
     print(
-        f"[SOURCE] {source}: checked={len(items)} saved={len(saved_rows)} skipped={skipped_total}"
+        f"[SOURCE] {source}: checked={len(items)} saved={saved_count} skipped={skipped_total}"
     )
-    return len(saved_rows)
+    return saved_count
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -800,6 +823,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     ap.add_argument("--out", default="data", help="Thư mục đầu ra (mặc định: data/)")
+    ap.add_argument("--embedding_model", default="BAAI/bge-small-en-v1.5")
     args = ap.parse_args(argv)
 
     since_dt: Optional[datetime] = None
@@ -820,9 +844,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     print(f"[*] Sẽ cào {len(sources)} source(s): {', '.join(sorted(sources))}")
+
+    encoder = SentenceTransformer(args.embedding_model)
     total = 0
     for source in sorted(sources):
-        total += crawl_source(source, args.out, since_dt)
+        total += crawl_source(source, args.out, since_dt, encoder)
 
     print(f"\n[*] Hoàn tất. Tổng cộng {total} bài mới đã lưu.")
     return 0
@@ -906,7 +932,9 @@ class TestExtraction(unittest.TestCase):
 
     def test_wall_pattern_detection(self):
         self.assertTrue(is_possible_wall("Please enable JavaScript to continue"))
-        self.assertFalse(is_possible_wall("Normal article body about markets and rates."))
+        self.assertFalse(
+            is_possible_wall("Normal article body about markets and rates.")
+        )
 
 
 if __name__ == "__main__":
