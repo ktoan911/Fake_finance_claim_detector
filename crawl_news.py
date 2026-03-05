@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import random
 import re
 import time
 import unittest
+import zlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -24,34 +26,37 @@ from urllib3.util.retry import Retry
 # -----------------------------
 
 
-RSS_FEEDS: Dict[str, List[str]] = {
+SITEMAP_SOURCES: Dict[str, List[str]] = {
     "reuters": [
-        # Reuters feeds công khai bị lỗi 404, tạm thời bỏ qua
-    ],
-    "yahoo": [
-        # Yahoo Finance có RSS tin tài chính tổng hợp:
-        "https://www.yahoo.com/news/rss/finance",  # Yahoo Finance news RSS feed (tài chính) :contentReference[oaicite:1]{index=1}
-        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-        "https://feeds.marketwatch.com/marketwatch/topstories/",
+        "https://www.reuters.com/sitemap_index.xml",
+        "https://www.reuters.com/sitemap.xml",
     ],
     "cnbc": [
-        # CNBC RSS (có thể dùng các URL RSS feed đã tồn tại):
-        "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC top news RSS (thường dùng) :contentReference[oaicite:2]{index=2}
-        "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",  # CNBC Business :contentReference[oaicite:3]{index=3}
+        "https://www.cnbc.com/sitemapAll.xml",
+        "https://www.cnbc.com/sitemap.xml",
     ],
     "sec": [
-        "https://www.sec.gov/rss/news/press.xml",
-    ],
-    "fed": [
-        "https://www.federalreserve.gov/feeds/press_all.xml",
+        "https://www.sec.gov/sitemap.xml",
     ],
     "ecb": [
-        "https://www.ecb.europa.eu/rss/press.html",
+        "https://www.ecb.europa.eu/sitemap.xml",
     ],
-    "ap": [
-        # AP (Associated Press) có rất nhiều RSS feed theo chủ đề:
-        "https://apnews.com/hub/business?outputType=rss",  # AP business news RSS
+    "coindesk": [
+        "https://www.coindesk.com/sitemap.xml",
     ],
+    "cointelegraph": [
+        "https://cointelegraph.com/sitemap.xml",
+        "https://cointelegraph.com/sitemap/post.xml",
+    ],
+}
+
+SOURCE_ALLOWED_DOMAINS: Dict[str, set] = {
+    "reuters": {"reuters.com", "www.reuters.com"},
+    "cnbc": {"cnbc.com", "www.cnbc.com"},
+    "sec": {"sec.gov", "www.sec.gov"},
+    "ecb": {"ecb.europa.eu", "www.ecb.europa.eu"},
+    "coindesk": {"coindesk.com", "www.coindesk.com"},
+    "cointelegraph": {"cointelegraph.com", "www.cointelegraph.com"},
 }
 
 DEFAULT_HEADERS = {
@@ -63,8 +68,11 @@ DEFAULT_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 20
-MIN_SLEEP = 0.8
-MAX_SLEEP = 2.2
+MIN_SLEEP = 0.15
+MAX_SLEEP = 0.45
+MAX_SITEMAP_DEPTH = 3
+MAX_SITEMAPS_PER_SOURCE = 80
+MAX_SITEMAP_URLS_PER_SOURCE = 3000
 
 # Extensions bị bỏ qua (không phải HTML)
 NON_HTML_EXTENSIONS = {
@@ -145,11 +153,56 @@ def is_possible_wall(html: str) -> bool:
     return bool(WALL_PATTERNS.search((html or "")[:50000]))
 
 
+def decode_response_text(resp: requests.Response) -> str:
+    """Decode response body robustly to avoid compressed/binary garbage text."""
+    raw = resp.content or b""
+    encoding_hdr = (resp.headers.get("Content-Encoding") or "").lower()
+    data = raw
+
+    # Fallback decompression for servers that send compressed bytes unexpectedly.
+    try:
+        if "gzip" in encoding_hdr and raw[:2] == b"\x1f\x8b":
+            data = gzip.decompress(raw)
+        elif "deflate" in encoding_hdr:
+            try:
+                data = zlib.decompress(raw)
+            except zlib.error:
+                data = zlib.decompress(raw, -zlib.MAX_WBITS)
+        elif "br" in encoding_hdr:
+            try:
+                import brotli  # type: ignore
+
+                data = brotli.decompress(raw)
+            except Exception:
+                try:
+                    import brotlicffi as brotli  # type: ignore
+
+                    data = brotli.decompress(raw)
+                except Exception:
+                    data = raw
+    except Exception:
+        data = raw
+
+    try:
+        if resp.apparent_encoding:
+            resp.encoding = resp.apparent_encoding
+    except Exception:
+        pass
+
+    encoding = resp.encoding or "utf-8"
+    try:
+        return data.decode(encoding, errors="replace")
+    except Exception:
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return resp.text
+
+
 def drop_tracking(u: str) -> str:
     try:
         p = urlparse(u)
-        if not p.query and not p.fragment:
-            return u
+        netloc = p.netloc.lower()
 
         kept_params = []
         for key, value in parse_qsl(p.query, keep_blank_values=True):
@@ -159,7 +212,7 @@ def drop_tracking(u: str) -> str:
             kept_params.append((key, value))
 
         new_query = urlencode(kept_params, doseq=True)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))
+        return urlunparse((p.scheme, netloc, p.path, p.params, new_query, ""))
     except Exception:
         return u
 
@@ -238,113 +291,132 @@ def build_session() -> requests.Session:
 
 
 # -----------------------------
-# RSS parsing
+# Sitemap parsing
 # -----------------------------
 
 
-def parse_rss_items(xml_text: str) -> List[Dict[str, Any]]:
-    """Parse RSS/Atom minimally without extra libs."""
+def is_allowed_source_domain(source: str, url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    allowed = SOURCE_ALLOWED_DOMAINS.get(source, set())
+    return any(host == d or host.endswith("." + d) for d in allowed)
+
+
+def parse_sitemap_document(xml_text: str) -> Dict[str, List[Any]]:
+    """Parse sitemap XML into nested sitemap URLs and page URLs."""
     soup = BeautifulSoup(xml_text, "xml")
+    nested_sitemaps: List[str] = []
+    page_items: List[Dict[str, Any]] = []
 
-    items: List[Dict[str, Any]] = []
+    for sm in soup.find_all("sitemap"):
+        loc_tag = sm.find("loc")
+        if not loc_tag:
+            continue
+        loc = loc_tag.get_text(strip=True)
+        if loc:
+            nested_sitemaps.append(loc)
 
-    # RSS <item>
-    for it in soup.find_all("item"):
-        link = it.find("link").get_text(strip=True) if it.find("link") else ""
-        title = it.find("title").get_text(strip=True) if it.find("title") else ""
-        pub = ""
-        if it.find("pubDate"):
-            pub = it.find("pubDate").get_text(strip=True)
-        elif it.find("date"):
-            pub = it.find("date").get_text(strip=True)
-
-        desc = (
-            it.find("description").get_text(" ", strip=True)
-            if it.find("description")
-            else ""
+    for u in soup.find_all("url"):
+        loc_tag = u.find("loc")
+        if not loc_tag:
+            continue
+        loc = loc_tag.get_text(strip=True)
+        if not loc:
+            continue
+        lastmod_tag = u.find("lastmod")
+        lastmod = lastmod_tag.get_text(strip=True) if lastmod_tag else ""
+        page_items.append(
+            {
+                "title": "",
+                "link": loc,
+                "published_raw": lastmod,
+                "summary": "",
+            }
         )
 
-        if link:
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "published_raw": pub,
-                    "summary": normalize_ws(
-                        BeautifulSoup(desc, "lxml").get_text(" ", strip=True)
-                    )
-                    if desc
-                    else "",
-                }
-            )
+    return {"sitemaps": nested_sitemaps, "urls": page_items}
 
-    # Atom <entry>
-    if not items:
-        for ent in soup.find_all("entry"):
-            title = ent.find("title").get_text(strip=True) if ent.find("title") else ""
 
-            link = ""
-            link_tags = ent.find_all("link")
-            # ưu tiên rel="alternate" type html
-            for lt in link_tags:
-                rel = (lt.get("rel") or "").lower()
-                typ = (lt.get("type") or "").lower()
-                href = (lt.get("href") or "").strip()
-                if href and (rel in ("", "alternate")) and ("html" in typ or typ == ""):
-                    link = href
+def discover_from_sitemaps(
+    session: requests.Session,
+    source: str,
+    seeds: List[str],
+    since_dt: Optional[datetime] = None,
+    max_urls: int = MAX_SITEMAP_URLS_PER_SOURCE,
+) -> List[Dict[str, Any]]:
+    discovered: List[Dict[str, Any]] = []
+    queue: List[tuple] = [(u, 0) for u in seeds]
+    visited_sitemaps: set = set()
+
+    while queue and len(visited_sitemaps) < MAX_SITEMAPS_PER_SOURCE:
+        sitemap_url, depth = queue.pop(0)
+        sitemap_key = drop_tracking(sitemap_url.strip())
+        if not sitemap_key or sitemap_key in visited_sitemaps:
+            continue
+        visited_sitemaps.add(sitemap_key)
+
+        try:
+            r = session.get(sitemap_url, timeout=REQUEST_TIMEOUT)
+            if r.status_code >= 400:
+                continue
+
+            parsed = parse_sitemap_document(decode_response_text(r))
+            nested = parsed["sitemaps"]
+            urls = parsed["urls"]
+
+            if depth < MAX_SITEMAP_DEPTH:
+                for child in nested:
+                    queue.append((child, depth + 1))
+
+            seen_recent_in_sitemap = False
+            for it in urls:
+                link = (it.get("link") or "").strip()
+                if not link:
+                    continue
+                if not is_allowed_source_domain(source, link):
+                    continue
+                if is_non_html_extension(link):
+                    continue
+                if since_dt is not None:
+                    lm_dt = parse_datetime_utc_maybe(it.get("published_raw", ""))
+                    if lm_dt is not None:
+                        if lm_dt >= since_dt:
+                            seen_recent_in_sitemap = True
+                        elif seen_recent_in_sitemap:
+                            # Sitemap thường được sort mới -> cũ, gặp bài cũ thì dừng sớm.
+                            break
+                        else:
+                            continue
+                discovered.append(it)
+                if len(discovered) >= max_urls:
                     break
-            # fallback: lấy href bất kỳ
-            if not link:
-                for lt in link_tags:
-                    href = (lt.get("href") or "").strip()
-                    if href:
-                        link = href
-                        break
-            # fallback: <link>TEXT</link>
-            if not link:
-                lt = ent.find("link")
-                if lt:
-                    link = (lt.get_text(strip=True) or "").strip()
+            if len(discovered) >= max_urls:
+                break
+        except Exception:
+            continue
 
-            pub = ""
-            if ent.find("updated"):
-                pub = ent.find("updated").get_text(strip=True)
-            elif ent.find("published"):
-                pub = ent.find("published").get_text(strip=True)
-
-            summ = (
-                ent.find("summary").get_text(" ", strip=True)
-                if ent.find("summary")
-                else ""
-            )
-
-            if link:
-                items.append(
-                    {
-                        "title": title,
-                        "link": link,
-                        "published_raw": pub,
-                        "summary": normalize_ws(
-                            BeautifulSoup(summ, "lxml").get_text(" ", strip=True)
-                        )
-                        if summ
-                        else "",
-                    }
-                )
-
-    return items
+    return discovered
 
 
-def parse_datetime_maybe(s: str) -> Optional[str]:
+def parse_datetime_utc_maybe(s: str) -> Optional[datetime]:
     if not s:
         return None
     try:
         dt = dtparser.parse(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def parse_datetime_maybe(s: str) -> Optional[str]:
+    dt = parse_datetime_utc_maybe(s)
+    return dt.isoformat() if dt is not None else None
 
 
 # -----------------------------
@@ -507,11 +579,14 @@ def extract_full_article(url: str, html: str) -> Dict[str, Any]:
         text = strip_nav_footer("\n".join([p for p in paras if len(p) > 40]))
 
     published_at = jsonld.get("published_at") or meta.get("published_at")
+    normalized_title = normalize_ws(title or "")
+    if not normalized_title:
+        normalized_title = "[no-title]"
 
     return {
         "url": url,
         "canonical_url": jsonld.get("canonical_url") or canonical,
-        "title": normalize_ws(title or ""),
+        "title": normalized_title,
         "published_at": published_at,
         "author": jsonld.get("author"),
         "description": meta.get("description"),
@@ -563,77 +638,71 @@ def crawl_source(
     """Crawl one source. Return number of articles saved.
 
     Args:
-        source:   key inside RSS_FEEDS
+        source:   key inside SITEMAP_SOURCES
         out_dir:  output directory
         since_dt: if given, only keep articles whose published_at >= since_dt
                   (UTC-aware). Articles with no timestamp are always kept.
     """
-    feeds = RSS_FEEDS.get(source, [])
-    if not feeds:
+    sitemap_seeds = SITEMAP_SOURCES.get(source, [])
+    if not sitemap_seeds:
         print(
-            f"[!] No RSS feeds configured for source='{source}'. Edit RSS_FEEDS first."
+            f"[!] No sitemap configured for source='{source}'. Edit SITEMAP_SOURCES first."
         )
         return 0
 
     session = build_session()
-    if source == "yahoo":
-        session.headers.update(
-            {
-                "Referer": "https://finance.yahoo.com/",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Dest": "document",
-            }
-        )
 
     seen_path = os.path.join(out_dir, f"seen_{source}.txt")
     out_path = os.path.join(out_dir, f"articles_{source}.jsonl")
     seen = load_seen(seen_path)
 
     discovered: List[Dict[str, Any]] = []
+    skip_stats: Dict[str, int] = {
+        "seen": 0,
+        "non_html_ext": 0,
+        "http_error": 0,
+        "non_html_ct": 0,
+        "wall_or_consent": 0,
+        "short_content": 0,
+        "too_old": 0,
+        "date_parse_warn": 0,
+        "fetch_errors": 0,
+    }
 
-    # 1) RSS discovery
-    for feed_url in feeds:
-        try:
-            r = session.get(feed_url, timeout=REQUEST_TIMEOUT)
-            if r.status_code >= 400:
-                print(f"[RSS] {feed_url} -> HTTP {r.status_code}")
-                continue
-
-            parsed = parse_rss_items(r.text)
-            if not parsed:
-                print(
-                    f"[DBG] empty parse for {feed_url}, first 120 chars = {r.text[:120]!r}"
-                )
-            else:
-                discovered.extend(parsed)
-        except Exception as e:
-            print(f"[RSS] error {feed_url}: {e}")
+    # 1) Sitemap discovery
+    discovered.extend(
+        discover_from_sitemaps(
+            session,
+            source,
+            sitemap_seeds,
+            since_dt=since_dt,
+            max_urls=MAX_SITEMAP_URLS_PER_SOURCE,
+        )
+    )
 
     # Dedup by link at discovery stage
     uniq: Dict[str, Dict[str, Any]] = {}
     for it in discovered:
         link = it.get("link")
         if link:
-            uniq[link] = it
+            uniq[drop_tracking(link.strip())] = it
 
     items = list(uniq.values())
-    print(
-        f"[+] [{source}] Discovered {len(items)} candidate URLs from {len(feeds)} RSS feeds"
-    )
 
     # 2) Fetch + extract
     saved_rows: List[Dict[str, Any]] = []
     new_seen: List[str] = []
 
-    for idx, it in enumerate(items, start=1):
+    for it in items:
         url = it["link"].strip()
+        normalized_url = drop_tracking(url)
 
-        url_key = sha256_text(url)
+        url_key = sha256_text(normalized_url)
         if url_key in seen:
+            skip_stats["seen"] += 1
             continue
         if is_non_html_extension(url):
-            print(f"[SKIP] [{source}] non-html extension: {url}")
+            skip_stats["non_html_ext"] += 1
             continue
 
         # polite sleep
@@ -642,29 +711,26 @@ def crawl_source(
         try:
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
             if resp.status_code >= 400:
-                print(
-                    f"[GET] [{source}] {idx}/{len(items)} {url} -> HTTP {resp.status_code}"
-                )
+                skip_stats["http_error"] += 1
                 continue
 
             raw_content_type = resp.headers.get("Content-Type") or ""
             if not is_html_content_type(raw_content_type):
-                print(
-                    f"[SKIP] [{source}] non-html content-type ({raw_content_type.lower()}): {url}"
-                )
+                skip_stats["non_html_ct"] += 1
                 continue
 
-            html = resp.text
+            html = decode_response_text(resp)
             if is_possible_wall(html):
-                print(f"[SKIP] [{source}] possible wall/consent: {url}")
+                skip_stats["wall_or_consent"] += 1
                 continue
 
             art = extract_full_article(url, html)
 
             # Basic quality gate
             text = art.get("text") or ""
-            if len(text) < 400:
-                print(f"[DBG] [{source}] short content ({len(text)} chars): {url}")
+            if len(text) < 20:
+                skip_stats["short_content"] += 1
+                continue
 
             # ---- Time filter ----
             pub_iso = art.get("published_at") or parse_datetime_maybe(
@@ -677,12 +743,10 @@ def crawl_source(
                         pub_dt = pub_dt.replace(tzinfo=timezone.utc)
                     pub_dt = pub_dt.astimezone(timezone.utc)
                     if pub_dt < since_dt:
-                        print(
-                            f"[SKIP] [{source}] too old ({pub_dt.isoformat()}): {url[:80]}"
-                        )
+                        skip_stats["too_old"] += 1
                         continue
                 except Exception:
-                    pass  # can't parse date -> keep the article
+                    skip_stats["date_parse_warn"] += 1
 
             canonical = drop_tracking(art.get("canonical_url") or url)
             content_hash = sha256_text(normalize_ws(text))
@@ -695,7 +759,7 @@ def crawl_source(
                 "canonical_url": canonical,
                 "title": art.get("title"),
                 "published_at": pub_iso,
-                "summary_from_rss": it.get("summary"),
+                "summary_from_sitemap": it.get("summary"),
                 "author": art.get("author"),
                 "description": art.get("description"),
                 "text": text,
@@ -706,22 +770,23 @@ def crawl_source(
             saved_rows.append(row)
             new_seen.append(url_key)
 
-            print(f"[OK] [{source}] saved #{len(saved_rows)}: {row['title'][:80]}")
-
-        except Exception as e:
-            print(f"[ERR] [{source}] {idx}/{len(items)} {url}: {e}")
+        except Exception:
+            skip_stats["fetch_errors"] += 1
 
     if saved_rows:
         append_jsonl(out_path, saved_rows)
         append_seen(seen_path, new_seen)
 
-    print(f"[+] [{source}] Saved {len(saved_rows)} articles -> {out_path}")
+    skipped_total = sum(skip_stats.values())
+    print(
+        f"[SOURCE] {source}: checked={len(items)} saved={len(saved_rows)} skipped={skipped_total}"
+    )
     return len(saved_rows)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Crawl tất cả nguồn tin tức được cấu hình trong RSS_FEEDS."
+        description="Crawl tất cả nguồn tin tức được cấu hình trong SITEMAP_SOURCES."
     )
     ap.add_argument(
         "--since",
@@ -745,12 +810,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         since_dt = since_dt - timedelta(seconds=args.since)
         print(f"[*] Lọc bài từ {since_dt.isoformat()} trở về sau ({args.since}s)")
     else:
-        print("[*] Không lọc thời gian - cào toàn bộ bài hiện có trong RSS")
+        print("[*] Không lọc thời gian - cào toàn bộ bài hiện có trong sitemap")
 
-    sources = [s for s, feeds in RSS_FEEDS.items() if feeds]
+    sources = [s for s, sitemaps in SITEMAP_SOURCES.items() if sitemaps]
     if not sources:
         print(
-            "[!] Không có source nào được cấu hình trong RSS_FEEDS. Hãy thêm RSS URL trước."
+            "[!] Không có source nào được cấu hình trong SITEMAP_SOURCES. Hãy thêm sitemap URL trước."
         )
         return 1
 
@@ -761,11 +826,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"\n[*] Hoàn tất. Tổng cộng {total} bài mới đã lưu.")
     return 0
-
-
-# -----------------------------
-# Tests
-# -----------------------------
 
 
 class TestExtraction(unittest.TestCase):
@@ -806,18 +866,20 @@ class TestExtraction(unittest.TestCase):
         out = extract_from_jsonld(html, "https://example.com")
         self.assertEqual(out["canonical_url"], "https://example.com/a")
 
-    def test_parse_rss_items_basic_rss(self):
+    def test_parse_sitemap_document_urlset(self):
         xml = """
-        <rss><channel>
-          <item><title>T</title><link>https://x.com/1</link><pubDate>Mon, 02 Mar 2026 10:00:00 GMT</pubDate>
-          <description><![CDATA[<p>Hi</p>]]></description></item>
-        </channel></rss>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url>
+            <loc>https://example.com/a</loc>
+            <lastmod>2026-03-02T10:00:00Z</lastmod>
+          </url>
+        </urlset>
         """
-        items = parse_rss_items(xml)
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["link"], "https://x.com/1")
-        self.assertEqual(items[0]["title"], "T")
-        self.assertEqual(items[0]["summary"], "Hi")
+        parsed = parse_sitemap_document(xml)
+        self.assertEqual(len(parsed["sitemaps"]), 0)
+        self.assertEqual(len(parsed["urls"]), 1)
+        self.assertEqual(parsed["urls"][0]["link"], "https://example.com/a")
+        self.assertEqual(parsed["urls"][0]["published_raw"], "2026-03-02T10:00:00Z")
 
     def test_drop_tracking_removes_utm_and_fragment(self):
         u = "https://example.com/a?utm_source=x&id=123&utm_medium=y#frag"
@@ -828,6 +890,11 @@ class TestExtraction(unittest.TestCase):
         u = "https://example.com/a?symbol=BTCUSD&page=2"
         out = drop_tracking(u)
         self.assertEqual(out, u)
+
+    def test_drop_tracking_lowercases_host_and_drops_fragment(self):
+        u = "https://EXAMPLE.COM/A?Symbol=BTCUSD#frag"
+        out = drop_tracking(u)
+        self.assertEqual(out, "https://example.com/A?Symbol=BTCUSD")
 
     def test_parse_datetime_maybe_with_z_suffix(self):
         iso = parse_datetime_maybe("2026-03-02T10:00:00Z")
