@@ -3,9 +3,6 @@ import argparse
 import psutil
 from sentence_transformers import SentenceTransformer
 
-# load model và ép chạy CPU
-model = SentenceTransformer("/media/kateee/New Volume/Python/Python/social_media_crypto/Fake_Crypto_Claim_Detector/artifacts/retriever_model", device="cpu")
-
 
 def generate_sentences(n):
     """
