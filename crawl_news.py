@@ -78,7 +78,6 @@ MIN_SLEEP = 0.15
 MAX_SLEEP = 0.45
 MAX_SITEMAP_DEPTH = 3
 MAX_SITEMAPS_PER_SOURCE = 80
-MAX_SITEMAP_URLS_PER_SOURCE = 3000
 SAVE_BATCH_SIZE = 50
 
 # Extensions bị bỏ qua (không phải HTML)
@@ -353,7 +352,7 @@ def discover_from_sitemaps(
     source: str,
     seeds: List[str],
     since_dt: Optional[datetime] = None,
-    max_urls: int = MAX_SITEMAP_URLS_PER_SOURCE,
+    max_urls: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     discovered: List[Dict[str, Any]] = []
     queue: List[tuple] = [(u, 0) for u in seeds]
@@ -399,9 +398,9 @@ def discover_from_sitemaps(
                         else:
                             continue
                 discovered.append(it)
-                if len(discovered) >= max_urls:
+                if max_urls is not None and len(discovered) >= max_urls:
                     break
-            if len(discovered) >= max_urls:
+            if max_urls is not None and len(discovered) >= max_urls:
                 break
         except Exception:
             continue
@@ -681,7 +680,7 @@ def crawl_source(
             source,
             sitemap_seeds,
             since_dt=since_dt,
-            max_urls=MAX_SITEMAP_URLS_PER_SOURCE,
+            max_urls=None,
         )
     )
 
