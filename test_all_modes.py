@@ -31,7 +31,7 @@ from src.retrieval import KnowledgeAugmentedRetriever
 from src.utils import normalize_text
 
 # Label mapping for metrics
-LABEL_MAP = {0: "True", 1: "False"}
+LABEL_MAP = {idx: label for idx, label in enumerate(LABEL_LIST)}
 
 
 def calculate_metrics(y_true, y_pred, mode_name):
@@ -42,14 +42,14 @@ def calculate_metrics(y_true, y_pred, mode_name):
     f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
     f1_binary = f1_score(
         y_true, y_pred, pos_label=1, zero_division=0
-    )  # False/Fake as positive class usually
+    )  # negative/refuted class as positive
 
     logger.info(f"--- Results for {mode_name} ---")
     logger.info(f"Accuracy:  {acc:.4f}")
     logger.info(f"Precision: {prec:.4f}")
     logger.info(f"Recall:    {rec:.4f}")
     logger.info(f"F1 Macro:  {f1_macro:.4f}")
-    logger.info(f"F1 Binary (False): {f1_binary:.4f}")
+    logger.info(f"F1 Binary (negative class): {f1_binary:.4f}")
 
     return {
         "Mode": mode_name,
@@ -136,7 +136,7 @@ def main():
 
     texts = df["text"].tolist()
     gold_evidences = df["evidence"].tolist()
-    labels = df["label"].tolist()  # 0=True, 1=False
+    labels = df["label"].tolist()  # 0=positive label, 1=negative label
 
     # Build Knowledge Base for Retrieval
     # Deduplicate documents from evidence column using normalization (match train_fusion.py)
@@ -183,7 +183,7 @@ def main():
         model_name=args.lora_model,
         device=args.device,
         max_length=2048,
-        labels=LABEL_LIST,  # ['True', 'False']
+        labels=LABEL_LIST,
         prompt_template=PROMPT_TEMPLATE,
     )
 

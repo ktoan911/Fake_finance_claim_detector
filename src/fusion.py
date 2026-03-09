@@ -77,7 +77,7 @@ if TORCH_AVAILABLE:
         pfinal(y|q, D) = σ(β · pLM + (1 − β) · MLP(pret))
 
         Where σ is Sigmoid for binary classification (num_classes=2).
-        For binary: MLP outputs 1 logit, sigmoid gives P(True), P(False)=1-P(True)
+        For binary: MLP outputs 1 logit; positive/negative probs are derived via softmax.
 
         With contrastive loss from Equation (3):
         L = -log(e^sp / Σe^sn) + λ||β||²
@@ -142,18 +142,18 @@ if TORCH_AVAILABLE:
 
             if self.is_binary:
                 # Binary classification: treat as 2-class softmax (same as multi-class)
-                # lm_logits: [B, 2] → [logit_True, logit_False]
+                # lm_logits: [B, 2] in LABEL_LIST order [positive, negative]
                 assert lm_logits.size(1) == 2, (
                     f"Binary mode: lm_logits should be [B, 2], got {lm_logits.shape}"
                 )
 
                 # For binary, MLP outputs 1 logit → expand to 2 logits [pos, neg]
-                # retrieval_logits: [B, 1] → treat as logit_True; logit_False = -logit_True
+                # retrieval_logits: [B, 1] → treat as positive logit; negative = -positive
                 assert retrieval_logits.size() == (batch_size, 1), (
                     f"Binary mode: retrieval_logits should be [B, 1], got {retrieval_logits.shape}"
                 )
 
-                # Expand retrieval to 2 logits: [logit_True, logit_False] = [r, -r]
+                # Expand retrieval to 2 logits in label order: [r, -r]
                 retrieval_logits_2 = torch.cat(
                     [retrieval_logits, -retrieval_logits], dim=-1
                 )  # [B, 2]
@@ -165,7 +165,7 @@ if TORCH_AVAILABLE:
 
                 # Apply softmax to get probabilities
                 final_probs = torch.softmax(fused_logits, dim=-1)  # [B, 2]
-                # final_probs[:, 0] = P(True), final_probs[:, 1] = P(False)
+                # final_probs[:, 0] = P(positive), final_probs[:, 1] = P(negative)
 
             else:
                 # Multi-class: use softmax

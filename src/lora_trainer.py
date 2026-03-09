@@ -26,6 +26,9 @@ except ImportError:
 
 from .config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
 
+POSITIVE_LABEL = LABEL_LIST[0]
+NEGATIVE_LABEL = LABEL_LIST[1]
+
 
 @dataclass
 class LoRATrainingConfig:
@@ -47,6 +50,89 @@ class LoRATrainingConfig:
     prompt_template: str = PROMPT_TEMPLATE
 
 
+def _is_linear_like_module(module) -> bool:
+    """Return True for linear-like modules supported by common PEFT backends."""
+    if isinstance(module, torch.nn.Linear):
+        return True
+    return "linear" in module.__class__.__name__.lower()
+
+
+def _resolve_lora_target_modules(model) -> List[str]:
+    """
+    Resolve LoRA target modules from the loaded model architecture.
+
+    This avoids hardcoding Llama-only names (q_proj/k_proj/v_proj/o_proj),
+    which breaks on models like GPT/PhoGPT/GPT-NeoX variants.
+    """
+    module_suffixes = {name.split(".")[-1] for name, _ in model.named_modules() if name}
+
+    # Preferred, architecture-aware suffixes (checked in this order).
+    preferred_suffixes = [
+        # Llama / Mistral / Qwen
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        # MLP projections (often useful in LoRA SFT)
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        # GPT-2 / Falcon style
+        "c_attn",
+        "c_proj",
+        "c_fc",
+        # GPT-NeoX / Phi style
+        "query_key_value",
+        "dense",
+        "dense_h_to_4h",
+        "dense_4h_to_h",
+        # Other common naming patterns
+        "Wqkv",
+        "out_proj",
+        "qkv_proj",
+        "W_pack",
+        "fc1",
+        "fc2",
+        "wq",
+        "wk",
+        "wv",
+        "wo",
+        "w1",
+        "w2",
+        "w3",
+    ]
+    detected = [name for name in preferred_suffixes if name in module_suffixes]
+    if detected:
+        return detected
+
+    # Generic fallback: use all linear-like layer suffixes except known output heads.
+    excluded_suffixes = {"lm_head", "embed_out", "classifier", "score", "qa_outputs"}
+    excluded_name_fragments = ("embed_tokens", "word_embeddings", "wte")
+
+    linear_suffixes = set()
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        suffix = name.split(".")[-1]
+        lower_name = name.lower()
+
+        if suffix in excluded_suffixes:
+            continue
+        if any(fragment in lower_name for fragment in excluded_name_fragments):
+            continue
+        if _is_linear_like_module(module):
+            linear_suffixes.add(suffix)
+
+    if linear_suffixes:
+        return sorted(linear_suffixes)
+
+    available_preview = ", ".join(sorted(module_suffixes)[:30])
+    raise ValueError(
+        "Could not infer LoRA target modules for this model. "
+        f"Available module suffixes (first 30): {available_preview}"
+    )
+
+
 def _build_prompt(claim: str, evidence: str, template: str) -> str:
     """Build prompt from claim and evidence."""
     return template.format(claim=claim, evidence=evidence)
@@ -62,22 +148,22 @@ def _get_label_token_ids(tokenizer, labels: list = None):
     if labels is None:
         labels = LABEL_LIST
 
-    # Labels are already words (True/False/Not) - no mapping needed
+    # Labels are provided directly as output tokens (e.g., Đúng/Sai).
+    # For logits-based classification here, each label MUST be exactly one token.
     label_token_ids = {}
     for label in labels:
-        # Use label directly as it's already a word
+        # Use label directly as it's already a word/token candidate
         tokens = tokenizer(label, add_special_tokens=False)["input_ids"]
 
-        if len(tokens) == 0:
-            raise ValueError(f"Label '{label}' tokenized to 0 tokens!")
+        if len(tokens) != 1:
+            raise ValueError(
+                f"Label '{label}' must tokenize to exactly 1 token, got {len(tokens)} tokens: {tokens}. "
+                "Update LABEL_LIST in src/config.py to single-token labels for this tokenizer."
+            )
 
-        # Use first token (for multi-token words)
-        # Space prefix usually makes it a single token for common words
         label_token_ids[label] = tokens[0]
 
-        logger.debug(
-            f"Label '{label}' -> token_id {tokens[0]} (total {len(tokens)} tokens)"
-        )
+        logger.debug(f"Label '{label}' -> token_id {tokens[0]}")
 
     return label_token_ids
 
@@ -107,7 +193,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     true_labels = []
 
     for batch_idx in range(len(logits)):
-        # Logits are already extracted for label tokens: [2] = [True, False]
+        # Logits are already extracted for label tokens: [2] = [positive, negative]
         label_logits_array = logits[batch_idx]  # Shape: [2]
 
         # Apply softmax to get probabilities (pLM)
@@ -127,15 +213,15 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
 
         if len(label_positions) == 0:
             logger.warning(
-                f"Sample {batch_idx}: No valid label position found, using False as default"
+                f"Sample {batch_idx}: No valid label position found, using {NEGATIVE_LABEL} as default"
             )
-            true_labels.append(LABEL_TO_ID["False"])
+            true_labels.append(LABEL_TO_ID[NEGATIVE_LABEL])
             continue
         valid_label_ids = batch_labels[label_positions]
         true_label_token = valid_label_ids[0]  # First token of label
 
         # Map back to label name
-        true_label = "False"  # default
+        true_label = NEGATIVE_LABEL  # default
         for label_name, token_id in label_token_ids.items():
             if token_id == true_label_token:
                 true_label = label_name
@@ -166,7 +252,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         ),
         "f1_binary": f1_score(
             true_labels, pred_labels, average="binary", pos_label=1, zero_division=0
-        ),  # False (scam) as positive
+        ),  # negative/refuted class as positive
         "precision_macro": precision_score(
             true_labels, pred_labels, average="macro", zero_division=0
         ),
@@ -204,25 +290,46 @@ def _prepare_classification_dataset(
         """Convert CSV_Loader integer ID to string label for LLM training.
 
         CSV_Loader Convention:
-          - ID 0 = True (supported/legitimate)
-          - ID 1 = False (refuted/fake)
+          - ID 0 = supported/legitimate
+          - ID 1 = refuted/fake
 
         This function converts those IDs to strings for LLM training targets.
         """
         if isinstance(label_value, (int, float)):
             idx = int(label_value)
-            # CSV_Loader outputs: 0=True, 1=False
+            # CSV_Loader outputs: 0=positive label, 1=negative label
             if idx == 0:
-                return "True"  # ID 0 → True
+                return POSITIVE_LABEL
             else:
-                return "False"  # ID 1 → False
+                return NEGATIVE_LABEL
 
-        # Should not reach here if CSV_Loader working correctly
+        # Handle string labels from multiple datasets/languages.
         label_upper = str(label_value).upper().strip()
-        if label_upper in ["TRUE", "SUPPORTED", "LEGIT", "LEGITIMATE"]:
-            return "True"
-        else:
-            return "False"
+        if label_upper in [
+            POSITIVE_LABEL.upper(),
+            "TRUE",
+            "SUPPORTED",
+            "LEGIT",
+            "LEGITIMATE",
+            "ĐÚNG",
+            "DUNG",
+            "0",
+        ]:
+            return POSITIVE_LABEL
+        if label_upper in [
+            NEGATIVE_LABEL.upper(),
+            "FALSE",
+            "REFUTED",
+            "SCAM",
+            "SAI",
+            "1",
+        ]:
+            return NEGATIVE_LABEL
+
+        logger.warning(
+            f"Unknown label '{label_value}' encountered during dataset prep. Defaulting to {NEGATIVE_LABEL}."
+        )
+        return NEGATIVE_LABEL
 
     for label in labels:
         target = normalize_label(label)
@@ -260,8 +367,14 @@ def _prepare_classification_dataset(
                 template_end, add_special_tokens=False, truncation=False
             )["input_ids"]
 
-            # Tokenize target (already a word: True/False)
-            target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
+            # Tokenize target label token (must be exactly one token).
+            target_token_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
+            if len(target_token_ids) != 1:
+                raise ValueError(
+                    f"Training label '{target}' must be exactly 1 token, got {len(target_token_ids)} tokens: {target_token_ids}. "
+                    "Update LABEL_LIST in src/config.py to single-token labels for this tokenizer."
+                )
+            target_ids = list(target_token_ids)
 
             if tokenizer.eos_token_id is not None:
                 target_ids = target_ids + [tokenizer.eos_token_id]
@@ -310,9 +423,7 @@ def _prepare_classification_dataset(
             # 5. Create labels
             # Mask everything except target
             prompt_len = len(start_ids) + len(evidence_ids) + len(end_ids)
-            label_token_count = len(target_ids) - (
-                1 if tokenizer.eos_token_id is not None else 0
-            )
+            label_token_count = len(target_token_ids)
 
             labels = (
                 [-100] * prompt_len
@@ -404,7 +515,7 @@ def train_lora_classification(
     Args:
         claims: List of claims to verify
         evidences: List of retrieved evidence for each claim
-        labels: List of ground truth labels (True/False/Not or dataset variants)
+        labels: List of ground truth labels (ID or dataset variants)
         eval_claims: Optional list of eval/dev claims. If provided with eval_evidences
             and eval_labels, trainer uses this set directly (no auto split).
         eval_evidences: Optional list of eval/dev evidence.
@@ -448,7 +559,7 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # NO special tokens needed - using existing vocab (True/False/Unknown)
+        # NO special tokens needed - using existing vocabulary labels
 
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
@@ -457,6 +568,7 @@ def train_lora_classification(
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
             low_cpu_mem_usage=True,
+            trust_remote_code=True,
         )
 
         # Enable gradient checkpointing
@@ -488,14 +600,17 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # NO special tokens needed - using existing vocab (True/False)
-        logger.info("Using existing vocabulary tokens for binary labels: True/False")
+        # NO special tokens needed - using existing vocabulary labels
+        logger.info(
+            f"Using existing vocabulary tokens for binary labels: {POSITIVE_LABEL}/{NEGATIVE_LABEL}"
+        )
 
         model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
             low_cpu_mem_usage=True,
+            trust_remote_code=True,
         )
 
         # Enable gradient checkpointing to save VRAM
@@ -505,13 +620,18 @@ def train_lora_classification(
         model.config.use_cache = False
 
         # Configure LoRA
+        target_modules = _resolve_lora_target_modules(model)
+        logger.info(
+            f"Detected LoRA target modules for {config.model_name}: {target_modules}"
+        )
+
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
             lora_dropout=config.lora_dropout,
             bias="none",
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],  # Attention layers
+            target_modules=target_modules,
         )
 
         model = get_peft_model(model, lora_cfg)
@@ -622,7 +742,7 @@ def train_lora_classification(
         For each sample, we extract:
         - Find label position from labels
         - Apply CausalLM shift (pred_pos = label_pos - 1)
-        - Extract logits for 2 label tokens only (True/False)
+        - Extract logits for 2 label tokens only (positive/negative)
 
         Memory savings: ~65MB/sample → ~100 bytes/sample (650x reduction!)
         """
@@ -635,7 +755,7 @@ def train_lora_classification(
             (batch_size, 2), device=logits.device, dtype=logits.dtype
         )
 
-        # Extract token IDs for labels (True, False)
+        # Extract token IDs for labels in LABEL_LIST order
         label_token_id_list = [label_token_ids[label] for label in LABEL_LIST]
 
         for i in range(batch_size):

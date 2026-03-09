@@ -359,7 +359,7 @@ class OpenSearchHybridRetriever:
 class ClaimPrediction:
     claim: str
     verdict: str  # "Đúng" | "Sai"
-    label: str  # "True" | "False"
+    label: str  # Model label token, e.g. "Đúng" | "Sai"
     label_id: int
     confidence: float
     evidence: List[str]
@@ -368,7 +368,7 @@ class ClaimPrediction:
 class FusionClaimVerifier:
     """
     Single-claim inference helper:
-      claim -> retrieved evidence -> LLM logits -> fusion -> True/False verdict.
+      claim -> retrieved evidence -> LLM logits -> fusion -> Đúng/Sai verdict.
     """
 
     def __init__(
@@ -637,7 +637,8 @@ class FusionClaimVerifier:
                 )
 
         pred_label = self.label_list[pred_id]
-        verdict = "Đúng" if pred_label.lower() == "true" else "Sai"
+        # Keep verdict tied to stable label ID convention: 0=Đúng, 1=Sai.
+        verdict = "Đúng" if pred_id == 0 else "Sai"
 
         if self.debug:
             logger.info(

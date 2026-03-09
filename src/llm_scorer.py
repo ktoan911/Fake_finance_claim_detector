@@ -34,13 +34,13 @@ except ImportError:
     PeftModel = None  # type: ignore
 
 
-# Labels are already words (True/False/Not) - no mapping needed
+# Labels are direct output tokens from config (e.g., Đúng/Sai).
 
 
 class LLMScorer:
     """
     Get LM logits for labels using a prompt.
-    Uses existing vocabulary tokens: True, False.
+    Uses existing vocabulary tokens from LABEL_LIST.
     Returns LOGITS, not probabilities (for fusion layer per Eq.2).
     """
 
@@ -233,13 +233,17 @@ class LLMScorer:
 
         self.labels = labels or LABEL_LIST
 
-        # Get token IDs for labels (already words: True/False)
+        # Get token IDs for labels. Each label must be exactly one token
+        # to keep logits extraction aligned with training.
         self.label_token_ids = {}
         for label in self.labels:
-            # Use label directly as it's already a word
+            # Use label directly as it's already a word/token candidate.
             tokens = self.tokenizer(label, add_special_tokens=False)["input_ids"]
-            if len(tokens) == 0:
-                raise ValueError(f"Label '{label}' tokenized to 0 tokens!")
+            if len(tokens) != 1:
+                raise ValueError(
+                    f"Label '{label}' must tokenize to exactly 1 token, got {len(tokens)} tokens: {tokens}. "
+                    "Update LABEL_LIST in src/config.py to single-token labels for this tokenizer."
+                )
             self.label_token_ids[label] = tokens[0]
             logger.debug(f"Label '{label}' -> token_id {tokens[0]}")
 
