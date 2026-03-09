@@ -40,7 +40,7 @@ class LoRATrainingConfig:
     lora_r: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.1
-    eval_ratio: float = 0.1  # 10% data for evaluation
+    eval_ratio: float = 0.1  # Used only when no explicit eval dataset is provided
     early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
 
     # Prompt template for classification
@@ -388,6 +388,9 @@ def train_lora_classification(
     claims: List[str],
     evidences: List[str],
     labels: List[str],
+    eval_claims: Optional[List[str]] = None,
+    eval_evidences: Optional[List[str]] = None,
+    eval_labels: Optional[List[str]] = None,
     config: Optional[LoRATrainingConfig] = None,
     gradient_accumulation_steps: int = 4,
     skip_final_eval: bool = True,  # Skip final eval by default to prevent OOM
@@ -402,6 +405,10 @@ def train_lora_classification(
         claims: List of claims to verify
         evidences: List of retrieved evidence for each claim
         labels: List of ground truth labels (True/False/Not or dataset variants)
+        eval_claims: Optional list of eval/dev claims. If provided with eval_evidences
+            and eval_labels, trainer uses this set directly (no auto split).
+        eval_evidences: Optional list of eval/dev evidence.
+        eval_labels: Optional list of eval/dev labels.
         config: Training configuration
         gradient_accumulation_steps: Number of gradient accumulation steps
         skip_final_eval: Skip final evaluation to save memory
@@ -510,18 +517,58 @@ def train_lora_classification(
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
 
-    # Prepare dataset
-    logger.info(f"Preparing dataset with {len(claims)} samples...")
-    full_dataset = _prepare_classification_dataset(
-        claims, evidences, labels, tokenizer, config.max_length, config.prompt_template
+    if not (len(claims) == len(evidences) == len(labels)):
+        raise ValueError(
+            "Training inputs must have the same length: claims, evidences, labels."
+        )
+    if len(claims) == 0:
+        raise ValueError("Training dataset is empty.")
+
+    has_explicit_eval = any(
+        x is not None for x in (eval_claims, eval_evidences, eval_labels)
     )
 
-    # Split into train and eval datasets for F1 optimization
-    split_dataset = full_dataset.train_test_split(
-        test_size=config.eval_ratio, seed=42, shuffle=True
-    )
-    train_dataset = split_dataset["train"]
-    eval_dataset = split_dataset["test"]
+    if has_explicit_eval:
+        if eval_claims is None or eval_evidences is None or eval_labels is None:
+            raise ValueError(
+                "When providing eval data, please provide all of: "
+                "eval_claims, eval_evidences, eval_labels."
+            )
+        if not (len(eval_claims) == len(eval_evidences) == len(eval_labels)):
+            raise ValueError(
+                "Eval inputs must have the same length: "
+                "eval_claims, eval_evidences, eval_labels."
+            )
+        if len(eval_claims) == 0:
+            raise ValueError("Eval dataset is empty.")
+
+        logger.info(f"Preparing TRAIN dataset with {len(claims)} samples...")
+        train_dataset = _prepare_classification_dataset(
+            claims, evidences, labels, tokenizer, config.max_length, config.prompt_template
+        )
+        logger.info(f"Preparing EVAL dataset with {len(eval_claims)} samples...")
+        eval_dataset = _prepare_classification_dataset(
+            eval_claims,
+            eval_evidences,
+            eval_labels,
+            tokenizer,
+            config.max_length,
+            config.prompt_template,
+        )
+        logger.info("Using provided DEV/EVAL dataset (no automatic train/eval split).")
+    else:
+        logger.warning(
+            "No explicit DEV/EVAL dataset provided; falling back to split from TRAIN."
+        )
+        logger.info(f"Preparing dataset with {len(claims)} samples...")
+        full_dataset = _prepare_classification_dataset(
+            claims, evidences, labels, tokenizer, config.max_length, config.prompt_template
+        )
+        split_dataset = full_dataset.train_test_split(
+            test_size=config.eval_ratio, seed=42, shuffle=True
+        )
+        train_dataset = split_dataset["train"]
+        eval_dataset = split_dataset["test"]
 
     logger.info(
         f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}"

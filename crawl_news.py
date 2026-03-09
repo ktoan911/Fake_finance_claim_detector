@@ -114,6 +114,11 @@ WALL_PATTERNS = re.compile(
     r"(enable javascript|cookie consent|agree to our|subscribe to|sign in to continue)",
     re.I,
 )
+SPECIAL_WHITESPACE_RE = re.compile(
+    r"[\u00a0\u1680\u180e\u2000-\u200b\u2028\u2029\u202f\u205f\u3000\ufeff]"
+)
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+TEXT_CHUNK_MAX_CHARS = 200
 
 
 # -----------------------------
@@ -131,6 +136,103 @@ def sha256_text(s: str) -> str:
 
 def normalize_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_text_field(value: str) -> str:
+    """Normalize common special whitespace to a single plain space."""
+    text = str(value or "")
+    text = SPECIAL_WHITESPACE_RE.sub(" ", text)
+    text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return normalize_ws(text)
+
+
+def clean_record_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, str):
+            cleaned[key] = clean_text_field(value)
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
+def split_text_by_max_chars(text: str, max_chars: int = TEXT_CHUNK_MAX_CHARS) -> List[str]:
+    """Chunk by character budget, but only cut at sentence boundaries.
+
+    Rule:
+    - Prefer chunks around max_chars.
+    - If crossing max_chars happens in the middle of a sentence, keep that whole
+      sentence, then cut.
+    """
+    cleaned = clean_text_field(text)
+    if not cleaned:
+        return [""]
+    if len(cleaned) <= max_chars:
+        return [cleaned]
+
+    sentences = [s.strip() for s in SENTENCE_SPLIT_RE.split(cleaned) if s.strip()]
+    if not sentences:
+        return [cleaned]
+
+    chunks: List[str] = []
+    current = ""
+
+    for sentence in sentences:
+        if not current:
+            current = sentence
+            continue
+
+        candidate = f"{current} {sentence}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        # If current is still below threshold, include this sentence anyway
+        # so we only cut after sentence end.
+        if len(current) < max_chars:
+            current = candidate
+            chunks.append(current)
+            current = ""
+            continue
+
+        chunks.append(current)
+        current = sentence
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def expand_row_with_text_chunks(
+    row: Dict[str, Any], max_chars: int = TEXT_CHUNK_MAX_CHARS
+) -> List[Dict[str, Any]]:
+    """Split text into <= max_chars chunks, then prepend description to each chunk."""
+    cleaned_row = clean_record_fields(row)
+    raw_text = cleaned_row.get("text") or ""
+    description = cleaned_row.get("description") or ""
+    canonical = cleaned_row.get("canonical_url") or ""
+
+    chunks = split_text_by_max_chars(raw_text, max_chars=max_chars)
+    total_chunks = len(chunks)
+    expanded_rows: List[Dict[str, Any]] = []
+
+    for idx, chunk in enumerate(chunks, start=1):
+        chunk_row = dict(cleaned_row)
+        merged_text = f"{description} {chunk}".strip() if description else chunk
+        chunk_content_hash = sha256_text(normalize_ws(merged_text))
+        if total_chunks > 1:
+            chunk_id = sha256_text(f"{canonical}|{chunk_content_hash}|chunk={idx}")
+        else:
+            chunk_id = sha256_text(f"{canonical}|{chunk_content_hash}")
+
+        chunk_row["text"] = merged_text
+        chunk_row["content_hash"] = chunk_content_hash
+        chunk_row["id"] = chunk_id
+        expanded_rows.append(chunk_row)
+
+    return expanded_rows
 
 
 def safe_json_loads(s: str) -> Optional[Any]:
@@ -732,7 +834,7 @@ def crawl_source(
             art = extract_full_article(url, html)
 
             # Basic quality gate
-            text = art.get("text") or ""
+            text = clean_text_field(art.get("text") or "")
             if len(text) < 20:
                 skip_stats["short_content"] += 1
                 continue
@@ -754,11 +856,11 @@ def crawl_source(
                     skip_stats["date_parse_warn"] += 1
 
             canonical = drop_tracking(art.get("canonical_url") or url)
-            content_hash = sha256_text(normalize_ws(text))
-            record_id = sha256_text(canonical + "|" + content_hash)
+            base_content_hash = sha256_text(normalize_ws(text))
+            base_record_id = sha256_text(canonical + "|" + base_content_hash)
 
-            row = {
-                "id": record_id,
+            base_row = {
+                "id": base_record_id,
                 "source": source,
                 "url": art.get("url"),
                 "canonical_url": canonical,
@@ -768,12 +870,13 @@ def crawl_source(
                 "author": art.get("author"),
                 "description": art.get("description"),
                 "text": text,
-                "content_hash": content_hash,
+                "content_hash": base_content_hash,
                 "fetched_at": now_utc_iso(),
                 "embedding": None,
             }
 
-            pending_rows.append(row)
+            expanded_rows = expand_row_with_text_chunks(base_row)
+            pending_rows.extend(expanded_rows)
             pending_seen.append(url_key)
 
             if len(pending_rows) >= SAVE_BATCH_SIZE:
