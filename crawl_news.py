@@ -625,7 +625,7 @@ def append_seen(path: str, keys: Iterable[str]) -> None:
 
 
 def save_articles_batch(source: str, out_dir: str, rows: List[Dict[str, Any]]) -> None:
-    kb = OpenSearchKB(index_name=os.getenv("OP_KB_NAME"), embedding_dim=768)
+    kb = OpenSearchKB(index_name=os.getenv("OP_KB_NAME"), embedding_dim=384)
     return kb.insert_many(rows)
 
 

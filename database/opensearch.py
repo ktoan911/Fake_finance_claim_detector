@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -29,8 +30,8 @@ class OpenSearchKB:
             os.getenv("OP_AUTH_USERNAME"),
             os.getenv("OP_AUTH_PASSWORD"),
         ),
-        index_name: str = os.getenv("OPENSEARCH_INDEX_NAME"),
-        embedding_dim: int = os.getenv("OPENSEARCH_EMBEDDING_DIM"),
+        index_name: str = os.getenv("OP_KB_NAME"),
+        embedding_dim: int = int(os.getenv("OP_EMBEDDING_DIM")),
         id_field_candidates: Sequence[str] = ("_id", "id"),
     ):
         self.index = index_name
@@ -105,6 +106,24 @@ class OpenSearchKB:
             d.pop(k, None)
         return d
 
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return re.sub(r"\s+", " ", str(query or "")).strip()
+
+    @staticmethod
+    def _split_field_boost(field_name: str) -> Tuple[str, float]:
+        raw = str(field_name or "").strip()
+        if not raw:
+            return "", 1.0
+        if "^" not in raw:
+            return raw, 1.0
+        name, boost_raw = raw.split("^", 1)
+        try:
+            boost = float(boost_raw)
+        except ValueError:
+            boost = 1.0
+        return name.strip(), boost
+
     # ----------------------------
     # Write operations
     # ----------------------------
@@ -124,6 +143,8 @@ class OpenSearchKB:
         If upsert=False:
           - uses "create" (fail if exists)
         """
+        if not self.client.indices.exists(index=self.index):
+            self.create_index(overwrite=False)
         if not docs:
             return {"inserted": 0, "errors": 0}
 
@@ -234,13 +255,70 @@ class OpenSearchKB:
         if fields is None:
             fields = ["title^3", "description^2", "content"]
 
-        must_query = {
-            "multi_match": {
-                "query": query,
-                "fields": fields,
-                "type": "best_fields",
+        normalized_query = self._normalize_query(query)
+        if not normalized_query:
+            return []
+
+        tokens = re.findall(r"\w+", normalized_query)
+        token_count = len(tokens)
+        phrase_query = (
+            normalized_query if token_count <= 32 else " ".join(tokens[:32]).strip()
+        )
+
+        should_queries: List[JsonDict] = [
+            {
+                "multi_match": {
+                    "query": normalized_query,
+                    "fields": fields,
+                    "type": "best_fields",
+                    "boost": 1.0,
+                }
             }
-        }
+        ]
+
+        if token_count >= 3:
+            should_queries.append(
+                {
+                    "multi_match": {
+                        "query": normalized_query,
+                        "fields": fields,
+                        "type": "cross_fields",
+                        "operator": "and",
+                        "boost": 2.0,
+                    }
+                }
+            )
+
+        if token_count >= 6:
+            minimum_should_match = "60%" if token_count < 12 else "70%"
+            should_queries.append(
+                {
+                    "multi_match": {
+                        "query": normalized_query,
+                        "fields": fields,
+                        "type": "most_fields",
+                        "minimum_should_match": minimum_should_match,
+                        "boost": 1.5,
+                    }
+                }
+            )
+
+        if phrase_query and token_count >= 4:
+            for raw_field in fields:
+                base_field, boost = self._split_field_boost(raw_field)
+                if not base_field:
+                    continue
+                should_queries.append(
+                    {
+                        "match_phrase": {
+                            base_field: {
+                                "query": phrase_query,
+                                "slop": 2,
+                                "boost": max(2.0, boost * 4.0),
+                            }
+                        }
+                    }
+                )
 
         filter_clauses = []
         if filters:
@@ -265,7 +343,8 @@ class OpenSearchKB:
             "size": k,
             "query": {
                 "bool": {
-                    "must": [must_query],
+                    "should": should_queries,
+                    "minimum_should_match": 1,
                     "filter": filter_clauses if filter_clauses else [],
                 }
             },
@@ -286,7 +365,6 @@ class OpenSearchKB:
         self,
         query_vector: List[float],
         k: int = 10,
-        num_candidates: Optional[int] = None,
         filters: Optional[JsonDict] = None,
         min_timestamp: Optional[str] = None,
         max_timestamp: Optional[str] = None,
@@ -305,18 +383,16 @@ class OpenSearchKB:
             )
 
         # kNN part
+        num_candidates = max(k * 8, 200)
         knn_query: JsonDict = {
             "knn": {
                 "embedding": {
                     "vector": query_vector,
                     "k": k,
+                    "num_candidates": num_candidates,
                 }
             }
         }
-        if num_candidates is not None:
-            # supported in many OpenSearch versions
-            knn_query["knn"]["embedding"]["num_candidates"] = int(num_candidates)
-
         # filters
         filter_clauses = []
         if filters:
@@ -347,7 +423,15 @@ class OpenSearchKB:
             },
         }
 
-        resp = self.client.search(index=self.index, body=body)
+        try:
+            resp = self.client.search(index=self.index, body=body)
+        except Exception as exc:
+            # Older OpenSearch versions may not support `num_candidates`.
+            if "num_candidates" not in str(exc).lower():
+                raise
+            knn_query["knn"]["embedding"].pop("num_candidates", None)
+            resp = self.client.search(index=self.index, body=body)
+
         hits = resp.get("hits", {}).get("hits", [])
         return [
             SearchHit(

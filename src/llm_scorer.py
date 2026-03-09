@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any, List, Optional
 
 from loguru import logger
@@ -6,7 +8,6 @@ from .config import LABEL_LIST, PROMPT_TEMPLATE
 
 try:
     import torch
-    from peft import PeftConfig, PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     TORCH_AVAILABLE = True
@@ -14,6 +15,23 @@ except ImportError:
     TORCH_AVAILABLE = False
     logger.warning("torch/transformers not available. LLMScorer cannot run.")
     torch = None  # type: ignore
+
+try:
+    from huggingface_hub import snapshot_download
+
+    HF_HUB_AVAILABLE = True
+except ImportError:
+    HF_HUB_AVAILABLE = False
+    snapshot_download = None  # type: ignore
+
+try:
+    from peft import PeftConfig, PeftModel
+
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+    PeftConfig = None  # type: ignore
+    PeftModel = None  # type: ignore
 
 
 # Labels are already words (True/False/Not) - no mapping needed
@@ -39,46 +57,169 @@ class LLMScorer:
 
         self.device = device
         self.max_length = max_length
+
+        use_cuda = str(self.device).startswith("cuda") and torch.cuda.is_available()
+
+        def _resolve_model_source(path_or_repo: str) -> str:
+            import os
+
+            if os.path.isdir(path_or_repo):
+                return path_or_repo
+
+            if not HF_HUB_AVAILABLE:
+                return path_or_repo
+
+            # Prefer local snapshot if already cached, then fallback to online snapshot.
+            try:
+                return snapshot_download(repo_id=path_or_repo, local_files_only=True)
+            except Exception:
+                try:
+                    return snapshot_download(repo_id=path_or_repo)
+                except Exception:
+                    return path_or_repo
+
+        def _load_tokenizer(model_path: str):
+            # NOTE:
+            # transformers>=5 with some fast tokenizers (e.g. Qwen2) may still call
+            # Hub APIs during tokenizer init (model_info), even when local files exist.
+            # Force slow tokenizer to keep CPU/offline inference stable.
+            kwargs = {"trust_remote_code": True, "use_fast": False}
+            try:
+                return AutoTokenizer.from_pretrained(model_path, **kwargs)
+            except Exception as exc:
+                logger.warning(
+                    f"Tokenizer online load failed ({exc}). Retrying with local cache only."
+                )
+                return AutoTokenizer.from_pretrained(
+                    model_path, local_files_only=True, **kwargs
+                )
+
+        def _load_causal_lm(model_path: str):
+            # CPU path: keep everything on CPU, avoid device_map/offload metadata.
+            # CUDA path: allow auto placement for large models.
+            dtype = torch.float16 if use_cuda else torch.float32
+            kwargs = {
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": bool(use_cuda),
+            }
+            if use_cuda:
+                kwargs["device_map"] = "auto"
+            else:
+                # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
+                kwargs["device_map"] = None
+            try:
+                return AutoModelForCausalLM.from_pretrained(
+                    model_path, dtype=dtype, **kwargs
+                )
+            except TypeError:
+                # Backward compatibility for older transformers versions
+                try:
+                    return AutoModelForCausalLM.from_pretrained(
+                        model_path, torch_dtype=dtype, **kwargs
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"Model online load failed ({exc}). Retrying with local cache only."
+                    )
+                    return AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        torch_dtype=dtype,
+                        local_files_only=True,
+                        **kwargs,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Model online load failed ({exc}). Retrying with local cache only."
+                )
+                try:
+                    return AutoModelForCausalLM.from_pretrained(
+                        model_path, dtype=dtype, local_files_only=True, **kwargs
+                    )
+                except TypeError:
+                    return AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        torch_dtype=dtype,
+                        local_files_only=True,
+                        **kwargs,
+                    )
+
+        def _strip_accelerate_offload_state(model) -> None:
+            """
+            Remove accelerate offload metadata/hooks so PEFT does not try to
+            rewrite offload indices in CPU-only inference.
+            """
+            try:
+                from accelerate.hooks import remove_hook_from_submodules
+
+                remove_hook_from_submodules(model)
+            except Exception:
+                pass
+
+            if hasattr(model, "hf_device_map"):
+                try:
+                    delattr(model, "hf_device_map")
+                except Exception:
+                    # Fallback when attribute deletion is blocked.
+                    model.hf_device_map = {}
+
         # Check if model_name is a LoRA adapter
         import os
 
         is_lora = os.path.exists(os.path.join(model_name, "adapter_config.json"))
 
         if is_lora:
+            if not PEFT_AVAILABLE:
+                raise ImportError(
+                    "peft is required to load LoRA adapters. Install with: pip install peft"
+                )
             logger.info(
                 f"Detected LoRA adapter at {model_name}. Loading base model + adapter..."
             )
             config = PeftConfig.from_pretrained(model_name)
             base_model_path = config.base_model_name_or_path
+            resolved_base_model_path = _resolve_model_source(base_model_path)
 
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                base_model_path, trust_remote_code=True
-            )
+            self.tokenizer = _load_tokenizer(resolved_base_model_path)
 
             # Load base model
-            self.model = AutoModelForCausalLM.from_pretrained(
-                base_model_path,
-                torch_dtype=torch.float16
-                if torch.cuda.is_available()
-                else torch.float32,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
+            self.model = _load_causal_lm(resolved_base_model_path)
+            if not use_cuda:
+                _strip_accelerate_offload_state(self.model)
+
             # Load adapter
-            self.model = PeftModel.from_pretrained(self.model, model_name)
+            try:
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    model_name,
+                    torch_device="cpu" if not use_cuda else None,
+                    low_cpu_mem_usage=False,
+                    ephemeral_gpu_offload=False,
+                )
+            except KeyError as exc:
+                # Work around PEFT offload-index key mismatches observed with
+                # some Qwen checkpoints when loaded in CPU-only mode.
+                if not use_cuda and "base_model.model.model.model." in str(exc):
+                    logger.warning(
+                        f"LoRA load hit offload key mismatch ({exc}); retrying after clearing offload metadata."
+                    )
+                    _strip_accelerate_offload_state(self.model)
+                    self.model = PeftModel.from_pretrained(
+                        self.model,
+                        model_name,
+                        torch_device="cpu",
+                        low_cpu_mem_usage=False,
+                        ephemeral_gpu_offload=False,
+                    )
+                else:
+                    raise
         else:
             logger.info(f"Loading standard model: {model_name}")
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name, trust_remote_code=True
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16
-                if torch.cuda.is_available()
-                else torch.float32,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
+            resolved_model = _resolve_model_source(model_name)
+            self.tokenizer = _load_tokenizer(resolved_model)
+            self.model = _load_causal_lm(resolved_model)
+
+        if not use_cuda:
+            self.model.to("cpu")
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
