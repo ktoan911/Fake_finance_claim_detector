@@ -68,10 +68,19 @@ class LoRATrainingConfig:
 
 
 def _load_tokenizer_for_training(model_name: str):
-    """Load tokenizer with remote code disabled by default."""
-    return AutoTokenizer.from_pretrained(
-        model_name, trust_remote_code=False, use_fast=False
-    )
+    """Load tokenizer with remote code disabled by default.
+
+    Note: use_fast=True (default) is used because newer versions of transformers
+    removed slow tokenizer classes for some model families (e.g. BloomTokenizer),
+    which causes a ValueError when use_fast=False is forced.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=False, use_fast=True
+        )
+    except Exception:
+        # Last-resort fallback: let transformers pick the best available tokenizer
+        return AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
 
 
 def _load_causal_lm_for_training(model_name: str):
@@ -683,7 +692,12 @@ def train_lora_classification(
 
         logger.info(f"Preparing TRAIN dataset with {len(claims)} samples...")
         train_dataset = _prepare_classification_dataset(
-            claims, evidences, labels, tokenizer, config.max_length, config.prompt_template
+            claims,
+            evidences,
+            labels,
+            tokenizer,
+            config.max_length,
+            config.prompt_template,
         )
         logger.info(f"Preparing EVAL dataset with {len(eval_claims)} samples...")
         eval_dataset = _prepare_classification_dataset(
@@ -701,7 +715,12 @@ def train_lora_classification(
         )
         logger.info(f"Preparing dataset with {len(claims)} samples...")
         full_dataset = _prepare_classification_dataset(
-            claims, evidences, labels, tokenizer, config.max_length, config.prompt_template
+            claims,
+            evidences,
+            labels,
+            tokenizer,
+            config.max_length,
+            config.prompt_template,
         )
         split_dataset = full_dataset.train_test_split(
             test_size=config.eval_ratio, seed=42, shuffle=True
