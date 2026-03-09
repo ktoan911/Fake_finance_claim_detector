@@ -83,7 +83,7 @@ class LLMScorer:
             # transformers>=5 with some fast tokenizers (e.g. Qwen2) may still call
             # Hub APIs during tokenizer init (model_info), even when local files exist.
             # Force slow tokenizer to keep CPU/offline inference stable.
-            kwargs = {"trust_remote_code": True, "use_fast": False}
+            kwargs = {"trust_remote_code": False, "use_fast": False}
             try:
                 return AutoTokenizer.from_pretrained(model_path, **kwargs)
             except Exception as exc:
@@ -99,7 +99,7 @@ class LLMScorer:
             # CUDA path: allow auto placement for large models.
             dtype = torch.float16 if use_cuda else torch.float32
             kwargs = {
-                "trust_remote_code": True,
+                "trust_remote_code": False,
                 "low_cpu_mem_usage": bool(use_cuda),
             }
             if use_cuda:

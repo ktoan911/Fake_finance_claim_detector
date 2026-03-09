@@ -23,6 +23,23 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    np = None  # type: ignore
+    torch = None  # type: ignore
+    Dataset = None  # type: ignore
+    LoraConfig = None  # type: ignore
+    TaskType = None  # type: ignore
+    get_peft_model = None  # type: ignore
+    accuracy_score = None  # type: ignore
+    f1_score = None  # type: ignore
+    precision_score = None  # type: ignore
+    recall_score = None  # type: ignore
+    AutoModelForCausalLM = None  # type: ignore
+    AutoTokenizer = None  # type: ignore
+    DataCollatorForSeq2Seq = None  # type: ignore
+    EarlyStoppingCallback = None  # type: ignore
+    Trainer = None  # type: ignore
+    TrainingArguments = None  # type: ignore
+    TrainerCallback = object  # type: ignore[misc,assignment]
 
 from .config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
 
@@ -48,6 +65,24 @@ class LoRATrainingConfig:
 
     # Prompt template for classification
     prompt_template: str = PROMPT_TEMPLATE
+
+
+def _load_tokenizer_for_training(model_name: str):
+    """Load tokenizer with remote code disabled by default."""
+    return AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=False, use_fast=False
+    )
+
+
+def _load_causal_lm_for_training(model_name: str):
+    """Load CausalLM with remote code disabled by default."""
+    model_kwargs = {
+        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+        "device_map": "auto" if torch.cuda.is_available() else None,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": False,
+    }
+    return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
 
 
 def _is_linear_like_module(module) -> bool:
@@ -552,9 +587,7 @@ def train_lora_classification(
 
         # Always load tokenizer from base model to avoid Peft corrupted tokenizer_config.json issues with Qwen
         logger.info("Loading tokenizer from base model...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, trust_remote_code=True
-        )
+        tokenizer = _load_tokenizer_for_training(config.model_name)
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -563,13 +596,7 @@ def train_lora_classification(
 
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
+        base_model = _load_causal_lm_for_training(config.model_name)
 
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
@@ -594,9 +621,7 @@ def train_lora_classification(
         else:
             logger.info(f"Creating new LoRA model from {config.model_name}")
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name, trust_remote_code=True
-        )
+        tokenizer = _load_tokenizer_for_training(config.model_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -605,13 +630,7 @@ def train_lora_classification(
             f"Using existing vocabulary tokens for binary labels: {POSITIVE_LABEL}/{NEGATIVE_LABEL}"
         )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
+        model = _load_causal_lm_for_training(config.model_name)
 
         # Enable gradient checkpointing to save VRAM
         model.gradient_checkpointing_enable()
