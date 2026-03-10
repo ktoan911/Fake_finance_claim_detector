@@ -119,27 +119,48 @@ def _load_causal_lm_for_training(
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,  # nested quant → extra ~0.4 bit/param
         )
-        model_kwargs = {
-            "quantization_config": bnb_config,
-            "device_map": "auto",
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": False,
-        }
         logger.info("Loading model in 4-bit QLoRA mode (BitsAndBytes NF4).")
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
     else:
-        # ── Optimization 1 (cont.): request Flash Attention 2 kernel if available ──
-        # Falls back to SDPA/eager automatically when flash_attention_2 is not
-        # installed; no crash.
-        attn_impl = "flash_attention_2" if torch.cuda.is_available() else "eager"
-        model_kwargs = {
+        # ── Optimization 1 (cont.): Flash Attention 2 with graceful fallback ──
+        # Not all architectures support flash_attention_2 (e.g. MPT / PhoGPT-4B).
+        # We try each implementation in order: flash_attention_2 → sdpa → default.
+        base_kwargs = {
             "torch_dtype": torch_dtype,
             "device_map": "auto" if torch.cuda.is_available() else None,
             "low_cpu_mem_usage": True,
             "trust_remote_code": False,
-            "attn_implementation": attn_impl,
         }
-        logger.info(f"Loading model with attn_implementation='{attn_impl}'.")
-    return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+        if torch.cuda.is_available():
+            for attn_impl in ("flash_attention_2", "sdpa", None):
+                try:
+                    if attn_impl is not None:
+                        kw = {**base_kwargs, "attn_implementation": attn_impl}
+                    else:
+                        kw = base_kwargs  # let transformers pick the default
+                    logger.info(
+                        f"Loading model with attn_implementation="
+                        f"'{attn_impl or 'default'}'."
+                    )
+                    return AutoModelForCausalLM.from_pretrained(model_name, **kw)
+                except (ValueError, ImportError) as exc:
+                    logger.warning(
+                        f"attn_implementation='{attn_impl}' not supported "
+                        f"({exc}); trying next option."
+                    )
+            # Should not reach here, but just in case all three attempts raise.
+            raise RuntimeError(
+                "Failed to load model with any attn_implementation option."
+            )
+        else:
+            return AutoModelForCausalLM.from_pretrained(model_name, **base_kwargs)
 
 
 def _resolve_training_precision(precision: str):
