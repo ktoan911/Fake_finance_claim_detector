@@ -62,6 +62,7 @@ class LoRATrainingConfig:
     lora_dropout: float = 0.1
     eval_ratio: float = 0.1  # Used only when no explicit eval dataset is provided
     early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
+    precision: str = "auto"  # auto -> bf16 (if supported) else fp16; cpu uses fp32
 
     # Prompt template for classification
     prompt_template: str = PROMPT_TEMPLATE
@@ -83,15 +84,55 @@ def _load_tokenizer_for_training(model_name: str):
         return AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
 
 
-def _load_causal_lm_for_training(model_name: str):
+def _load_causal_lm_for_training(model_name: str, torch_dtype):
     """Load CausalLM with remote code disabled by default."""
     model_kwargs = {
-        "torch_dtype": torch.float16 if torch.cuda.is_available() else torch.float32,
+        "torch_dtype": torch_dtype,
         "device_map": "auto" if torch.cuda.is_available() else None,
         "low_cpu_mem_usage": True,
         "trust_remote_code": False,
     }
     return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+
+def _resolve_training_precision(precision: str):
+    """
+    Resolve compute precision for training/evaluation.
+
+    Returns:
+        tuple(torch_dtype, use_bf16, use_fp16, resolved_name)
+    """
+    requested = (precision or "auto").lower().strip()
+    valid_precisions = {"auto", "bf16", "fp16", "fp32"}
+    if requested not in valid_precisions:
+        raise ValueError(
+            f"Unsupported precision '{precision}'. "
+            f"Expected one of: {sorted(valid_precisions)}."
+        )
+
+    if not torch.cuda.is_available():
+        if requested in {"bf16", "fp16"}:
+            logger.warning(
+                f"Requested precision '{requested}' requires CUDA. Falling back to fp32."
+            )
+        return torch.float32, False, False, "fp32"
+
+    if requested == "auto":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16, True, False, "bf16"
+        return torch.float16, False, True, "fp16"
+
+    if requested == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError(
+                "precision='bf16' requested but GPU does not support bfloat16."
+            )
+        return torch.bfloat16, True, False, "bf16"
+
+    if requested == "fp16":
+        return torch.float16, False, True, "fp16"
+
+    return torch.float32, False, False, "fp32"
 
 
 def _is_linear_like_module(module) -> bool:
@@ -379,36 +420,49 @@ def _prepare_classification_dataset(
         target = normalize_label(label)
         targets.append(target)
 
+    if "{evidence}" not in prompt_template:
+        raise ValueError("Prompt template must contain {evidence} placeholder")
+    if "{claim}" not in prompt_template:
+        raise ValueError("Prompt template must contain {claim} placeholder")
+
+    template_start_raw, template_end_raw = prompt_template.split(
+        "{evidence}", maxsplit=1
+    )
+    template_prefix_raw, template_claim_suffix_raw = template_start_raw.split(
+        "{claim}", maxsplit=1
+    )
+
+    # Tokenize static template chunks once for efficiency and consistent budgeting.
+    template_prefix_ids = tokenizer(
+        template_prefix_raw, add_special_tokens=True, truncation=False
+    )["input_ids"]
+    template_claim_suffix_ids = tokenizer(
+        template_claim_suffix_raw, add_special_tokens=False, truncation=False
+    )["input_ids"]
+    template_end_ids = tokenizer(
+        template_end_raw, add_special_tokens=False, truncation=False
+    )["input_ids"]
+
+    truncation_stats = {"claim_truncated": 0, "evidence_truncated": 0}
+
     # Tokenize
     def tokenize_function(examples):
         """
         Build input_ids with smart truncation and numbered evidence.
+
+        Priority order for fitting sequence into max_length:
+        1) Always keep label token supervision.
+        2) Keep prompt template.
+        3) Truncate evidence first.
+        4) Truncate claim only when claim+template already exceeds budget.
         """
         model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-
-        # Split template into start (before evidence) and end (after evidence)
-        # Template: "... Claim: {claim} ... Evidence: {evidence} ... Verdict:"
-        if "{evidence}" not in prompt_template:
-            raise ValueError("Prompt template must contain {evidence} placeholder")
-
-        template_parts = prompt_template.split("{evidence}")
-        template_start_raw = template_parts[0]
-        template_end_raw = template_parts[1]
 
         for claim, evidence_raw, target in zip(
             examples["claim"], examples["evidence"], examples["target"]
         ):
-            # 1. Prepare fixed parts
-            # Format start with claim
-            template_start = template_start_raw.format(claim=claim)
-            template_end = template_end_raw  # No other placeholders in end
-
-            # Tokenize fixed parts
-            start_ids = tokenizer(
-                template_start, add_special_tokens=True, truncation=False
-            )["input_ids"]
-            end_ids = tokenizer(
-                template_end, add_special_tokens=False, truncation=False
+            claim_ids = tokenizer(
+                str(claim), add_special_tokens=False, truncation=False
             )["input_ids"]
 
             # Tokenize target label token (must be exactly one token).
@@ -419,16 +473,35 @@ def _prepare_classification_dataset(
                     "Update LABEL_LIST in src/config.py to single-token labels for this tokenizer."
                 )
             target_ids = list(target_token_ids)
-
             if tokenizer.eos_token_id is not None:
                 target_ids = target_ids + [tokenizer.eos_token_id]
 
-            # 2. Calculate available space for evidence
-            # input = start + evidence + end + target
-            fixed_len = len(start_ids) + len(end_ids) + len(target_ids)
+            # Reserve space for template ending + target first to guarantee supervision.
+            fixed_without_claim_and_evidence = (
+                len(template_prefix_ids)
+                + len(template_claim_suffix_ids)
+                + len(template_end_ids)
+                + len(target_ids)
+            )
+            available_for_claim = max_length - fixed_without_claim_and_evidence
+
+            if available_for_claim < 0:
+                raise ValueError(
+                    "Prompt template is too long for max_length after reserving label token. "
+                    f"Increase max_length (current={max_length})."
+                )
+
+            # If claim alone overflows, truncate claim tail but keep template + label.
+            if len(claim_ids) > available_for_claim:
+                claim_ids = claim_ids[:available_for_claim]
+                truncation_stats["claim_truncated"] += 1
+
+            start_ids = template_prefix_ids + claim_ids + template_claim_suffix_ids
+
+            # Remaining budget goes to evidence.
+            fixed_len = len(start_ids) + len(template_end_ids) + len(target_ids)
             available_for_evidence = max_length - fixed_len
 
-            # 3. Process evidence with smart truncation
             evidence_ids = []
             if available_for_evidence > 0:
                 # Support both newline separation (old) and ||| separation (CSV loader)
@@ -455,39 +528,43 @@ def _prepare_classification_dataset(
                     ):
                         current_evidence_ids.extend(item_ids)
                     else:
-                        # Don't truncate mid-token - skip this item entirely to preserve semantic integrity
-                        # Truncating evidence mid-word can corrupt fact-checking context
+                        # Keep complete evidence items only (no mid-item truncation).
+                        truncation_stats["evidence_truncated"] += 1
                         break
 
                 evidence_ids = current_evidence_ids
 
-            # 4. Construct full input
-            full_input_ids = start_ids + evidence_ids + end_ids + target_ids
+            # Construct full input
+            full_input_ids = start_ids + evidence_ids + template_end_ids + target_ids
 
-            # 5. Create labels
-            # Mask everything except target
-            prompt_len = len(start_ids) + len(evidence_ids) + len(end_ids)
+            # Create labels: mask prompt, supervise label token only.
+            prompt_len = len(start_ids) + len(evidence_ids) + len(template_end_ids)
             label_token_count = len(target_token_ids)
-
             labels = (
                 [-100] * prompt_len
                 + target_ids[:label_token_count]
                 + [-100] * (len(target_ids) - label_token_count)
             )
 
-            # 6. Pad to max_length
+            # Safety guard: supervision token must remain after preprocessing.
+            if not any(token_id != -100 for token_id in labels):
+                raise ValueError(
+                    "A sample ended up without supervised label tokens. "
+                    "Increase max_length or review prompt truncation logic."
+                )
+
+            # Pad to max_length
             padding_length = max_length - len(full_input_ids)
             if padding_length > 0:
+                unpadded_len = len(full_input_ids)
                 pad_token_id = (
                     tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
                 )
                 full_input_ids = full_input_ids + [pad_token_id] * padding_length
                 labels = labels + [-100] * padding_length
-                attention_mask = [1] * (max_length - padding_length) + [
-                    0
-                ] * padding_length
+                attention_mask = [1] * unpadded_len + [0] * padding_length
             else:
-                # If we somehow exceeded max_length (shouldn't happen with logic above), truncate
+                # Defensive fallback if sequence sizing ever regresses.
                 full_input_ids = full_input_ids[:max_length]
                 labels = labels[:max_length]
                 attention_mask = [1] * max_length
@@ -505,6 +582,28 @@ def _prepare_classification_dataset(
     tokenized = dataset.map(
         tokenize_function, batched=True, remove_columns=["claim", "evidence", "target"]
     )
+
+    if truncation_stats["claim_truncated"] > 0:
+        logger.warning(
+            f"Claim truncation applied to {truncation_stats['claim_truncated']} samples "
+            f"to preserve supervision labels within max_length={max_length}."
+        )
+    if truncation_stats["evidence_truncated"] > 0:
+        logger.info(
+            f"Evidence truncation applied to {truncation_stats['evidence_truncated']} samples "
+            f"for max_length={max_length}."
+        )
+
+    missing_supervision = sum(
+        1
+        for sample_labels in tokenized["labels"]
+        if not any(x != -100 for x in sample_labels)
+    )
+    if missing_supervision > 0:
+        raise ValueError(
+            f"Tokenized dataset contains {missing_supervision} samples with no supervised label tokens. "
+            "Increase max_length or review prompt template."
+        )
 
     return tokenized
 
@@ -578,6 +677,12 @@ def train_lora_classification(
         )
 
     config = config or LoRATrainingConfig()
+    train_dtype, use_bf16, use_fp16, resolved_precision = _resolve_training_precision(
+        config.precision
+    )
+    logger.info(
+        f"Training precision resolved to {resolved_precision} (dtype={train_dtype})."
+    )
 
     # Check if resuming from checkpoint
     import os
@@ -605,7 +710,7 @@ def train_lora_classification(
 
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
-        base_model = _load_causal_lm_for_training(config.model_name)
+        base_model = _load_causal_lm_for_training(config.model_name, train_dtype)
 
         # Enable gradient checkpointing
         base_model.gradient_checkpointing_enable()
@@ -639,7 +744,7 @@ def train_lora_classification(
             f"Using existing vocabulary tokens for binary labels: {POSITIVE_LABEL}/{NEGATIVE_LABEL}"
         )
 
-        model = _load_causal_lm_for_training(config.model_name)
+        model = _load_causal_lm_for_training(config.model_name, train_dtype)
 
         # Enable gradient checkpointing to save VRAM
         model.gradient_checkpointing_enable()
@@ -742,11 +847,13 @@ def train_lora_classification(
         logging_steps=10,
         save_steps=200,  # Save checkpoint every 200 steps
         save_total_limit=3,  # Keep 3 checkpoints (best + recent ones for resuming)
-        fp16=torch.cuda.is_available(),
+        fp16=use_fp16,
+        bf16=use_bf16,
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
         weight_decay=0.01,
+        logging_nan_inf_filter=False,
         eval_strategy="steps",
         eval_steps=200,
         load_best_model_at_end=True,

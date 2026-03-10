@@ -26,6 +26,13 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=None, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        choices=["auto", "bf16", "fp16", "fp32"],
+        default=None,
+        help="Training precision (default: auto)",
+    )
     parser.add_argument("--max-length", type=int, default=None, help="Max sequence length")
     parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps")
     parser.add_argument("--early-stopping", type=int, default=None, help="Early stopping patience (default: 3)")
@@ -77,6 +84,7 @@ def main():
         epochs=args.epochs or int(os.getenv("LORA_EPOCHS", "3")),
         batch_size=args.batch_size or int(os.getenv("LORA_BATCH_SIZE", "1")),
         learning_rate=args.lr or float(os.getenv("LORA_LR", "2e-4")),
+        precision=args.precision or os.getenv("LORA_PRECISION", "auto"),
         max_length=args.max_length or int(os.getenv("LORA_MAX_LENGTH", "256")),
         early_stopping_patience=args.early_stopping or int(os.getenv("LORA_EARLY_STOPPING", "3")),
     )
