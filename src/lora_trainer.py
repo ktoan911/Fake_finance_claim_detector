@@ -23,17 +23,6 @@ try:
 
     TORCH_AVAILABLE = True
 
-    # ── Optimization 1: Enable Flash Attention / SDPA kernels (PyTorch ≥ 2.1) ──
-    # Flash-attention reduces VRAM ~30-50% and speeds up training ~1.5-2x,
-    # especially at long sequence lengths (max_length ≥ 512).
-    if torch.cuda.is_available():
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(False)  # disable slow fallback
-        except AttributeError:
-            pass  # PyTorch < 2.1 – skip silently
-
 except ImportError:
     TORCH_AVAILABLE = False
     np = None  # type: ignore
@@ -128,39 +117,13 @@ def _load_causal_lm_for_training(
             trust_remote_code=False,
         )
     else:
-        # ── Optimization 1 (cont.): Flash Attention 2 with graceful fallback ──
-        # Not all architectures support flash_attention_2 (e.g. MPT / PhoGPT-4B).
-        # We try each implementation in order: flash_attention_2 → sdpa → default.
-        base_kwargs = {
-            "torch_dtype": torch_dtype,
-            "device_map": "auto" if torch.cuda.is_available() else None,
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": False,
-        }
-
-        if torch.cuda.is_available():
-            for attn_impl in ("flash_attention_2", "sdpa", None):
-                try:
-                    if attn_impl is not None:
-                        kw = {**base_kwargs, "attn_implementation": attn_impl}
-                    else:
-                        kw = base_kwargs  # let transformers pick the default
-                    logger.info(
-                        f"Loading model with attn_implementation="
-                        f"'{attn_impl or 'default'}'."
-                    )
-                    return AutoModelForCausalLM.from_pretrained(model_name, **kw)
-                except (ValueError, ImportError) as exc:
-                    logger.warning(
-                        f"attn_implementation='{attn_impl}' not supported "
-                        f"({exc}); trying next option."
-                    )
-            # Should not reach here, but just in case all three attempts raise.
-            raise RuntimeError(
-                "Failed to load model with any attn_implementation option."
-            )
-        else:
-            return AutoModelForCausalLM.from_pretrained(model_name, **base_kwargs)
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
 
 
 def _resolve_training_precision(precision: str):
