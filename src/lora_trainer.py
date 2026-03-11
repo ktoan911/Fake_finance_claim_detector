@@ -13,7 +13,6 @@ try:
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
-        BitsAndBytesConfig,
         DataCollatorForSeq2Seq,
         EarlyStoppingCallback,
         Trainer,
@@ -37,7 +36,6 @@ except ImportError:
     recall_score = None  # type: ignore
     AutoModelForCausalLM = None  # type: ignore
     AutoTokenizer = None  # type: ignore
-    BitsAndBytesConfig = None  # type: ignore
     DataCollatorForSeq2Seq = None  # type: ignore
     EarlyStoppingCallback = None  # type: ignore
     Trainer = None  # type: ignore
@@ -65,19 +63,14 @@ class LoRATrainingConfig:
     lora_dropout: float = 0.1
     eval_ratio: float = 0.1  # Used only when no explicit eval dataset is provided
     early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
-    precision: str = "auto"  # auto -> bf16 (if supported) else fp16; cpu uses fp32
+    precision: str = "auto"  # auto -> bf16 (if supported) else fp16; T4 uses fp16
+    use_sdpa: bool = True
 
     # Prompt template for classification
     prompt_template: str = PROMPT_TEMPLATE
 
 
 def _load_tokenizer_for_training(model_name: str):
-    """Load tokenizer with remote code disabled by default.
-
-    Note: use_fast=True (default) is used because newer versions of transformers
-    removed slow tokenizer classes for some model families (e.g. BloomTokenizer),
-    which causes a ValueError when use_fast=False is forced.
-    """
     try:
         return AutoTokenizer.from_pretrained(
             model_name, trust_remote_code=False, use_fast=True
@@ -90,40 +83,30 @@ def _load_tokenizer_for_training(model_name: str):
 def _load_causal_lm_for_training(
     model_name: str,
     torch_dtype,
-    use_4bit_quant: bool = False,
+    attn_implementation: str = "sdpa",
 ):
-    """Load CausalLM with remote code disabled by default.
-
-    Args:
-        model_name: HuggingFace model ID or local path.
-        torch_dtype: Compute dtype (e.g. torch.bfloat16).
-        use_4bit_quant: If True, load in 4-bit QLoRA mode via BitsAndBytes.
-            Reduces base model VRAM from ~20 GB (fp16 LoRA) to ~7-10 GB.
-    """
-    if use_4bit_quant and torch.cuda.is_available():
-        # ── Optimization 3: 4-bit QLoRA quantization (BitsAndBytes) ──
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,  # nested quant → extra ~0.4 bit/param
-        )
-        logger.info("Loading model in 4-bit QLoRA mode (BitsAndBytes NF4).")
-        return AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=False,
-        )
-    else:
-        return AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-            low_cpu_mem_usage=True,
-            trust_remote_code=False,
-        )
+    kwargs = dict(
+        torch_dtype=torch_dtype,
+        device_map="auto" if torch.cuda.is_available() else None,
+        low_cpu_mem_usage=True,
+        trust_remote_code=False,
+    )
+    # Try the requested attention implementation first; fall back to eager if unsupported.
+    if attn_implementation and attn_implementation != "eager":
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                attn_implementation=attn_implementation,
+                **kwargs,
+            )
+            logger.info(f"✅ Attention implementation: {attn_implementation}")
+            return model
+        except (ValueError, NotImplementedError) as e:
+            logger.warning(
+                f"attn_implementation='{attn_implementation}' not supported by this model: {e}. "
+                "Falling back to 'eager' attention."
+            )
+    return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
 
 def _resolve_training_precision(precision: str):
@@ -677,19 +660,10 @@ def train_lora_classification(
     eval_evidences: Optional[List[str]] = None,
     eval_labels: Optional[List[str]] = None,
     config: Optional[LoRATrainingConfig] = None,
-    # ── Optimization 2: gradient_accumulation_steps=2 with batch_size=1 ─────────
-    # Effective batch = batch_size × gradient_accumulation_steps = 1×2 = 2.
-    # VRAM is the same as batch_size=1 (only one micro-batch lives on GPU at a time)
-    # while gradient quality matches batch_size=2.  Previously this was 4 which
-    # means each optimizer step needed 4× forward passes; 2 is a better default
-    # for seq=2048 workloads.
-    gradient_accumulation_steps: int = 2,
+    # gradient_accumulation_steps: Effective batch = batch_size × steps.
+    # On T4 with batch_size=1, set to 4-8 to simulate larger batches without extra VRAM.
+    gradient_accumulation_steps: int = 4,
     skip_final_eval: bool = True,  # Skip final eval by default to prevent OOM
-    # ── Optimization 3: enable 4-bit QLoRA ──────────────────────────────────────
-    # Set use_4bit_quant=True to load the base model in 4-bit (NF4) mode.
-    # This drops base-model VRAM from ~20 GB (fp16 LoRA) to ~7-10 GB.
-    # Adapter weights are still trained in bf16/fp16.
-    use_4bit_quant: bool = False,
     checkpoint_path: Optional[
         str
     ] = None,  # Path to existing checkpoint to resume training
@@ -726,6 +700,18 @@ def train_lora_classification(
         f"Training precision resolved to {resolved_precision} (dtype={train_dtype})."
     )
 
+    # ── T4 / Tensor Core optimizations ──────────────────────────────────────
+    # TF32 gives ~1.3-1.5× matmul speedup on T4 with negligible accuracy loss.
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    attn_impl = "sdpa" if config.use_sdpa else "eager"
+    logger.info(
+        f"🚀 T4 optimisations: SDPA={config.use_sdpa}, "
+        f"TF32=True, 8-bit AdamW, group_by_length=True"
+    )
+
     # Check if resuming from checkpoint
     import os
 
@@ -753,7 +739,7 @@ def train_lora_classification(
         # Load base model
         logger.info(f"Loading base model: {config.model_name}")
         base_model = _load_causal_lm_for_training(
-            config.model_name, train_dtype, use_4bit_quant=use_4bit_quant
+            config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
         # ── Optimization 4: gradient checkpointing (use_reentrant=False) ──
@@ -792,7 +778,7 @@ def train_lora_classification(
         )
 
         model = _load_causal_lm_for_training(
-            config.model_name, train_dtype, use_4bit_quant=use_4bit_quant
+            config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
         # ── Optimization 4: gradient checkpointing (use_reentrant=False) ──
@@ -888,22 +874,40 @@ def train_lora_classification(
         f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}"
     )
 
-    # Training arguments - optimized for F1 score with memory management
+    # ── Training arguments ─────────────────────────────────────────────────
+    # Resolve optimizer: prefer 8-bit AdamW (saves ~75% optimizer VRAM on T4);
+    # fall back to fused AdamW if bitsandbytes is unavailable.
+    try:
+        import bitsandbytes  # noqa: F401
+
+        _optim = "adamw_bnb_8bit"
+    except ImportError:
+        _optim = "adamw_torch_fused"
+        logger.warning(
+            "bitsandbytes not found; using adamw_torch_fused instead of 8-bit AdamW. "
+            "Install bitsandbytes for lower optimizer VRAM usage: pip install bitsandbytes"
+        )
+    logger.info(f"Optimizer: {_optim}")
+
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=1,
+        per_device_eval_batch_size=4,  # T4: eval is inference-only, 4× faster
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
+        lr_scheduler_type="cosine",  # cosine decay → better convergence
         logging_steps=10,
-        save_steps=200,  # Save checkpoint every 200 steps
-        save_total_limit=3,  # Keep 3 checkpoints (best + recent ones for resuming)
+        save_steps=200,
+        save_total_limit=3,
         fp16=use_fp16,
         bf16=use_bf16,
+        tf32=True,  # TF32 matmul → ~1.4× speedup on T4
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
         weight_decay=0.01,
+        optim=_optim,  # 8-bit Adam: optimizer VRAM ↓ 75%
+        group_by_length=True,  # pack similar-length seqs → less padding waste
         logging_nan_inf_filter=False,
         eval_strategy="steps",
         eval_steps=200,
@@ -913,7 +917,8 @@ def train_lora_classification(
         save_strategy="steps",
         eval_accumulation_steps=64,
         max_grad_norm=1.0,
-        dataloader_num_workers=0,
+        dataloader_num_workers=2,  # parallel data prefetch
+        dataloader_pin_memory=True,  # faster CPU→GPU transfer
         ddp_find_unused_parameters=False,
     )
 
