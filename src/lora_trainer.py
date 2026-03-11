@@ -923,6 +923,8 @@ def train_lora_classification(
         max_grad_norm=1.0,
         dataloader_num_workers=2,  # parallel data prefetch
         dataloader_pin_memory=True,  # faster CPU→GPU transfer
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
     )
 
