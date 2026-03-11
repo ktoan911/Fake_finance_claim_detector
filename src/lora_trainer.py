@@ -700,16 +700,20 @@ def train_lora_classification(
         f"Training precision resolved to {resolved_precision} (dtype={train_dtype})."
     )
 
-    # ── T4 / Tensor Core optimizations ──────────────────────────────────────
-    # TF32 gives ~1.3-1.5× matmul speedup on T4 with negligible accuracy loss.
+    # TF32 gives ~1.3-1.5× matmul speedup but requires Ampere (sm_80+).
+    # T4 is Turing (sm_75) → skip TF32 to avoid a hard ValueError from transformers.
+    _use_tf32 = False
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        _cc_major, _ = torch.cuda.get_device_capability()
+        if _cc_major >= 8:  # Ampere or newer
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            _use_tf32 = True
 
     attn_impl = "sdpa" if config.use_sdpa else "eager"
     logger.info(
-        f"🚀 T4 optimisations: SDPA={config.use_sdpa}, "
-        f"TF32=True, 8-bit AdamW, group_by_length=True"
+        f"🚀 Speed optimisations: SDPA={config.use_sdpa}, "
+        f"TF32={_use_tf32}, 8-bit AdamW, group_by_length=True"
     )
 
     # Check if resuming from checkpoint
@@ -901,7 +905,7 @@ def train_lora_classification(
         save_total_limit=3,
         fp16=use_fp16,
         bf16=use_bf16,
-        tf32=True,  # TF32 matmul → ~1.4× speedup on T4
+        tf32=_use_tf32,  # only on Ampere+ (sm_80+); T4 sm_75 → False
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
