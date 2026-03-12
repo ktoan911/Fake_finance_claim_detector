@@ -1,4 +1,3 @@
-import gc
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -296,10 +295,10 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         label_logits_array = logits[batch_idx]  # Shape: [2]
 
         # Apply softmax to get probabilities (pLM)
-        exp_logits = np.exp(
-            label_logits_array - np.max(label_logits_array)
-        )  # numerical stability
-        probs = exp_logits / np.sum(exp_logits)
+        # Use torch.softmax for numerical stability (avoids overflow with large logits)
+        probs = torch.softmax(
+            torch.tensor(label_logits_array, dtype=torch.float32), dim=0
+        ).numpy()
 
         # Choose label with highest probability
         pred_label_idx = np.argmax(probs)
@@ -361,11 +360,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         "accuracy": accuracy_score(true_labels, pred_labels),
     }
 
-    # Clean up memory
     del pred_labels, true_labels, logits, labels
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return metrics
 
@@ -622,36 +617,6 @@ def _prepare_classification_dataset(
     return tokenized
 
 
-class MemoryCleanupCallback(TrainerCallback):
-    """
-    Callback to aggressively clean up memory after evaluation to prevent OOM.
-    """
-
-    def on_evaluate(self, args, state, control, **kwargs):
-        """Clean up memory after evaluation."""
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info(
-                f"GPU Memory: {torch.cuda.memory_allocated() / 2048**3:.2f}GB / {torch.cuda.max_memory_allocated() / 2048**3:.2f}GB"
-            )
-
-    def on_step_end(self, args, state, control, **kwargs):
-        """Periodically clean up memory during training."""
-        if state.global_step % 50 == 0:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    def on_prediction_step(self, args, state, control, **kwargs):
-        """Clean up after each prediction step during evaluation."""
-        # Clean every 10 predictions to prevent accumulation
-        if state.global_step % 10 == 0:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-
 def train_lora_classification(
     claims: List[str],
     evidences: List[str],
@@ -662,7 +627,7 @@ def train_lora_classification(
     config: Optional[LoRATrainingConfig] = None,
     # gradient_accumulation_steps: Effective batch = batch_size × steps.
     # On T4 with batch_size=1, set to 4-8 to simulate larger batches without extra VRAM.
-    gradient_accumulation_steps: int = 4,
+    gradient_accumulation_steps: int = 1,
     skip_final_eval: bool = True,  # Skip final eval by default to prevent OOM
     checkpoint_path: Optional[
         str
@@ -746,14 +711,8 @@ def train_lora_classification(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # ── Optimization 4: gradient checkpointing (use_reentrant=False) ──
-        # use_reentrant=False avoids extra activation copies → saves ~10-15% VRAM.
-        base_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-
-        # FIXED: Disable cache when using gradient checkpointing
-        base_model.config.use_cache = False
+        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
+        base_model.config.use_cache = True
 
         # Load LoRA adapter from checkpoint
         logger.info("Loading LoRA adapter from checkpoint...")
@@ -785,13 +744,8 @@ def train_lora_classification(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # ── Optimization 4: gradient checkpointing (use_reentrant=False) ──
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-
-        # FIXED: Disable cache when using gradient checkpointing
-        model.config.use_cache = False
+        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
+        model.config.use_cache = True
 
         # Configure LoRA
         target_modules = _resolve_lora_target_modules(model)
@@ -879,24 +833,14 @@ def train_lora_classification(
     )
 
     # ── Training arguments ─────────────────────────────────────────────────
-    # Resolve optimizer: prefer 8-bit AdamW (saves ~75% optimizer VRAM on T4);
-    # fall back to fused AdamW if bitsandbytes is unavailable.
-    try:
-        import bitsandbytes  # noqa: F401
-
-        _optim = "adamw_bnb_8bit"
-    except ImportError:
-        _optim = "adamw_torch_fused"
-        logger.warning(
-            "bitsandbytes not found; using adamw_torch_fused instead of 8-bit AdamW. "
-            "Install bitsandbytes for lower optimizer VRAM usage: pip install bitsandbytes"
-        )
+    # H100: use fused AdamW — faster than 8-bit AdamW on H100 (ample VRAM, no need to save).
+    _optim = "adamw_torch_fused"
     logger.info(f"Optimizer: {_optim}")
 
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=4,  # T4: eval is inference-only, 4× faster
+        per_device_eval_batch_size=32,  # H100: large VRAM → big eval batch
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
         lr_scheduler_type="cosine",  # cosine decay → better convergence
@@ -905,12 +849,12 @@ def train_lora_classification(
         save_total_limit=3,
         fp16=use_fp16,
         bf16=use_bf16,
-        tf32=_use_tf32,  # only on Ampere+ (sm_80+); T4 sm_75 → False
+        tf32=_use_tf32,  # only on Ampere+ (sm_80+)
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
         weight_decay=0.01,
-        optim=_optim,  # 8-bit Adam: optimizer VRAM ↓ 75%
+        optim=_optim,  # fused AdamW: fastest on H100
         group_by_length=True,  # pack similar-length seqs → less padding waste
         logging_nan_inf_filter=False,
         eval_strategy="steps",
@@ -921,10 +865,9 @@ def train_lora_classification(
         save_strategy="steps",
         eval_accumulation_steps=64,
         max_grad_norm=1.0,
-        dataloader_num_workers=2,  # parallel data prefetch
+        dataloader_num_workers=8,  # H100 server: many CPUs → fast prefetch
         dataloader_pin_memory=True,  # faster CPU→GPU transfer
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        gradient_checkpointing=False,  # H100: disabled — saves 30-40% training time
         ddp_find_unused_parameters=False,
     )
 
@@ -1001,23 +944,12 @@ def train_lora_classification(
             EarlyStoppingCallback(
                 early_stopping_patience=config.early_stopping_patience
             ),
-            MemoryCleanupCallback(),  # Add memory cleanup
         ],
     )
 
     logger.info("Starting LoRA fine-tuning with F1 optimization...")
 
-    # Clear cache before training
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     trainer.train()
-
-    # Clear cache after training
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     # Final evaluation (optional - can skip to save memory)
     if not skip_final_eval:
@@ -1030,10 +962,6 @@ def train_lora_classification(
             f"Accuracy={final_metrics.get('eval_accuracy', 0):.4f}"
         )
 
-        # Clear memory after eval
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     else:
         logger.info("⚠️  Skipping final evaluation to prevent CUDA OOM")
         logger.info(
