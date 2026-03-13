@@ -51,19 +51,22 @@ NEGATIVE_LABEL = LABEL_LIST[1]
 class LoRATrainingConfig:
     """Configuration for LoRA supervised fine-tuning."""
 
-    model_name: str = "meta-llama/Llama-3.1-8B"
+    model_name: str = "vinai/PhoGPT-4B"
     output_dir: str = "artifacts/lora_llm"
     batch_size: int = 1
     epochs: int = 3
-    learning_rate: float = 2e-4
+    learning_rate: float = 5e-5  # Lowered from 2e-4: 4B-param models need smaller LR to avoid grad explosions
     max_length: int = 256
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
     eval_ratio: float = 0.1  # Used only when no explicit eval dataset is provided
     early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
     precision: str = "auto"  # auto -> bf16 (if supported) else fp16; T4 uses fp16
-    use_sdpa: bool = True
+    attn_implementation: str = "auto"  # auto: flash_attention_2 → eager
+    gradient_checkpointing: bool = (
+        True  # trade compute for memory; disable on H100 for speed
+    )
 
     # Prompt template for classification
     prompt_template: str = PROMPT_TEMPLATE
@@ -82,7 +85,7 @@ def _load_tokenizer_for_training(model_name: str):
 def _load_causal_lm_for_training(
     model_name: str,
     torch_dtype,
-    attn_implementation: str = "sdpa",
+    attn_implementation: str = "auto",
 ):
     kwargs = dict(
         torch_dtype=torch_dtype,
@@ -90,21 +93,31 @@ def _load_causal_lm_for_training(
         low_cpu_mem_usage=True,
         trust_remote_code=False,
     )
-    # Try the requested attention implementation first; fall back to eager if unsupported.
-    if attn_implementation and attn_implementation != "eager":
+
+    # Priority cascade: flash_attention_2 → eager
+    if attn_implementation == "auto":
+        candidates = ["flash_attention_2"]
+    elif attn_implementation == "eager":
+        candidates = []
+    else:
+        candidates = [attn_implementation]
+
+    for impl in candidates:
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                attn_implementation=attn_implementation,
+                attn_implementation=impl,
                 **kwargs,
             )
-            logger.info(f"✅ Attention implementation: {attn_implementation}")
+            logger.info(f"✅ Attention implementation: {impl}")
             return model
-        except (ValueError, NotImplementedError) as e:
+        except (ValueError, NotImplementedError, ImportError) as e:
             logger.warning(
-                f"attn_implementation='{attn_implementation}' not supported by this model: {e}. "
-                "Falling back to 'eager' attention."
+                f"attn_implementation='{impl}' not available: {e}. Trying next option..."
             )
+
+    # Final fallback: eager (no attn_implementation kwarg)
+    logger.info("✅ Attention implementation: eager (fallback)")
     return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
 
@@ -349,8 +362,12 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
             true_labels, pred_labels, average="weighted", zero_division=0
         ),
         "f1_binary": f1_score(
-            true_labels, pred_labels, average="binary", pos_label=1, zero_division=0
-        ),  # negative/refuted class as positive
+            true_labels,
+            pred_labels,
+            average="binary",
+            pos_label=LABEL_TO_ID[NEGATIVE_LABEL],
+            zero_division=0,
+        ),  # "Sai"/fake = positive class (fraud detection convention: fake=1)
         "precision_macro": precision_score(
             true_labels, pred_labels, average="macro", zero_division=0
         ),
@@ -617,6 +634,78 @@ def _prepare_classification_dataset(
     return tokenized
 
 
+class WeightedLoRATrainer(Trainer):
+    """Trainer with per-sample class-weighted loss for imbalanced datasets.
+
+    Overrides compute_loss to apply a scalar weight per sample based on its
+    true label token.  Weights are computed externally via sklearn-style
+    balanced weighting:  w_i = n_total / (n_classes * n_i)
+    """
+
+    def __init__(
+        self,
+        *args,
+        class_weights: dict = None,
+        label_token_ids: dict = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._class_weights = class_weights  # {label_name: float}
+        self._label_token_ids = label_token_ids  # {label_name: token_id}
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+
+        # Fall back to default loss if weights are not configured.
+        if (
+            self._class_weights is None
+            or self._label_token_ids is None
+            or labels is None
+        ):
+            loss = outputs.loss
+            return (loss, outputs) if return_outputs else loss
+
+        logits = outputs.logits  # [batch, seq_len, vocab_size]
+        batch_size = labels.shape[0]
+
+        # Build token_id → weight look-up table
+        token_weight_map = {
+            token_id: self._class_weights.get(lbl, 1.0)
+            for lbl, token_id in self._label_token_ids.items()
+        }
+
+        # Replicate the CausalLM causal shift used inside HF forward()
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        loss_fct = torch.nn.CrossEntropyLoss(reduction="none", ignore_index=-100)
+        per_token_loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(batch_size, -1)  # [batch, seq_len-1]
+
+        # Average loss over supervised tokens per sample
+        valid_mask = (shift_labels != -100).float()
+        per_sample_loss = (per_token_loss * valid_mask).sum(dim=-1) / (
+            valid_mask.sum(dim=-1).clamp(min=1)
+        )
+
+        # Determine class weight for each sample from its true label token
+        sample_weights = torch.ones(
+            batch_size, device=labels.device, dtype=per_sample_loss.dtype
+        )
+        for i in range(batch_size):
+            valid_tokens = labels[i][labels[i] != -100]
+            if len(valid_tokens) > 0:
+                tok_id = valid_tokens[0].item()
+                if tok_id in token_weight_map:
+                    sample_weights[i] = token_weight_map[tok_id]
+
+        weighted_loss = (per_sample_loss * sample_weights).mean()
+        return (weighted_loss, outputs) if return_outputs else weighted_loss
+
+
 def train_lora_classification(
     claims: List[str],
     evidences: List[str],
@@ -675,10 +764,10 @@ def train_lora_classification(
             torch.backends.cudnn.allow_tf32 = True
             _use_tf32 = True
 
-    attn_impl = "sdpa" if config.use_sdpa else "eager"
+    attn_impl = config.attn_implementation  # auto → flash_attention_2 → sdpa → eager
     logger.info(
-        f"🚀 Speed optimisations: SDPA={config.use_sdpa}, "
-        f"TF32={_use_tf32}, 8-bit AdamW, group_by_length=True"
+        f"🚀 Speed optimisations: attn={attn_impl}, "
+        f"TF32={_use_tf32}, fused AdamW, group_by_length=True"
     )
 
     # Check if resuming from checkpoint
@@ -711,14 +800,18 @@ def train_lora_classification(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
-        base_model.config.use_cache = True
+        # gradient_checkpointing requires use_cache=False (incompatible with KV cache)
+        base_model.config.use_cache = not config.gradient_checkpointing
 
         # Load LoRA adapter from checkpoint
         logger.info("Loading LoRA adapter from checkpoint...")
         model = PeftModel.from_pretrained(
             base_model, checkpoint_path, is_trainable=True
         )
+        # Required for gradient checkpointing + PEFT: frozen base model inputs
+        # won't have requires_grad, so gradients can't flow without this hook.
+        if config.gradient_checkpointing:
+            model.enable_input_require_grads()
         model.print_trainable_parameters()
 
     else:
@@ -744,8 +837,8 @@ def train_lora_classification(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
-        model.config.use_cache = True
+        # gradient_checkpointing requires use_cache=False (incompatible with KV cache)
+        model.config.use_cache = not config.gradient_checkpointing
 
         # Configure LoRA
         target_modules = _resolve_lora_target_modules(model)
@@ -763,6 +856,10 @@ def train_lora_classification(
         )
 
         model = get_peft_model(model, lora_cfg)
+        # Required for gradient checkpointing + PEFT: frozen base model inputs
+        # won't have requires_grad, so gradients can't flow without this hook.
+        if config.gradient_checkpointing:
+            model.enable_input_require_grads()
         model.print_trainable_parameters()
 
     if not (len(claims) == len(evidences) == len(labels)):
@@ -833,32 +930,37 @@ def train_lora_classification(
     )
 
     # ── Training arguments ─────────────────────────────────────────────────
-    # H100: use fused AdamW — faster than 8-bit AdamW on H100 (ample VRAM, no need to save).
-    _optim = "adamw_torch_fused"
+    # 8-bit AdamW: ~4× less optimizer VRAM than fused AdamW; requires bitsandbytes.
+    # Use fused AdamW only on machines with abundant VRAM (e.g., H100 with small seq len).
+    _optim = "adamw_8bit"
     logger.info(f"Optimizer: {_optim}")
+
+    # Eval batch: large eval batch wastes VRAM. Scale conservatively from train batch.
+    # With max_length=2048 + large model, eval_batch=train_batch is already generous.
+    _eval_batch = max(1, config.batch_size)
 
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=32,  # H100: large VRAM → big eval batch
+        per_device_eval_batch_size=_eval_batch,  # dynamic: same as train batch to avoid OOM
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
         lr_scheduler_type="cosine",  # cosine decay → better convergence
         logging_steps=10,
-        save_steps=200,
+        save_steps=100,
         save_total_limit=3,
         fp16=use_fp16,
         bf16=use_bf16,
         tf32=_use_tf32,  # only on Ampere+ (sm_80+)
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
-        warmup_ratio=0.1,
+        warmup_ratio=0.05,  # Shorter warmup → lower LR at early steps → avoids initial loss spike
         weight_decay=0.01,
         optim=_optim,  # fused AdamW: fastest on H100
         group_by_length=True,  # pack similar-length seqs → less padding waste
         logging_nan_inf_filter=False,
         eval_strategy="steps",
-        eval_steps=200,
+        eval_steps=100,
         load_best_model_at_end=True,
         metric_for_best_model="f1_macro",
         greater_is_better=True,
@@ -867,7 +969,7 @@ def train_lora_classification(
         max_grad_norm=1.0,
         dataloader_num_workers=8,  # H100 server: many CPUs → fast prefetch
         dataloader_pin_memory=True,  # faster CPU→GPU transfer
-        gradient_checkpointing=False,  # H100: disabled — saves 30-40% training time
+        gradient_checkpointing=config.gradient_checkpointing,  # True → save activations, save VRAM
         ddp_find_unused_parameters=False,
     )
 
@@ -877,6 +979,40 @@ def train_lora_classification(
 
     # Get label token IDs for logits-based classification
     label_token_ids = _get_label_token_ids(tokenizer)
+
+    # ── Compute class weights for imbalanced dataset ───────────────────────
+    # Balanced weighting: w_i = n_total / (n_classes * n_i)
+    # Minority class (True/Đúng ~35%) gets ~1.45×, majority (False/Sai ~65%) ~0.76×
+    from collections import Counter
+
+    def _norm_label_for_weight(lv):
+        """Mirror normalize_label logic for weight computation."""
+        if isinstance(lv, (int, float)):
+            return POSITIVE_LABEL if int(lv) == 0 else NEGATIVE_LABEL
+        lu = str(lv).upper().strip()
+        if lu in [
+            POSITIVE_LABEL.upper(),
+            "TRUE",
+            "SUPPORTED",
+            "LEGIT",
+            "LEGITIMATE",
+            "ĐÚNG",
+            "DUNG",
+            "0",
+        ]:
+            return POSITIVE_LABEL
+        return NEGATIVE_LABEL
+
+    label_counts = Counter(_norm_label_for_weight(lv) for lv in labels)
+    # DISABLED: the balanced weighting formula (n_total / (n_cls * cnt)) penalised
+    # the majority "Sai" class 0.76× and the minority "Đúng" class 1.44×, causing
+    # the model to always predict "Đúng" (accuracy locked at 35.7% = Đúng base-rate).
+    # With class_weights=None the WeightedLoRATrainer falls back to plain CE loss.
+    class_weights = None
+    logger.info(
+        f"📊 Label distribution: { {k: v for k, v in label_counts.items()} }\n"
+        f"⚖️  Class weights: disabled (plain CE loss to avoid minority-class bias)"
+    )
 
     # Create compute_metrics function with tokenizer and label_token_ids closure
     def compute_metrics_fn(eval_pred):
@@ -908,12 +1044,14 @@ def train_lora_classification(
         # Extract token IDs for labels in LABEL_LIST order
         label_token_id_list = [label_token_ids[label] for label in LABEL_LIST]
 
+        missing = 0
         for i in range(batch_size):
             # Find label position
             label_positions = (labels[i] != -100).nonzero(as_tuple=True)[0]
 
             if len(label_positions) == 0:
                 # No label found, use zeros (will be handled in compute_metrics)
+                missing += 1
                 continue
 
             label_pos = label_positions[0].item()
@@ -921,6 +1059,7 @@ def train_lora_classification(
 
             if pred_pos < 0:
                 # Can't predict position 0
+                missing += 1
                 continue
 
             # Extract logits at prediction position for label tokens only
@@ -928,11 +1067,17 @@ def train_lora_classification(
             for j, token_id in enumerate(label_token_id_list):
                 label_logits_batch[i, j] = logits[i, pred_pos, token_id]
 
+        if missing > 0:
+            logger.warning(
+                f"preprocess_logits_for_metrics: {missing}/{batch_size} samples had no valid "
+                "label position — their logits default to zeros. Check tokenization/max_length."
+            )
+
         # Return reduced logits [batch, 2] instead of [batch, seq_len, vocab_size]
         # This is ~650x smaller for binary classification!
         return label_logits_batch
 
-    trainer = Trainer(
+    trainer = WeightedLoRATrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -940,6 +1085,8 @@ def train_lora_classification(
         data_collator=data_collator,
         compute_metrics=compute_metrics_fn,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,  # KEY FIX!
+        class_weights=class_weights,  # ← imbalance compensation
+        label_token_ids=label_token_ids,  # ← token→weight lookup
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=config.early_stopping_patience
@@ -973,9 +1120,9 @@ def train_lora_classification(
     best_model_dir = config.output_dir
     trainer.save_model(best_model_dir)
     tokenizer.save_pretrained(best_model_dir)
-    logger.info(
-        f"✅ Best model (F1={final_metrics.get('eval_f1_macro', 0):.4f}) saved to {best_model_dir}"
-    )
+    # trainer.state.best_metric holds the actual best eval_f1_macro seen during training
+    best_f1 = trainer.state.best_metric or 0.0
+    logger.info(f"✅ Best model (F1={best_f1:.4f}) saved to {best_model_dir}")
 
     logger.info(
         f"ℹ️  Intermediate checkpoints (e.g., checkpoint-XXX) are saved in {config.output_dir}"

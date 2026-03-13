@@ -1,0 +1,13 @@
+Loading tokenizer...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Encountered exception while importing einops: No module named 'einops'
+You are using a model of type `mpt` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Loaded.
+'Đúng': [10058]
+' Sai': [5500]
+' Đúng': [7833]
+'Sai': [15388]
+'Kết luận: ': [3724, 6604, 178]
+'Kết luận: Đúng': [3724, 6604, 7833]
+'Kết luận: Sai': [3724, 6604, 5500]
+'Kết luận:  Đúng': [3724, 6604, 178, 7833]
