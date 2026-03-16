@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -475,10 +476,12 @@ async def main(args):
                         content_chunks.append(current)
 
             # Bước 2: Cập nhật lại trường content: title + " " + content_đoạn
-            for chunk in content_chunks:
+            for chunk_idx, chunk in enumerate(content_chunks):
                 new_item = item.copy()
                 new_item["title"] = title
                 new_item["content"] = f"{title} {chunk}".strip()
+                chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
+                new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
                 processed_batch.append(new_item)
 
         # Tạo embedding cho cả batch mới xử lý xong
