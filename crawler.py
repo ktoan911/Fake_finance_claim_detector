@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -301,7 +301,7 @@ async def fetch_article_content(session, item, semaphore):
             item["published_at"] = None
 
 
-async def main():
+async def main(args):
     results = []
     concurrency_limit = 5
     semaphore = asyncio.Semaphore(concurrency_limit)
@@ -375,17 +375,40 @@ async def main():
             ]
             await asyncio.gather(*fetch_tasks)
 
-    # Lọc bỏ các bài viết không lấy được nội dung (content rỗng hoặc quá ngắn)
-    valid_results = [
-        item for item in results if item.get("content") and len(item["content"]) > 10
-    ]
+    # Lọc bài viết
+    valid_results = []
+    cutoff_time = None
+    if args.timestamp:
+        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=args.timestamp)
+
+    filtered_by_time = 0
+    for item in results:
+        if not item.get("content") or len(item["content"]) <= 10:
+            continue
+
+        if cutoff_time and item.get("published_at"):
+            try:
+                pub_dt = dtparser.parse(item["published_at"])
+                if pub_dt.tzinfo is None:
+                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                if pub_dt < cutoff_time:
+                    filtered_by_time += 1
+                    continue
+            except Exception:
+                pass
+
+        valid_results.append(item)
 
     logging.info(
-        f"Đã lọc bỏ {len(results) - len(valid_results)} bài viết không có nội dung."
+        f"Đã lọc bỏ {len(results) - len(valid_results) - filtered_by_time} bài viết không có nội dung hoặc quá ngắn."
     )
+    if args.timestamp:
+        logging.info(
+            f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()}."
+        )
 
     # --- Xử lý dữ liệu định kỳ theo batch ---
-    batch_size = 50
+    batch_size = args.batch_size
     processed_count = 0
     kb = OpenSearchKB(
         index_name=os.getenv("OP_KB_NAME"),
@@ -393,10 +416,10 @@ async def main():
     )
 
     # Load model 1 lần để dùng chung cho các batch
-    logging.info("Đang khởi tạo model embedding...")
+    logging.info("Đang khởi tạo model embedding trên CPU...")
     try:
         model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
-        encoder = SentenceTransformer(model_name)
+        encoder = SentenceTransformer(model_name, device="cpu")
     except Exception as e:
         logging.error(f"Không thể tải model embedding: {e}")
         encoder = None
@@ -481,8 +504,24 @@ async def main():
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
+
+    parser = argparse.ArgumentParser(description="Crawler for crypto news")
+    parser.add_argument(
+        "--timestamp",
+        type=int,
+        default=None,
+        help="Crawl articles from the last X seconds (e.g., 86400 for 1 day)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Batch size for processing and embedding generation",
+    )
+    args = parser.parse_args()
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(main())
+    asyncio.run(main(args))
