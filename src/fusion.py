@@ -32,8 +32,8 @@ if TORCH_AVAILABLE:
 
         final_probs: torch.Tensor
         fused_logits: torch.Tensor
-        lm_weight: float
-        retrieval_weight: float
+        lm_weight: torch.Tensor
+        retrieval_weight: torch.Tensor
 
     class RetrievalMLP(nn.Module):
         """
@@ -183,8 +183,8 @@ if TORCH_AVAILABLE:
             return FusionOutput(
                 final_probs=final_probs,
                 fused_logits=fused_logits,
-                lm_weight=beta.item(),
-                retrieval_weight=(1 - beta).item(),
+                lm_weight=beta.detach(),
+                retrieval_weight=(1 - beta).detach(),
             )
 
         def compute_contrastive_loss(

@@ -25,7 +25,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.csv_loader import CSVLabeledLoader
 from src.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
-from src.fusion_trainer import _build_retrieval_features  # Re-use helper
+from src.fusion_trainer import (  # Re-use helper
+    _build_retrieval_features,
+    _normalize_label_to_id,
+)
 from src.llm_scorer import LLMScorer
 from src.retrieval import KnowledgeAugmentedRetriever
 from src.utils import normalize_text
@@ -40,28 +43,39 @@ def calculate_metrics(y_true, y_pred, mode_name):
     prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
     rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
     f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
-    f1_binary = f1_score(
-        y_true, y_pred, pos_label=1, zero_division=0
-    )  # negative/refuted class as positive
+    f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    per_class_f1 = f1_score(
+        y_true,
+        y_pred,
+        average=None,
+        zero_division=0,
+        labels=list(range(len(LABEL_LIST))),
+    )
 
     logger.info(f"--- Results for {mode_name} ---")
     logger.info(f"Accuracy:  {acc:.4f}")
     logger.info(f"Precision: {prec:.4f}")
     logger.info(f"Recall:    {rec:.4f}")
     logger.info(f"F1 Macro:  {f1_macro:.4f}")
-    logger.info(f"F1 Binary (negative class): {f1_binary:.4f}")
+    logger.info(f"F1 Weighted: {f1_weighted:.4f}")
+    for idx, label_name in enumerate(LABEL_LIST):
+        logger.info(f"F1 {label_name}: {per_class_f1[idx]:.4f}")
 
-    return {
+    metrics = {
         "Mode": mode_name,
         "Accuracy": acc,
         "Precision": prec,
         "Recall": rec,
         "F1_Macro": f1_macro,
-        "F1_Binary": f1_binary,
+        "F1_Weighted": f1_weighted,
     }
+    for idx, label_name in enumerate(LABEL_LIST):
+        metrics[f"F1_{label_name}"] = per_class_f1[idx]
+
+    return metrics
 
 
-def load_fusion_model(model_path, device, num_classes=2):
+def load_fusion_model(model_path, device, num_classes=len(LABEL_LIST)):
     """Load trained fusion model components."""
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -136,7 +150,7 @@ def main():
 
     texts = df["text"].tolist()
     gold_evidences = df["evidence"].tolist()
-    labels = df["label"].tolist()  # 0=positive label, 1=negative label
+    labels = [_normalize_label_to_id(v) for v in df["label"].tolist()]
 
     # Build Knowledge Base for Retrieval
     # Deduplicate documents from evidence column using normalization (match train_fusion.py)
@@ -169,7 +183,7 @@ def main():
     )
     top_k = fusion_config.get("top_k", 10)
     retriever_model = args.retriever_model or fusion_config.get(
-        "retriever_model", "BAAI/bge-small-en-v1.5"
+        "retriever_model", "bge-vi-base"
     )
 
     # 2. Initialize Components
@@ -298,14 +312,28 @@ def main():
     )
 
     # Summary Table
-    print("\n" + "=" * 60)
-    print(f"{'Mode':<20} | {'Acc':<8} | {'Prec':<8} | {'Rec':<8} | {'F1':<8}")
-    print("-" * 60)
+    print("\n" + "=" * 110)
+    headers = [f"{'Mode':<18}"] + [
+        f"{h:<8}"
+        for h in ["Acc", "Prec", "Rec", "F1_Mac", "F1_W"]
+        + [f"F1_{l}" for l in LABEL_LIST]
+    ]
+    print(" | ".join(headers))
+    print("-" * 110)
     for res in results_summary:
-        print(
-            f"{res['Mode']:<20} | {res['Accuracy']:.4f}   | {res['Precision']:.4f}   | {res['Recall']:.4f}   | {res['F1_Macro']:.4f}"
+        row = (
+            [f"{res['Mode']:<18}"]
+            + [
+                f"{res['Accuracy']:<8.4f}",
+                f"{res['Precision']:<8.4f}",
+                f"{res['Recall']:<8.4f}",
+                f"{res['F1_Macro']:<8.4f}",
+                f"{res['F1_Weighted']:<8.4f}",
+            ]
+            + [f"{res[f'F1_{l}']:<8.4f}" for l in LABEL_LIST]
         )
-    print("=" * 60 + "\n")
+        print(" | ".join(row))
+    print("=" * 110 + "\n")
 
     logger.info("Done.")
 

@@ -12,7 +12,7 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-from .config import LABEL_LIST, PROMPT_TEMPLATE
+from .config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
 from .fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 from .llm_scorer import LLMScorer
 from .retrieval import KnowledgeAugmentedRetriever
@@ -39,7 +39,7 @@ class FusionTrainingConfig:
         "retrieved"  # "gold" or "retrieved" - per paper, should be "retrieved"
     )
     label_list: List[str] = field(default_factory=lambda: LABEL_LIST)
-    retriever_model: str = "BAAI/bge-small-en-v1.5"
+    retriever_model: str = "bge-vi-base"
     use_class_weights: bool = (
         True  # Address class imbalance with inverse-frequency weighting
     )
@@ -63,6 +63,33 @@ def _build_retrieval_features(
 
     # Return list of evidence texts (for smart truncation in LLMScorer)
     return np.array(features, dtype=np.float32), evidence_texts
+
+
+def _normalize_label_to_id(label_value) -> int:
+    if isinstance(label_value, (int, float)):
+        idx = int(label_value)
+        if idx in (0, 1, 2):
+            return idx
+        raise ValueError(f"Unknown integer label: {label_value}. Expected 0, 1, or 2.")
+
+    label_upper = str(label_value).upper().strip()
+    if label_upper in ("TRUE", "ĐÚNG", "DUNG", "SUPPORTED", "LEGIT", "0"):
+        return LABEL_TO_ID["Đúng"]
+    if label_upper in ("FALSE", "SAI", "REFUTED", "SCAM", "FAKE", "1"):
+        return LABEL_TO_ID["Sai"]
+    if label_upper in (
+        "NEI",
+        "THIEU",
+        "NOT ENOUGH INFO",
+        "NOT ENOUGH INFORMATION",
+        "INSUFFICIENT",
+        "2",
+    ):
+        return LABEL_TO_ID["Thiếu"]
+    raise ValueError(
+        f"Unknown label string '{label_value}'. "
+        "Expected one of: true, false, nei (or integer 0/1/2)."
+    )
 
 
 def train_fusion_from_dataframe(
@@ -97,6 +124,7 @@ def train_fusion_from_dataframe(
 
     logger.info(f"Training fusion on device: {config.device}")
     logger.info(f"Evidence mode: {config.evidence_mode}")
+    logger.info(f"Retriever model: {config.retriever_model}")
 
     if labeled_df is None or labeled_df.empty:
         raise ValueError("Labeled DataFrame is empty.")
@@ -149,9 +177,9 @@ def train_fusion_from_dataframe(
     # Prepare data
     texts = labeled_df["text"].tolist()
     gold_evidences = labeled_df["evidence"].tolist()
-    # CSVLabeledLoader already normalized labels (true→0, false→1)
-    # Do NOT call _normalize_label again or labels will be flipped!
-    labels = labeled_df["label"].tolist()
+    # Normalize labels: raw string (true/false/nei) or integer (0/1/2) → int ID
+    # ID convention: 0=Đúng (true), 1=Sai (false), 2=NEI (not-enough-info)
+    labels = [_normalize_label_to_id(v) for v in labeled_df["label"].tolist()]
 
     logger.info(f"Training samples: {len(texts)}")
 

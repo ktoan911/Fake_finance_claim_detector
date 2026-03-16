@@ -1,27 +1,19 @@
-"""
-Shared configuration for LoRA training and Fusion training.
-Ensures consistency in prompts and labels across the pipeline.
-"""
-
-# Label mapping - Binary classification.
-# Keep ID convention stable across pipeline:
-#   - ID 0: supported/legitimate
-#   - ID 1: refuted/fake
-LABEL_LIST = ["Đúng", "Sai"]
-LABEL_TO_ID = {"Đúng": 0, "Sai": 1}
-ID_TO_LABEL = {0: "Đúng", 1: "Sai"}
+LABEL_LIST = ["A", "B", "C"]
+LABEL_TO_ID = {"A": 0, "B": 1, "C": 2}
+ID_TO_LABEL = {0: "A", 1: "B", 2: "C"}
 
 # Prompt template used for both LoRA fine-tuning and Fusion scoring
 # MUST include {claim} and {evidence} placeholders
-# Output tokens follow Vietnamese labels for PhoGPT and Vietnamese prompts.
-PROMPT_TEMPLATE = """Bạn là một chuyên gia kiểm chứng thông tin cho các tuyên bố trong lĩnh vực tài chính.
+# Output: A (supported), B (refuted), C (not enough info)
+PROMPT_TEMPLATE = """You are an expert fact-checker verifying Vietnamese claims based on the provided evidence.
 
-Hãy phân loại tuyên bố dựa trên bằng chứng:
-- Đúng: Bằng chứng xác nhận tuyên bố
-- Sai: Bằng chứng mâu thuẫn với tuyên bố hoặc không đủ bằng chứng
+Classify the claim based on ALL the evidence and answer with ONLY a single letter:
+- A: The evidence supports the claim
+- B: The evidence contradicts the claim
+- C: There is not enough evidence to support or refute the claim
 
-Tuyên bố: {claim}
+Claim: {claim}
 
-Bằng chứng: {evidence}
+Evidence: {evidence}
 
-Kết luận: """
+Conclusion: """

@@ -412,7 +412,7 @@ class KnowledgeAugmentedRetriever:
 
     def __init__(
         self,
-        embedding_model: str = "BAAI/bge-small-en-v1.5",
+        embedding_model: str = "AITeamVN/Vietnamese_Embedding",
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
         gamma: float = 0.5,
@@ -451,7 +451,11 @@ class KnowledgeAugmentedRetriever:
             self.embedding_dim = self.encoder.get_sentence_embedding_dimension()
         else:
             self.encoder = None
-            self.embedding_dim = 384  # Default
+            import os
+
+            self.embedding_dim = int(
+                os.getenv("RETRIEVER_EMBEDDING_DIM", "1024")
+            )  # Use from env var
 
         # Cross-Encoder removed - using RRF-based hybrid retrieval instead
 

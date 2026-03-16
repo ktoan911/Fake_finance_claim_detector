@@ -170,7 +170,7 @@ def main():
     parser.add_argument(
         "--model_name",
         type=str,
-        default="BAAI/bge-small-en-v1.5",
+        default="bge-vi-base",
         help="Base SentenceTransformer model",
     )
     parser.add_argument(

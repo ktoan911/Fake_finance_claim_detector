@@ -1,3 +1,5 @@
+# Script to train LoRA for 3-class claim classification (A=Đúng/B=Sai/C=Thiếu)
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -23,49 +25,49 @@ try:
 
 except ImportError:
     TORCH_AVAILABLE = False
-    np = None  # type: ignore
-    torch = None  # type: ignore
-    Dataset = None  # type: ignore
-    LoraConfig = None  # type: ignore
-    TaskType = None  # type: ignore
-    get_peft_model = None  # type: ignore
-    accuracy_score = None  # type: ignore
-    f1_score = None  # type: ignore
-    precision_score = None  # type: ignore
-    recall_score = None  # type: ignore
-    AutoModelForCausalLM = None  # type: ignore
-    AutoTokenizer = None  # type: ignore
-    DataCollatorForSeq2Seq = None  # type: ignore
-    EarlyStoppingCallback = None  # type: ignore
-    Trainer = None  # type: ignore
-    TrainingArguments = None  # type: ignore
-    TrainerCallback = object  # type: ignore[misc,assignment]
+    np = None
+    torch = None
+    Dataset = None
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
+    accuracy_score = None
+    f1_score = None
+    precision_score = None
+    recall_score = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    DataCollatorForSeq2Seq = None
+    EarlyStoppingCallback = None
+    Trainer = None
+    TrainingArguments = None
+    TrainerCallback = object
 
 from .config import LABEL_LIST, LABEL_TO_ID, PROMPT_TEMPLATE
 
 POSITIVE_LABEL = LABEL_LIST[0]
 NEGATIVE_LABEL = LABEL_LIST[1]
+NEI_LABEL = LABEL_LIST[2]
 
 
 @dataclass
 class LoRATrainingConfig:
-    """Configuration for LoRA supervised fine-tuning."""
-
-    model_name: str = "meta-llama/Llama-3.1-8B"
+    # Default to a Vietnamese base model to match Vietnamese labels/prompts.
+    model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
     output_dir: str = "artifacts/lora_llm"
     batch_size: int = 1
     epochs: int = 3
-    learning_rate: float = 2e-4
+    learning_rate: float = 5e-5
     max_length: int = 256
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.1
-    eval_ratio: float = 0.1  # Used only when no explicit eval dataset is provided
-    early_stopping_patience: int = 3  # Stop if F1 doesn't improve for 3 evals
-    precision: str = "auto"  # auto -> bf16 (if supported) else fp16; T4 uses fp16
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    eval_ratio: float = 0.1
+    early_stopping_patience: int = 3
+    precision: str = "auto"
+    use_flash_attention: bool = True
     use_sdpa: bool = True
 
-    # Prompt template for classification
     prompt_template: str = PROMPT_TEMPLATE
 
 
@@ -75,14 +77,13 @@ def _load_tokenizer_for_training(model_name: str):
             model_name, trust_remote_code=False, use_fast=True
         )
     except Exception:
-        # Last-resort fallback: let transformers pick the best available tokenizer
         return AutoTokenizer.from_pretrained(model_name, trust_remote_code=False)
 
 
 def _load_causal_lm_for_training(
     model_name: str,
     torch_dtype,
-    attn_implementation: str = "sdpa",
+    attn_implementation: str = "flash_attention_2",
 ):
     kwargs = dict(
         torch_dtype=torch_dtype,
@@ -90,7 +91,6 @@ def _load_causal_lm_for_training(
         low_cpu_mem_usage=True,
         trust_remote_code=False,
     )
-    # Try the requested attention implementation first; fall back to eager if unsupported.
     if attn_implementation and attn_implementation != "eager":
         try:
             model = AutoModelForCausalLM.from_pretrained(
@@ -100,21 +100,34 @@ def _load_causal_lm_for_training(
             )
             logger.info(f"✅ Attention implementation: {attn_implementation}")
             return model
-        except (ValueError, NotImplementedError) as e:
-            logger.warning(
-                f"attn_implementation='{attn_implementation}' not supported by this model: {e}. "
-                "Falling back to 'eager' attention."
-            )
+        except Exception as e:
+            if attn_implementation == "flash_attention_2":
+                logger.warning(
+                    f"attn_implementation='flash_attention_2' failed: {e}. "
+                    "Falling back to 'sdpa' attention."
+                )
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_name,
+                        attn_implementation="sdpa",
+                        **kwargs,
+                    )
+                    logger.info("✅ Attention implementation: sdpa")
+                    return model
+                except Exception as e2:
+                    logger.warning(
+                        f"attn_implementation='sdpa' not supported: {e2}. "
+                        "Falling back to 'eager' attention."
+                    )
+            else:
+                logger.warning(
+                    f"attn_implementation='{attn_implementation}' not supported by this model: {e}. "
+                    "Falling back to 'eager' attention."
+                )
     return AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
 
 
 def _resolve_training_precision(precision: str):
-    """
-    Resolve compute precision for training/evaluation.
-
-    Returns:
-        tuple(torch_dtype, use_bf16, use_fp16, resolved_name)
-    """
     requested = (precision or "auto").lower().strip()
     valid_precisions = {"auto", "bf16", "fp16", "fp32"}
     if requested not in valid_precisions:
@@ -149,42 +162,29 @@ def _resolve_training_precision(precision: str):
 
 
 def _is_linear_like_module(module) -> bool:
-    """Return True for linear-like modules supported by common PEFT backends."""
     if isinstance(module, torch.nn.Linear):
         return True
     return "linear" in module.__class__.__name__.lower()
 
 
 def _resolve_lora_target_modules(model) -> List[str]:
-    """
-    Resolve LoRA target modules from the loaded model architecture.
-
-    This avoids hardcoding Llama-only names (q_proj/k_proj/v_proj/o_proj),
-    which breaks on models like GPT/PhoGPT/GPT-NeoX variants.
-    """
     module_suffixes = {name.split(".")[-1] for name, _ in model.named_modules() if name}
 
-    # Preferred, architecture-aware suffixes (checked in this order).
     preferred_suffixes = [
-        # Llama / Mistral / Qwen
         "q_proj",
         "k_proj",
         "v_proj",
         "o_proj",
-        # MLP projections (often useful in LoRA SFT)
         "gate_proj",
         "up_proj",
         "down_proj",
-        # GPT-2 / Falcon style
         "c_attn",
         "c_proj",
         "c_fc",
-        # GPT-NeoX / Phi style
         "query_key_value",
         "dense",
         "dense_h_to_4h",
         "dense_4h_to_h",
-        # Other common naming patterns
         "Wqkv",
         "out_proj",
         "qkv_proj",
@@ -203,7 +203,6 @@ def _resolve_lora_target_modules(model) -> List[str]:
     if detected:
         return detected
 
-    # Generic fallback: use all linear-like layer suffixes except known output heads.
     excluded_suffixes = {"lm_head", "embed_out", "classifier", "score", "qa_outputs"}
     excluded_name_fragments = ("embed_tokens", "word_embeddings", "wte")
 
@@ -232,25 +231,102 @@ def _resolve_lora_target_modules(model) -> List[str]:
 
 
 def _build_prompt(claim: str, evidence: str, template: str) -> str:
-    """Build prompt from claim and evidence."""
     return template.format(claim=claim, evidence=evidence)
 
 
-def _get_label_token_ids(tokenizer, labels: list = None):
-    """
-    Get token ID for each label using special tokens.
-    Used for logits-based classification (pLM from paper).
+def _normalize_label(label_value) -> str:
+    if isinstance(label_value, (int, float)):
+        idx = int(label_value)
+        if idx == 0:
+            return POSITIVE_LABEL
+        if idx == 1:
+            return NEGATIVE_LABEL
+        if idx == 2:
+            return NEI_LABEL
+        logger.warning(
+            f"Unknown integer label '{label_value}'. Defaulting to {NEI_LABEL}."
+        )
+        return NEI_LABEL
 
-    Special tokens ensure each label is exactly 1 token, making pLM extraction reliable.
-    """
+    label_upper = str(label_value).upper().strip()
+    # A = Đúng (supported/true)
+    if label_upper in [
+        POSITIVE_LABEL.upper().strip(),
+        "TRUE",
+        "SUPPORTED",
+        "LEGIT",
+        "LEGITIMATE",
+        "ĐÚNG",
+        "DUNG",
+        "0",
+    ]:
+        return POSITIVE_LABEL
+    # B = Sai (refuted/false)
+    if label_upper in [
+        NEGATIVE_LABEL.upper().strip(),
+        "FALSE",
+        "REFUTED",
+        "SCAM",
+        "SAI",
+        "1",
+    ]:
+        return NEGATIVE_LABEL
+    # C = Thiếu (not enough info)
+    if label_upper in [
+        NEI_LABEL.upper().strip(),
+        "THIEU",
+        "THIẾU",
+        "NEI",
+        "NOT ENOUGH INFO",
+        "NOT ENOUGH INFORMATION",
+        "INSUFFICIENT",
+        "2",
+    ]:
+        return NEI_LABEL
+
+    logger.warning(
+        f"Unknown label '{label_value}' encountered during dataset prep. Defaulting to {NEI_LABEL}."
+    )
+    return NEI_LABEL
+
+
+def _log_label_distribution(labels: List[str], title: str) -> None:
+    if not labels:
+        logger.warning(f"{title}: empty label list.")
+        return
+
+    normalized = [_normalize_label(label) for label in labels]
+    counts = Counter(normalized)
+    total = sum(counts.values())
+    parts = []
+    for label in LABEL_LIST:
+        count = counts.get(label, 0)
+        ratio = (count / total) * 100 if total else 0.0
+        parts.append(f"{label}={count} ({ratio:.1f}%)")
+    logger.info(f"{title} label distribution: " + ", ".join(parts))
+
+    missing = [label for label in LABEL_LIST if counts.get(label, 0) == 0]
+    if missing:
+        logger.warning(f"{title} missing classes: {', '.join(missing)}")
+
+
+def _warn_if_model_label_mismatch(model_name: str) -> None:
+    combined = "".join(LABEL_LIST) + PROMPT_TEMPLATE
+    has_non_ascii = any(ord(ch) > 127 for ch in combined)
+    model_lower = (model_name or "").lower()
+    if has_non_ascii and "phogpt" not in model_lower:
+        logger.warning(
+            "Using Vietnamese labels/prompts with a non-Vietnamese base model. "
+            "Consider a Vietnamese base (e.g., PhoGPT) or switch labels/prompts to English."
+        )
+
+
+def _get_label_token_ids(tokenizer, labels: list = None):
     if labels is None:
         labels = LABEL_LIST
 
-    # Labels are provided directly as output tokens (e.g., Đúng/Sai).
-    # For logits-based classification here, each label MUST be exactly one token.
     label_token_ids = {}
     for label in labels:
-        # Use label directly as it's already a word/token candidate
         tokens = tokenizer(label, add_special_tokens=False)["input_ids"]
 
         if len(tokens) != 1:
@@ -267,59 +343,35 @@ def _get_label_token_ids(tokenizer, labels: list = None):
 
 
 def compute_metrics(eval_pred, tokenizer, label_token_ids):
-    """
-    Compute F1, Precision, Recall, Accuracy for binary classification evaluation.
-
-    PAPER-ACCURATE: Extracts pLM(y|q) from logits, not from text generation.
-
-    Args:
-        eval_pred: Tuple of (predictions, labels)
-            - predictions: preprocessed logits with shape [batch, 2] (label logits only)
-            - labels: label IDs with shape [batch, seq_len], -100 for masked positions
-        tokenizer: Tokenizer to decode labels
-        label_token_ids: Dict mapping label names to their token IDs
-
-    Returns:
-        Dict of metrics (F1, precision, recall, accuracy)
-    """
     logits, labels = eval_pred
-
-    # logits shape: [batch, 2] - already preprocessed to label logits only!
-    # labels shape: [batch, seq_len]
 
     pred_labels = []
     true_labels = []
 
     for batch_idx in range(len(logits)):
-        # Logits are already extracted for label tokens: [2] = [positive, negative]
-        label_logits_array = logits[batch_idx]  # Shape: [2]
+        label_logits_array = logits[batch_idx]
 
-        # Apply softmax to get probabilities (pLM)
-        # Use torch.softmax for numerical stability (avoids overflow with large logits)
         probs = torch.softmax(
             torch.tensor(label_logits_array, dtype=torch.float32), dim=0
         ).numpy()
 
-        # Choose label with highest probability
         pred_label_idx = np.argmax(probs)
         pred_label = LABEL_LIST[pred_label_idx]
         pred_labels.append(LABEL_TO_ID[pred_label])
 
-        # Extract true label from labels
         batch_labels = labels[batch_idx]
         label_positions = np.where(batch_labels != -100)[0]
 
         if len(label_positions) == 0:
             logger.warning(
-                f"Sample {batch_idx}: No valid label position found, using {NEGATIVE_LABEL} as default"
+                f"Sample {batch_idx}: No valid label position found, using {NEI_LABEL} as default"
             )
-            true_labels.append(LABEL_TO_ID[NEGATIVE_LABEL])
+            true_labels.append(LABEL_TO_ID[NEI_LABEL])
             continue
         valid_label_ids = batch_labels[label_positions]
-        true_label_token = valid_label_ids[0]  # First token of label
+        true_label_token = valid_label_ids[0]
 
-        # Map back to label name
-        true_label = NEGATIVE_LABEL  # default
+        true_label = NEI_LABEL
         for label_name, token_id in label_token_ids.items():
             if token_id == true_label_token:
                 true_label = label_name
@@ -340,7 +392,7 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
     pred_labels = np.array(pred_labels)
     true_labels = np.array(true_labels)
 
-    # Compute metrics (binary classification)
+    num_classes = len(LABEL_LIST)
     metrics = {
         "f1_macro": f1_score(
             true_labels, pred_labels, average="macro", zero_division=0
@@ -348,9 +400,6 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         "f1_weighted": f1_score(
             true_labels, pred_labels, average="weighted", zero_division=0
         ),
-        "f1_binary": f1_score(
-            true_labels, pred_labels, average="binary", pos_label=1, zero_division=0
-        ),  # negative/refuted class as positive
         "precision_macro": precision_score(
             true_labels, pred_labels, average="macro", zero_division=0
         ),
@@ -359,6 +408,17 @@ def compute_metrics(eval_pred, tokenizer, label_token_ids):
         ),
         "accuracy": accuracy_score(true_labels, pred_labels),
     }
+    per_class_f1 = f1_score(
+        true_labels,
+        pred_labels,
+        average=None,
+        zero_division=0,
+        labels=list(range(num_classes)),
+    )
+    for idx, label_name in enumerate(LABEL_LIST):
+        metrics[f"f1_{label_name.lower()}"] = (
+            float(per_class_f1[idx]) if idx < len(per_class_f1) else 0.0
+        )
 
     del pred_labels, true_labels, logits, labels
 
@@ -373,60 +433,10 @@ def _prepare_classification_dataset(
     max_length: int,
     prompt_template: str,
 ):
-    """
-    Prepare dataset for supervised classification fine-tuning.
-    Format: prompt + label (causal LM style)
-    Implements smart truncation: preserves claim/template, truncates evidence from bottom.
-    """
     targets = []
 
-    def normalize_label(label_value) -> str:
-        """Convert CSV_Loader integer ID to string label for LLM training.
-
-        CSV_Loader Convention:
-          - ID 0 = supported/legitimate
-          - ID 1 = refuted/fake
-
-        This function converts those IDs to strings for LLM training targets.
-        """
-        if isinstance(label_value, (int, float)):
-            idx = int(label_value)
-            # CSV_Loader outputs: 0=positive label, 1=negative label
-            if idx == 0:
-                return POSITIVE_LABEL
-            else:
-                return NEGATIVE_LABEL
-
-        # Handle string labels from multiple datasets/languages.
-        label_upper = str(label_value).upper().strip()
-        if label_upper in [
-            POSITIVE_LABEL.upper(),
-            "TRUE",
-            "SUPPORTED",
-            "LEGIT",
-            "LEGITIMATE",
-            "ĐÚNG",
-            "DUNG",
-            "0",
-        ]:
-            return POSITIVE_LABEL
-        if label_upper in [
-            NEGATIVE_LABEL.upper(),
-            "FALSE",
-            "REFUTED",
-            "SCAM",
-            "SAI",
-            "1",
-        ]:
-            return NEGATIVE_LABEL
-
-        logger.warning(
-            f"Unknown label '{label_value}' encountered during dataset prep. Defaulting to {NEGATIVE_LABEL}."
-        )
-        return NEGATIVE_LABEL
-
     for label in labels:
-        target = normalize_label(label)
+        target = _normalize_label(label)
         targets.append(target)
 
     if "{evidence}" not in prompt_template:
@@ -441,7 +451,6 @@ def _prepare_classification_dataset(
         "{claim}", maxsplit=1
     )
 
-    # Tokenize static template chunks once for efficiency and consistent budgeting.
     template_prefix_ids = tokenizer(
         template_prefix_raw, add_special_tokens=True, truncation=False
     )["input_ids"]
@@ -454,17 +463,7 @@ def _prepare_classification_dataset(
 
     truncation_stats = {"claim_truncated": 0, "evidence_truncated": 0}
 
-    # Tokenize
     def tokenize_function(examples):
-        """
-        Build input_ids with smart truncation and numbered evidence.
-
-        Priority order for fitting sequence into max_length:
-        1) Always keep label token supervision.
-        2) Keep prompt template.
-        3) Truncate evidence first.
-        4) Truncate claim only when claim+template already exceeds budget.
-        """
         model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
 
         for claim, evidence_raw, target in zip(
@@ -474,7 +473,6 @@ def _prepare_classification_dataset(
                 str(claim), add_special_tokens=False, truncation=False
             )["input_ids"]
 
-            # Tokenize target label token (must be exactly one token).
             target_token_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
             if len(target_token_ids) != 1:
                 raise ValueError(
@@ -485,7 +483,6 @@ def _prepare_classification_dataset(
             if tokenizer.eos_token_id is not None:
                 target_ids = target_ids + [tokenizer.eos_token_id]
 
-            # Reserve space for template ending + target first to guarantee supervision.
             fixed_without_claim_and_evidence = (
                 len(template_prefix_ids)
                 + len(template_claim_suffix_ids)
@@ -500,20 +497,17 @@ def _prepare_classification_dataset(
                     f"Increase max_length (current={max_length})."
                 )
 
-            # If claim alone overflows, truncate claim tail but keep template + label.
             if len(claim_ids) > available_for_claim:
                 claim_ids = claim_ids[:available_for_claim]
                 truncation_stats["claim_truncated"] += 1
 
             start_ids = template_prefix_ids + claim_ids + template_claim_suffix_ids
 
-            # Remaining budget goes to evidence.
             fixed_len = len(start_ids) + len(template_end_ids) + len(target_ids)
             available_for_evidence = max_length - fixed_len
 
             evidence_ids = []
             if available_for_evidence > 0:
-                # Support both newline separation (old) and ||| separation (CSV loader)
                 evidence_str = str(evidence_raw)
                 if "|||" in evidence_str:
                     evidence_items = evidence_str.split("|||")
@@ -525,7 +519,6 @@ def _prepare_classification_dataset(
                     if not item.strip():
                         continue
 
-                    # Format: "1. Evidence text\n"
                     formatted_item = f"{i + 1}. {item.strip()}\n"
                     item_ids = tokenizer(formatted_item, add_special_tokens=False)[
                         "input_ids"
@@ -537,16 +530,13 @@ def _prepare_classification_dataset(
                     ):
                         current_evidence_ids.extend(item_ids)
                     else:
-                        # Keep complete evidence items only (no mid-item truncation).
                         truncation_stats["evidence_truncated"] += 1
                         break
 
                 evidence_ids = current_evidence_ids
 
-            # Construct full input
             full_input_ids = start_ids + evidence_ids + template_end_ids + target_ids
 
-            # Create labels: mask prompt, supervise label token only.
             prompt_len = len(start_ids) + len(evidence_ids) + len(template_end_ids)
             label_token_count = len(target_token_ids)
             labels = (
@@ -555,14 +545,12 @@ def _prepare_classification_dataset(
                 + [-100] * (len(target_ids) - label_token_count)
             )
 
-            # Safety guard: supervision token must remain after preprocessing.
             if not any(token_id != -100 for token_id in labels):
                 raise ValueError(
                     "A sample ended up without supervised label tokens. "
                     "Increase max_length or review prompt truncation logic."
                 )
 
-            # Pad to max_length
             padding_length = max_length - len(full_input_ids)
             if padding_length > 0:
                 unpadded_len = len(full_input_ids)
@@ -573,7 +561,6 @@ def _prepare_classification_dataset(
                 labels = labels + [-100] * padding_length
                 attention_mask = [1] * unpadded_len + [0] * padding_length
             else:
-                # Defensive fallback if sequence sizing ever regresses.
                 full_input_ids = full_input_ids[:max_length]
                 labels = labels[:max_length]
                 attention_mask = [1] * max_length
@@ -625,33 +612,10 @@ def train_lora_classification(
     eval_evidences: Optional[List[str]] = None,
     eval_labels: Optional[List[str]] = None,
     config: Optional[LoRATrainingConfig] = None,
-    # gradient_accumulation_steps: Effective batch = batch_size × steps.
-    # On T4 with batch_size=1, set to 4-8 to simulate larger batches without extra VRAM.
     gradient_accumulation_steps: int = 1,
-    skip_final_eval: bool = True,  # Skip final eval by default to prevent OOM
-    checkpoint_path: Optional[
-        str
-    ] = None,  # Path to existing checkpoint to resume training
+    skip_final_eval: bool = True,
+    checkpoint_path: Optional[str] = None,
 ) -> str:
-    """
-    Train LLM with LoRA for classification task.
-
-    Args:
-        claims: List of claims to verify
-        evidences: List of retrieved evidence for each claim
-        labels: List of ground truth labels (ID or dataset variants)
-        eval_claims: Optional list of eval/dev claims. If provided with eval_evidences
-            and eval_labels, trainer uses this set directly (no auto split).
-        eval_evidences: Optional list of eval/dev evidence.
-        eval_labels: Optional list of eval/dev labels.
-        config: Training configuration
-        gradient_accumulation_steps: Number of gradient accumulation steps
-        skip_final_eval: Skip final evaluation to save memory
-        checkpoint_path: Path to existing LoRA checkpoint to resume training (optional)
-
-    Returns:
-        Path to saved LoRA model
-    """
     if not TORCH_AVAILABLE:
         raise ImportError(
             "torch/transformers/peft/datasets are required for LoRA training."
@@ -664,24 +628,26 @@ def train_lora_classification(
     logger.info(
         f"Training precision resolved to {resolved_precision} (dtype={train_dtype})."
     )
+    _warn_if_model_label_mismatch(config.model_name)
 
-    # TF32 gives ~1.3-1.5× matmul speedup but requires Ampere (sm_80+).
-    # T4 is Turing (sm_75) → skip TF32 to avoid a hard ValueError from transformers.
     _use_tf32 = False
     if torch.cuda.is_available():
         _cc_major, _ = torch.cuda.get_device_capability()
-        if _cc_major >= 8:  # Ampere or newer
+        if _cc_major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             _use_tf32 = True
 
-    attn_impl = "sdpa" if config.use_sdpa else "eager"
+    attn_impl = (
+        "flash_attention_2"
+        if getattr(config, "use_flash_attention", True)
+        else ("sdpa" if config.use_sdpa else "eager")
+    )
     logger.info(
-        f"🚀 Speed optimisations: SDPA={config.use_sdpa}, "
+        f"🚀 Speed optimisations: Target Attn={attn_impl}, "
         f"TF32={_use_tf32}, 8-bit AdamW, group_by_length=True"
     )
 
-    # Check if resuming from checkpoint
     import os
 
     from peft import PeftModel
@@ -689,32 +655,27 @@ def train_lora_classification(
     if checkpoint_path and os.path.exists(checkpoint_path):
         logger.info(f"🔄 Resuming training from checkpoint: {checkpoint_path}")
 
-        # Check if checkpoint has adapter files
         adapter_config = os.path.join(checkpoint_path, "adapter_config.json")
         if not os.path.exists(adapter_config):
             raise ValueError(
                 f"Invalid checkpoint: missing adapter_config.json in {checkpoint_path}"
             )
 
-        # Always load tokenizer from base model to avoid Peft corrupted tokenizer_config.json issues with Qwen
         logger.info("Loading tokenizer from base model...")
         tokenizer = _load_tokenizer_for_training(config.model_name)
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # NO special tokens needed - using existing vocabulary labels
-
-        # Load base model
         logger.info(f"Loading base model: {config.model_name}")
         base_model = _load_causal_lm_for_training(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
-        base_model.config.use_cache = True
+        base_model.config.use_cache = (
+            False  # Must be False during training for correct gradients
+        )
 
-        # Load LoRA adapter from checkpoint
         logger.info("Loading LoRA adapter from checkpoint...")
         model = PeftModel.from_pretrained(
             base_model, checkpoint_path, is_trainable=True
@@ -722,7 +683,6 @@ def train_lora_classification(
         model.print_trainable_parameters()
 
     else:
-        # Create new model from scratch
         if checkpoint_path:
             logger.warning(
                 f"⚠️  Checkpoint path provided but not found: {checkpoint_path}"
@@ -735,19 +695,18 @@ def train_lora_classification(
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # NO special tokens needed - using existing vocabulary labels
         logger.info(
-            f"Using existing vocabulary tokens for binary labels: {POSITIVE_LABEL}/{NEGATIVE_LABEL}"
+            f"Using existing vocabulary tokens for 3-class labels: {POSITIVE_LABEL}/{NEGATIVE_LABEL}/{NEI_LABEL}"
         )
 
         model = _load_causal_lm_for_training(
             config.model_name, train_dtype, attn_implementation=attn_impl
         )
 
-        # H100: gradient checkpointing disabled (slows training ~30-40% with no VRAM benefit on H100)
-        model.config.use_cache = True
+        model.config.use_cache = (
+            False  # Must be False during training for correct gradients
+        )
 
-        # Configure LoRA
         target_modules = _resolve_lora_target_modules(model)
         logger.info(
             f"Detected LoRA target modules for {config.model_name}: {target_modules}"
@@ -790,6 +749,9 @@ def train_lora_classification(
         if len(eval_claims) == 0:
             raise ValueError("Eval dataset is empty.")
 
+        _log_label_distribution(labels, "TRAIN (raw)")
+        _log_label_distribution(eval_labels, "EVAL (raw)")
+
         logger.info(f"Preparing TRAIN dataset with {len(claims)} samples...")
         train_dataset = _prepare_classification_dataset(
             claims,
@@ -813,6 +775,7 @@ def train_lora_classification(
         logger.warning(
             "No explicit DEV/EVAL dataset provided; falling back to split from TRAIN."
         )
+        _log_label_distribution(labels, "TRAIN (raw)")
         logger.info(f"Preparing dataset with {len(claims)} samples...")
         full_dataset = _prepare_classification_dataset(
             claims,
@@ -832,30 +795,28 @@ def train_lora_classification(
         f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}"
     )
 
-    # ── Training arguments ─────────────────────────────────────────────────
-    # H100: use fused AdamW — faster than 8-bit AdamW on H100 (ample VRAM, no need to save).
     _optim = "adamw_torch_fused"
     logger.info(f"Optimizer: {_optim}")
 
     training_args = TrainingArguments(
         output_dir=config.output_dir,
         per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=32,  # H100: large VRAM → big eval batch
+        per_device_eval_batch_size=32,
         num_train_epochs=config.epochs,
         learning_rate=config.learning_rate,
-        lr_scheduler_type="cosine",  # cosine decay → better convergence
+        lr_scheduler_type="cosine",
         logging_steps=10,
         save_steps=200,
         save_total_limit=3,
         fp16=use_fp16,
         bf16=use_bf16,
-        tf32=_use_tf32,  # only on Ampere+ (sm_80+)
+        tf32=_use_tf32,
         report_to="none",
         gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_ratio=0.1,
         weight_decay=0.01,
-        optim=_optim,  # fused AdamW: fastest on H100
-        group_by_length=True,  # pack similar-length seqs → less padding waste
+        optim=_optim,
+        group_by_length=True,
         logging_nan_inf_filter=False,
         eval_strategy="steps",
         eval_steps=200,
@@ -865,9 +826,9 @@ def train_lora_classification(
         save_strategy="steps",
         eval_accumulation_steps=64,
         max_grad_norm=1.0,
-        dataloader_num_workers=8,  # H100 server: many CPUs → fast prefetch
-        dataloader_pin_memory=True,  # faster CPU→GPU transfer
-        gradient_checkpointing=False,  # H100: disabled — saves 30-40% training time
+        dataloader_num_workers=8,
+        dataloader_pin_memory=True,
+        gradient_checkpointing=False,
         ddp_find_unused_parameters=False,
     )
 
@@ -875,61 +836,53 @@ def train_lora_classification(
 
     data_collator = default_data_collator
 
-    # Get label token IDs for logits-based classification
     label_token_ids = _get_label_token_ids(tokenizer)
 
-    # Create compute_metrics function with tokenizer and label_token_ids closure
     def compute_metrics_fn(eval_pred):
         return compute_metrics(eval_pred, tokenizer, label_token_ids)
 
-    # CRITICAL: Preprocess logits to reduce memory usage during evaluation
-    # Without this, logits accumulation causes CUDA OOM (22GB+ for 337 samples)
     def preprocess_logits_for_metrics(logits, labels):
-        """
-        Reduce full logits [batch, seq_len, vocab_size] to label logits [batch, 2]
-        BEFORE accumulation to save massive amounts of memory.
+        """Extract logits at the position that predicts the label token.
 
-        For each sample, we extract:
-        - Find label position from labels
-        - Apply CausalLM shift (pred_pos = label_pos - 1)
-        - Extract logits for 2 label tokens only (positive/negative)
-
-        Memory savings: ~65MB/sample → ~100 bytes/sample (650x reduction!)
+        In causal LM, logits[i, t, :] predicts token at position t+1.
+        So to predict label at position `label_pos`, we use logits at `label_pos - 1`.
         """
-        # logits: [batch, seq_len, vocab_size]
-        # labels: [batch, seq_len]
+        num_labels = len(LABEL_LIST)
         batch_size = logits.shape[0]
 
-        # Pre-allocate for label logits only [batch, 2] for binary classification
         label_logits_batch = torch.zeros(
-            (batch_size, 2), device=logits.device, dtype=logits.dtype
+            (batch_size, num_labels), device=logits.device, dtype=logits.dtype
         )
 
-        # Extract token IDs for labels in LABEL_LIST order
         label_token_id_list = [label_token_ids[label] for label in LABEL_LIST]
+        skipped = 0
 
         for i in range(batch_size):
-            # Find label position
             label_positions = (labels[i] != -100).nonzero(as_tuple=True)[0]
 
             if len(label_positions) == 0:
-                # No label found, use zeros (will be handled in compute_metrics)
+                skipped += 1
                 continue
 
             label_pos = label_positions[0].item()
             pred_pos = label_pos - 1
 
             if pred_pos < 0:
-                # Can't predict position 0
+                skipped += 1
                 continue
 
-            # Extract logits at prediction position for label tokens only
-            # This is the key: extract ONLY 2 values instead of entire vocab
+            if pred_pos >= logits.shape[1]:
+                skipped += 1
+                continue
+
             for j, token_id in enumerate(label_token_id_list):
                 label_logits_batch[i, j] = logits[i, pred_pos, token_id]
 
-        # Return reduced logits [batch, 2] instead of [batch, seq_len, vocab_size]
-        # This is ~650x smaller for binary classification!
+        if skipped > 0:
+            logger.warning(
+                f"preprocess_logits_for_metrics: skipped {skipped}/{batch_size} samples (no valid label position)"
+            )
+
         return label_logits_batch
 
     trainer = Trainer(
@@ -939,7 +892,7 @@ def train_lora_classification(
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics_fn,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,  # KEY FIX!
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=config.early_stopping_patience
@@ -951,7 +904,6 @@ def train_lora_classification(
 
     trainer.train()
 
-    # Final evaluation (optional - can skip to save memory)
     if not skip_final_eval:
         logger.info("Running final evaluation...")
         final_metrics = trainer.evaluate()
@@ -969,13 +921,18 @@ def train_lora_classification(
         )
         final_metrics = {}
 
-    # Save BEST model (according to F1 metric)
     best_model_dir = config.output_dir
+    # Re-enable cache for inference after training
+    model.config.use_cache = True
     trainer.save_model(best_model_dir)
     tokenizer.save_pretrained(best_model_dir)
-    logger.info(
-        f"✅ Best model (F1={final_metrics.get('eval_f1_macro', 0):.4f}) saved to {best_model_dir}"
-    )
+    best_f1 = final_metrics.get("eval_f1_macro")
+    if best_f1 is None:
+        best_f1 = trainer.state.best_metric
+    best_ckpt = trainer.state.best_model_checkpoint
+    logger.info(f"✅ Best model (F1={best_f1 or 0:.4f}) saved to {best_model_dir}")
+    if best_ckpt:
+        logger.info(f"✅ Best checkpoint: {best_ckpt}")
 
     logger.info(
         f"ℹ️  Intermediate checkpoints (e.g., checkpoint-XXX) are saved in {config.output_dir}"

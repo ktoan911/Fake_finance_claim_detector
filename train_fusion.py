@@ -57,7 +57,7 @@ def main():
     parser.add_argument(
         "--retriever_model",
         type=str,
-        default=os.getenv("RETRIEVER_MODEL_PATH", "artifacts/retriever_model"),
+        default=os.getenv("RETRIEVER_MODEL_PATH", "AITeamVN/Vietnamese_Embedding"),
         help="Path to trained dense retrieval model (default: artifacts/retriever_model)",
     )
 

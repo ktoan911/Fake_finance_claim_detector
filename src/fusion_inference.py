@@ -186,7 +186,9 @@ class OpenSearchHybridRetriever:
                 pool = min(count, 10000)
         except Exception as exc:
             pool = max(pool, 300)
-            logger.warning(f"Could not fetch OpenSearch count, using pool={pool}: {exc}")
+            logger.warning(
+                f"Could not fetch OpenSearch count, using pool={pool}: {exc}"
+            )
         return pool
 
     def _doc_group_key(self, source: Dict[str, Any]) -> str:
@@ -224,11 +226,7 @@ class OpenSearchHybridRetriever:
 
         verbatim_query = _is_verbatim_query(query)
         expanded_query = normalized_query
-        if (
-            expand_query
-            and self.query_expander is not None
-            and not verbatim_query
-        ):
+        if expand_query and self.query_expander is not None and not verbatim_query:
             expanded_query = self.query_expander.expand_query(normalized_query)
 
         effective_rrf_top_k = max(rrf_top_k, top_k * 10)
@@ -316,14 +314,16 @@ class OpenSearchHybridRetriever:
             group = self._doc_group_key(source)
 
             if use_temporal:
-                temporal, recency, cyclicity = self.temporal_scorer.calculate_temporal_score(
-                    timestamp,
-                    docs_by_group.get(group, []),
-                    use_adaptive_lambda=True,
+                temporal, recency, cyclicity = (
+                    self.temporal_scorer.calculate_temporal_score(
+                        timestamp,
+                        docs_by_group.get(group, []),
+                        use_adaptive_lambda=True,
+                    )
                 )
-                final_score = self.alpha * rrf_scores_norm[doc_id] + (
-                    1.0 - self.alpha
-                ) * temporal
+                final_score = (
+                    self.alpha * rrf_scores_norm[doc_id] + (1.0 - self.alpha) * temporal
+                )
             else:
                 recency, cyclicity = 0.5, 0.5
                 final_score = rrf_scores_norm[doc_id]
@@ -398,7 +398,9 @@ class FusionClaimVerifier:
                 f"fusion_inference is running in CPU-only mode; got device='{device}', forcing 'cpu'."
             )
         self.device = "cpu"
-        self.checkpoint = torch.load(fusion_model_path, map_location=torch.device("cpu"))
+        self.checkpoint = torch.load(
+            fusion_model_path, map_location=torch.device("cpu")
+        )
         self.saved_config = self.checkpoint.get("config", {})
 
         self.top_k = int(self.saved_config.get("top_k", 10))
@@ -467,7 +469,7 @@ class FusionClaimVerifier:
         )
 
         retriever_model = retriever_model_path or self.saved_config.get(
-            "retriever_model", "BAAI/bge-small-en-v1.5"
+            "retriever_model", "bge-vi-base"
         )
 
         index_name = (
@@ -505,8 +507,8 @@ class FusionClaimVerifier:
             logger.info(f"[fusion_inference] claim_input={text!r}")
 
         t_retrieval0 = perf_counter()
-        retrieval_features_np, retrieved_evidence, retrieval_results = _build_retrieval_features_train_compatible(
-            self.retriever, text, self.top_k
+        retrieval_features_np, retrieved_evidence, retrieval_results = (
+            _build_retrieval_features_train_compatible(self.retriever, text, self.top_k)
         )
         t_retrieval1 = perf_counter()
 
@@ -518,12 +520,21 @@ class FusionClaimVerifier:
             )
             if retrieval_results:
                 for idx, r in enumerate(retrieval_results, start=1):
-                    ts = r.timestamp.astimezone(timezone.utc) if isinstance(r.timestamp, datetime) else _parse_timestamp(r.timestamp)
+                    ts = (
+                        r.timestamp.astimezone(timezone.utc)
+                        if isinstance(r.timestamp, datetime)
+                        else _parse_timestamp(r.timestamp)
+                    )
                     age_s = (now_utc - ts).total_seconds()
                     meta = r.metadata or {}
                     title = _truncate(str(meta.get("title") or ""), 120)
                     url = _truncate(
-                        str(meta.get("url") or meta.get("link") or meta.get("source_url") or ""),
+                        str(
+                            meta.get("url")
+                            or meta.get("link")
+                            or meta.get("source_url")
+                            or ""
+                        ),
                         200,
                     )
                     source_name = str(meta.get("source") or meta.get("type") or "")
@@ -572,9 +583,7 @@ class FusionClaimVerifier:
 
         with torch.inference_mode():
             t_llm0 = perf_counter()
-            llm_logits = self.llm.score_logits([text], [llm_evidence]).to(
-                self.device
-            )
+            llm_logits = self.llm.score_logits([text], [llm_evidence]).to(self.device)
             t_llm1 = perf_counter()
 
             if self.debug:

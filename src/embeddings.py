@@ -1,5 +1,3 @@
-import hashlib
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, List, Union
 
@@ -36,312 +34,8 @@ class TripletSample:
     negatives: List[str]  # List of non-matching samples (hard + random)
 
 
-class SimulatedEmbeddingModel:
-    """
-    Simulated embedding model for testing without heavy dependencies.
-    Uses TF-IDF with dimension reduction.
-
-    This is the main embedding model used when PyTorch/SentenceTransformers
-    are not available.
-    """
-
-    def __init__(self, embedding_dim: int = 128, seed: int = 42):
-        from sklearn.decomposition import TruncatedSVD
-        from sklearn.feature_extraction.text import TfidfVectorizer
-
-        self.embedding_dim = embedding_dim
-        self.vectorizer = TfidfVectorizer(
-            max_features=1000, ngram_range=(1, 2), stop_words="english"
-        )
-        self.svd = TruncatedSVD(n_components=embedding_dim, random_state=seed)
-        self.is_fitted = False
-
-    def fit(self, texts: List[str]) -> None:
-        """Fit the embedding model"""
-        tfidf = self.vectorizer.fit_transform(texts)
-        self.svd.fit(tfidf)
-        self.is_fitted = True
-        logger.info(f"SimulatedEmbeddingModel fitted on {len(texts)} texts")
-
-    def encode(self, texts: List[str], normalize: bool = True) -> np.ndarray:
-        """Encode texts to embeddings"""
-        if not self.is_fitted:
-            raise ValueError("Model not fitted. Call fit() first.")
-
-        # TF-IDF + SVD
-        tfidf = self.vectorizer.transform(texts)
-        embeddings = self.svd.transform(tfidf)
-
-        if normalize:
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-8)
-            embeddings = embeddings / norms
-
-        return embeddings
-
-    def similarity(self, query: str, documents: List[str]) -> np.ndarray:
-        """Compute cosine similarity between query and documents"""
-        query_emb = self.encode([query])
-        doc_embs = self.encode(documents)
-
-        similarities = np.dot(doc_embs, query_emb.T).flatten()
-        return similarities
-
-
 # PyTorch-based classes (only available if torch is installed)
 if TORCH_AVAILABLE:
-
-    class CryptoEmbeddingDataset(TorchDataset):
-        """
-        Dataset for contrastive learning on crypto scam patterns.
-        Creates triplets (q, d+, {d-}) for training.
-        Supports hard negative mining and multiple negatives.
-        """
-
-        def __init__(
-            self,
-            scam_samples: List[Dict],
-            legitimate_samples: List[Dict],
-            num_triplets: int = 10000,
-            num_negatives: int = 3,  # Number of negatives per anchor
-            hard_negative_ratio: float = 0.5,
-            embedding_model=None,  # Optional model for hard negative mining
-        ):
-            # --- Core state ---
-            self.scam_samples = scam_samples
-            self.num_negatives = num_negatives
-            self.hard_negative_ratio = hard_negative_ratio
-            self.embedding_model = embedding_model
-
-            # Group scams by type for triplet construction
-            self.scams_by_type: Dict[str, List[Dict]] = {}
-            for sample in scam_samples:
-                t = sample.get("scam_type", "unknown")
-                self.scams_by_type.setdefault(t, []).append(sample)
-
-            # Store only text (not full dicts) to minimize RAM for legitimate samples
-            self.legit_texts: List[str] = [s["text"] for s in legitimate_samples]
-
-            # Pre-compute embeddings for hard negative mining if model provided
-            self.legit_embeddings = None
-            if self.embedding_model and hasattr(self.embedding_model, "encode"):
-                logger.info(
-                    "Pre-computing legitimate embeddings for hard negative mining..."
-                )
-                L = len(self.legit_texts)
-
-                # 1) Probe one mini-batch to determine D without storing outs list
-                with torch.no_grad():
-                    probe = self.embedding_model.encode(
-                        self.legit_texts[: min(8, L)], normalize=True
-                    ).cpu()
-                D = int(probe.shape[1])
-                del probe
-
-                # 2) Pre-allocate final tensor once → no double-copy from torch.cat
-                self.legit_embeddings = torch.empty(
-                    (L, D), dtype=torch.float16, device="cpu"
-                )
-
-                bs = 256
-                write_ptr = 0
-                with torch.no_grad():
-                    for i in range(0, L, bs):
-                        emb = self.embedding_model.encode(
-                            self.legit_texts[i : i + bs], normalize=True
-                        ).cpu()  # float32 (from SentenceTransformer)
-                        emb = emb.float()
-                        emb = F.normalize(emb, p=2, dim=1)  # guarantee L2 norm
-                        emb = emb.to(torch.float16)
-                        bsz = emb.size(0)
-                        self.legit_embeddings[write_ptr : write_ptr + bsz].copy_(emb)
-                        write_ptr += bsz
-                        del emb  # release immediately to avoid fragmentation
-
-                self.legit_embeddings = self.legit_embeddings.contiguous()
-
-                ram_mb = (
-                    self.legit_embeddings.nelement()
-                    * self.legit_embeddings.element_size()
-                    / 1e6
-                )
-                logger.info(
-                    f"legit_embeddings: shape={tuple(self.legit_embeddings.shape)}, "
-                    f"dtype={self.legit_embeddings.dtype}, RAM≈{ram_mb:.1f} MB"
-                )
-
-            # LRU cache: hash64 key, float16 value, capped at 5k
-            self._anchor_cache: OrderedDict = OrderedDict()
-            self._anchor_cache_max = 5000
-
-            # Generate triplets on the fly instead of storing strings in RAM
-            self.num_triplets = num_triplets
-            logger.info(
-                f"Dataset ready to lazily generate {self.num_triplets} triplets via __getitem__"
-            )
-
-        def _topk_legit_for_scam(
-            self, scam_emb: torch.Tensor, k: int = 20, block: int = 2048
-        ):
-            """
-            Optimized chunked hard negative mining to prevent OOM
-            scam_emb: [1, D] or [D] on CPU, normalized
-            self.legit_embeddings: [L, D] on CPU, normalized
-            Return: indices [k]
-            """
-            best_scores = torch.full((k,), -1e9, device="cpu")
-            best_idx = torch.full((k,), -1, dtype=torch.long, device="cpu")
-
-            L = self.legit_embeddings.size(0)
-            # Cast to match float16 embeddings for dot product
-            scam_emb_flat = scam_emb.view(-1).to(torch.float16)
-
-            for start in range(0, L, block):
-                end = min(start + block, L)
-                chunk = self.legit_embeddings[start:end]  # [b, D]
-                scores = torch.mv(chunk, scam_emb_flat)  # cosine = dot (đã normalize)
-
-                # lấy topk trong block
-                tk = min(k, scores.numel())
-                s, idx = torch.topk(scores, k=tk)
-                idx = idx + start
-
-                # merge vào best hiện tại
-                all_scores = torch.cat([best_scores, s])
-                all_idx = torch.cat([best_idx, idx])
-                best_scores, pos = torch.topk(all_scores, k=k)
-                best_idx = all_idx[pos]
-
-            return best_idx
-
-        @staticmethod
-        def _hash64(s: str) -> int:
-            """Stable 64-bit hash for dict key to avoid storing full strings."""
-            return int.from_bytes(
-                hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest(), "little"
-            )
-
-        def _get_anchor_emb(self, anchor_text: str) -> torch.Tensor:
-            """Encode anchor text with LRU caching (hash64 key, float16 value, max 5k entries)."""
-            key = self._hash64(anchor_text)
-            v = self._anchor_cache.get(key)
-            if v is not None:
-                self._anchor_cache.move_to_end(key)  # LRU update
-                return v
-
-            with torch.no_grad():
-                emb = self.embedding_model.encode([anchor_text], normalize=True).cpu()[
-                    0
-                ]
-            emb = emb.float()
-            emb = F.normalize(
-                emb, p=2, dim=0
-            )  # guarantee L2 norm for dot-product cosine
-            emb = emb.to(torch.float16)  # float16 to halve RAM
-
-            self._anchor_cache[key] = emb
-            if len(self._anchor_cache) > self._anchor_cache_max:
-                self._anchor_cache.popitem(last=False)  # evict oldest
-            return emb
-
-        def __len__(self) -> int:
-            return self.num_triplets
-
-        def __getitem__(self, idx: int) -> Dict[str, Union[str, List[str]]]:
-            scam_types = list(self.scams_by_type.keys())
-
-            # Bounded retry loop - prevent infinite loops if imbalanced dataset
-            fallback = None
-            for _ in range(50):
-                anchor_type = np.random.choice(scam_types)
-                anchor_samples = self.scams_by_type[anchor_type]
-
-                if not anchor_samples:
-                    continue
-
-                # Pick anchor
-                anchor_idx = np.random.choice(len(anchor_samples))
-                anchor_sample = anchor_samples[anchor_idx]
-                anchor_text = anchor_sample["text"]
-
-                # Determine Positive
-                # Priority: Use "evidence" field (Paper alignment: Query -> Evidence)
-                if "evidence" in anchor_sample and anchor_sample["evidence"]:
-                    positive_text = anchor_sample["evidence"]
-                    using_evidence = True
-                elif len(anchor_samples) >= 2:
-                    # Fallback: Metric Learning (Cluster same scam types)
-                    pos_idx = np.random.choice(
-                        [i for i in range(len(anchor_samples)) if i != anchor_idx]
-                    )
-                    positive_text = anchor_samples[pos_idx]["text"]
-                    using_evidence = False
-                else:
-                    continue
-
-                negatives = []
-
-                # Try to mine hard negatives on-the-fly
-                if self.legit_embeddings is not None:
-                    anchor_emb = self._get_anchor_emb(anchor_text)
-
-                    # Call optimized chunked search instead of full matrix
-                    top_k_indices = self._topk_legit_for_scam(
-                        anchor_emb, k=min(20, len(self.legit_texts))
-                    )
-
-                    # Add hard negatives
-                    num_hard = int(self.num_negatives * self.hard_negative_ratio)
-                    for _ in range(num_hard):
-                        neg_idx = top_k_indices[
-                            np.random.randint(0, len(top_k_indices))
-                        ].item()
-                        negatives.append(self.legit_texts[neg_idx])
-
-                # Fill remaining with random negatives
-                while len(negatives) < self.num_negatives:
-                    if np.random.random() < 0.5:
-                        # Random negative from other scam types
-                        other_types = [t for t in scam_types if t != anchor_type]
-                        if other_types:
-                            neg_type = np.random.choice(other_types)
-                            neg_sample = np.random.choice(self.scams_by_type[neg_type])
-
-                            if (
-                                using_evidence
-                                and "evidence" in neg_sample
-                                and neg_sample["evidence"]
-                            ):
-                                negatives.append(neg_sample["evidence"])
-                            else:
-                                negatives.append(neg_sample["text"])
-                        else:
-                            negatives.append(np.random.choice(self.legit_texts))
-                    else:
-                        # Random legitimate sample
-                        negatives.append(np.random.choice(self.legit_texts))
-
-                # If we successfully made it here, cache as fallback too
-                triplet = {
-                    "anchor": anchor_text,
-                    "positive": positive_text,
-                    "negatives": negatives,
-                }
-                fallback = triplet
-                return triplet
-
-            # If 50 attempts all failed, return last known good or a random fallback
-            if fallback is not None:
-                return fallback
-
-            # Final emergency fallback with random data to prevent DataLoader crash
-            anchor_sample = np.random.choice(self.scam_samples)
-            legit_text = np.random.choice(self.legit_texts)
-            return {
-                "anchor": anchor_sample["text"],
-                "positive": anchor_sample.get("evidence", anchor_sample["text"]),
-                "negatives": [legit_text] * self.num_negatives,
-            }
 
     class ContrastiveEmbeddingModel(nn.Module):
         """
@@ -352,8 +46,8 @@ if TORCH_AVAILABLE:
 
         def __init__(
             self,
-            base_model_name: str = "BAAI/bge-small-en-v1.5",
-            embedding_dim: int = 384,
+            base_model_name: str = "bge-vi-base",
+            embedding_dim: int = None,
             lambda_reg: float = 0.001,
             freeze_base: bool = True,
             max_length: int = 256,
@@ -363,7 +57,13 @@ if TORCH_AVAILABLE:
             super().__init__()
 
             self.lambda_reg = lambda_reg
-            self.embedding_dim = embedding_dim
+            import os
+
+            self.embedding_dim = (
+                embedding_dim
+                if embedding_dim is not None
+                else int(os.getenv("RETRIEVER_EMBEDDING_DIM", "1024"))
+            )
             # Strict memory cap on attention matrices
             self.max_length = max_length
             self.encoder_device = encoder_device
@@ -865,12 +565,6 @@ if TORCH_AVAILABLE:
 
 else:
     # Dummy classes when torch is not available
-    class CryptoEmbeddingDataset:
-        """Placeholder when PyTorch is not available"""
-
-        def __init__(self, *args, **kwargs):
-            logger.warning("CryptoEmbeddingDataset requires PyTorch")
-
     class RetrievalDataset:
         """Placeholder when PyTorch is not available"""
 
