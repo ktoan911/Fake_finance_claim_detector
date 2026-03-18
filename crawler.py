@@ -376,7 +376,6 @@ async def main(args):
             ]
             await asyncio.gather(*fetch_tasks)
 
-    # Lọc bài viết
     valid_results = []
     cutoff_time = None
     if args.timestamp:
