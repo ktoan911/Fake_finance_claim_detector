@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -190,12 +189,12 @@ async def process_url(context, url, semaphore, results):
 
             # Chờ để load các trang render bằng JS (VD: vietcombank load bằng API)
             # Chờ một lúc để các trang SPA (React/Vue/API) kịp gọi XMLHttpRequest và render HTML ra cây DOM
-            await asyncio.sleep(5)  # Tăng từ 3s lên 5s để nhẹ CPU hơn
+            await asyncio.sleep(3)
 
             # Thử cuộn trang xuống để kích hoạt lazy-loading (Bọc trong try-except phòng khi trang bị treo JS)
             try:
                 await page.evaluate("window.scrollBy(0, 1000)")
-                await asyncio.sleep(3)  # Tăng từ 1.5s lên 3s để nhẹ CPU hơn
+                await asyncio.sleep(1.5)
             except Exception:
                 pass  # Bỏ qua nếu cuộn trang lỗi
 
@@ -305,7 +304,7 @@ async def fetch_article_content(session, item, semaphore):
 
 async def main(args):
     results = []
-    concurrency_limit = 1  # 1 tab tại một thời điểm để vừa 2GB RAM
+    concurrency_limit = 5
     semaphore = asyncio.Semaphore(concurrency_limit)
 
     logging.info("Bắt đầu quá trình cào dữ liệu...")
@@ -319,14 +318,6 @@ async def main(args):
                 "--disable-http2",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                # Tiết kiệm RAM cho môi trường 2GB
-                "--disable-gpu",
-                "--disable-dev-shm-usage",  # Quan trọng trên VPS/Docker
-                "--no-zygote",
-                "--single-process",  # 1 process thay vì nhiều process con
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--js-flags=--max-old-space-size=256",  # Giới hạn JS heap 256MB
             ],
         )
 
@@ -371,7 +362,7 @@ async def main(args):
         logging.info(
             f"Đã thu thập {len(results)} liên kết. Bắt đầu tải nội dung bài viết..."
         )
-        content_semaphore = asyncio.Semaphore(3)  # Giảm xuống 3 để vừa 2GB RAM
+        content_semaphore = asyncio.Semaphore(15)
         connector = aiohttp.TCPConnector(ssl=False)
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -517,31 +508,7 @@ async def main(args):
 
 if __name__ == "__main__":
     import argparse
-
-    # --- Kiểm tra RAM tối thiểu 2 GB ---
-    try:
-        import psutil
-
-        available_ram_gb = psutil.virtual_memory().available / (1024**3)
-        total_ram_gb = psutil.virtual_memory().total / (1024**3)
-        print(
-            f"[RAM] Tổng: {total_ram_gb:.1f} GB | Còn trống: {available_ram_gb:.1f} GB"
-        )
-        if available_ram_gb < 2.0:
-            print(
-                f"[CẢNH BÁO] RAM còn trống chỉ {available_ram_gb:.1f} GB — cần tối thiểu 2 GB. "
-                "Trình cào có thể bị crash hoặc bị hệ điều hành kill."
-            )
-            sys.exit(1)
-        else:
-            print(
-                f"[OK] RAM đủ điều kiện ({available_ram_gb:.1f} GB trống). Bắt đầu crawler..."
-            )
-    except ImportError:
-        print(
-            "[CẢNH BÁO] Không tìm thấy thư viện psutil — bỏ qua kiểm tra RAM. Cài bằng: pip install psutil"
-        )
-    # ------------------------------------
+    import sys
 
     parser = argparse.ArgumentParser(description="Crawler for crypto news")
     parser.add_argument(
@@ -553,7 +520,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=5,  # Giảm xuống 5 để vừa 2GB RAM khi encode embedding
+        default=50,
         help="Batch size for processing and embedding generation",
     )
     args = parser.parse_args()
