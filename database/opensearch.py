@@ -43,6 +43,9 @@ class OpenSearchKB:
             http_auth=auth,
             verify_certs=True,
             http_compress=True,
+            timeout=60,
+            max_retries=3,
+            retry_on_timeout=True,
         )
 
     def create_index(self, overwrite: bool = False) -> None:
@@ -423,14 +426,23 @@ class OpenSearchKB:
             },
         }
 
+        from opensearchpy.exceptions import RequestError
+
         try:
             resp = self.client.search(index=self.index, body=body)
-        except Exception as exc:
+        except RequestError as exc:
             # Older OpenSearch versions may not support `num_candidates`.
-            if "num_candidates" not in str(exc).lower():
+            if "num_candidates" in str(exc).lower():
+                knn_query["knn"]["embedding"].pop("num_candidates", None)
+                resp = self.client.search(index=self.index, body=body)
+            else:
                 raise
-            knn_query["knn"]["embedding"].pop("num_candidates", None)
-            resp = self.client.search(index=self.index, body=body)
+        except Exception as exc:
+            if "num_candidates" in str(exc).lower():
+                knn_query["knn"]["embedding"].pop("num_candidates", None)
+                resp = self.client.search(index=self.index, body=body)
+            else:
+                raise
 
         hits = resp.get("hits", {}).get("hits", [])
         return [

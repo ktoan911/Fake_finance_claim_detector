@@ -95,17 +95,23 @@ class LLMScorer:
                 )
 
         def _load_causal_lm(model_path: str):
-            # CPU path: keep everything on CPU, avoid device_map/offload metadata.
-            # CUDA path: allow auto placement for large models.
-            dtype = torch.float16 if use_cuda else torch.float32
+            import os
+
+            # CPU path: use bfloat16 to halve RAM usage (e.g. 7GB instead of 14GB for 7B models)
+            # Use low_cpu_mem_usage=True to avoid the 2x peak RAM spike during loading!
+            dtype = torch.float16 if use_cuda else torch.bfloat16
+            if os.getenv("LLM_CPU_FORCE_FP32") == "1":
+                dtype = torch.float32
+
             kwargs = {
                 "trust_remote_code": False,
-                "low_cpu_mem_usage": bool(use_cuda),
+                "low_cpu_mem_usage": True,
             }
             if use_cuda:
                 kwargs["device_map"] = "auto"
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
+                # PEFT sometimes crashes with CPU offloading index mismatches if device_map is set.
                 kwargs["device_map"] = None
             try:
                 return AutoModelForCausalLM.from_pretrained(
@@ -220,6 +226,10 @@ class LLMScorer:
 
         if not use_cuda:
             self.model.to("cpu")
+
+        import gc
+
+        gc.collect()
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

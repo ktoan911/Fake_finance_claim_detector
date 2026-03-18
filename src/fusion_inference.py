@@ -594,7 +594,7 @@ class FusionClaimVerifier:
                 logger.info(
                     "[fusion_inference] llm_logits="
                     + np.array2string(
-                        llm_logits.detach().cpu().numpy(),
+                        llm_logits.detach().cpu().float().numpy(),
                         precision=6,
                         suppress_small=False,
                         separator=", ",
@@ -603,7 +603,7 @@ class FusionClaimVerifier:
                 logger.info(
                     "[fusion_inference] llm_probs="
                     + np.array2string(
-                        llm_probs.detach().cpu().numpy(),
+                        llm_probs.detach().cpu().float().numpy(),
                         precision=6,
                         suppress_small=False,
                         separator=", ",
@@ -629,7 +629,7 @@ class FusionClaimVerifier:
                 logger.info(
                     "[fusion_inference] fused_logits="
                     + np.array2string(
-                        fusion_output.fused_logits.detach().cpu().numpy(),
+                        fusion_output.fused_logits.detach().cpu().float().numpy(),
                         precision=6,
                         suppress_small=False,
                         separator=", ",
@@ -638,7 +638,7 @@ class FusionClaimVerifier:
                 logger.info(
                     "[fusion_inference] final_probs="
                     + np.array2string(
-                        fusion_output.final_probs.detach().cpu().numpy(),
+                        fusion_output.final_probs.detach().cpu().float().numpy(),
                         precision=6,
                         suppress_small=False,
                         separator=", ",
