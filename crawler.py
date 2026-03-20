@@ -509,7 +509,7 @@ async def main(args):
         model,
         full_text: str,
         chunk_texts: list[str],
-        max_length: int = 512,
+        max_length: int = 2048,
     ) -> list[list[float]]:
         """
         Late Chunking:
