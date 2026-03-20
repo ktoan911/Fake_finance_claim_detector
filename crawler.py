@@ -8,11 +8,12 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+import torch
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 
 from database.opensearch import OpenSearchKB
 
@@ -407,6 +408,30 @@ async def main(args):
             f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()}."
         )
 
+    # --- Báo cáo nguồn không cào được bài viết nào ---
+    sources_with_links = {item["source_url"] for item in results}
+    sources_with_content = {item["source_url"] for item in valid_results}
+
+    no_links = [u for u in URLS_TO_CRAWL if u not in sources_with_links]
+    links_but_no_content = [
+        u
+        for u in URLS_TO_CRAWL
+        if u in sources_with_links and u not in sources_with_content
+    ]
+
+    if no_links:
+        logging.warning(
+            f"[NGUỒN TRẮNG - không tìm được link nào] ({len(no_links)} nguồn):\n"
+            + "\n".join(f"  - {u}" for u in no_links)
+        )
+    if links_but_no_content:
+        logging.warning(
+            f"[NGUỒN RỖNG - có link nhưng không có nội dung hợp lệ] ({len(links_but_no_content)} nguồn):\n"
+            + "\n".join(f"  - {u}" for u in links_but_no_content)
+        )
+    if not no_links and not links_but_no_content:
+        logging.info("Tất cả nguồn đều cào được ít nhất 1 bài viết hợp lệ.")
+
     # --- Xử lý dữ liệu định kỳ theo batch ---
     batch_size = args.batch_size
     processed_count = 0
@@ -415,89 +440,163 @@ async def main(args):
         embedding_dim=int(os.getenv("RETRIEVER_EMBEDDING_DIM")),
     )
 
+    # ---------------------------------------------------------------------------
+    # Late Chunking helpers
+    # ---------------------------------------------------------------------------
+    def _split_sentences(text: str, chunk_size: int = 200) -> list[str]:
+        """Tách văn bản thành các câu, gộp câu ngắn lại cho đến khi đủ chunk_size."""
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if not sentences:
+            return [text]
+        chunks, current = [], ""
+        for sent in sentences:
+            if not current:
+                current = sent
+                if len(current) >= chunk_size:
+                    chunks.append(current)
+                    current = ""
+                continue
+            candidate = f"{current} {sent}"
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = sent
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def late_chunk_embed(
+        tokenizer,
+        model,
+        full_text: str,
+        chunk_texts: list[str],
+        max_length: int = 512,
+    ) -> list[list[float]]:
+        """
+        Late Chunking:
+        1. Tokenize toàn bộ tài liệu, lấy token embeddings (contextualized).
+        2. Với mỗi chunk, tìm span token tương ứng trong full_text và
+           mean-pool token embeddings của span đó.
+
+        Nếu full_text vượt max_length token, phần thừa bị cắt bỏ — các chunk
+        nằm ngoài phạm vi sẽ fallback về zero vector.
+        """
+        # Tokenize full document
+        full_enc = tokenizer(
+            full_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            return_offsets_mapping=True,
+        )
+        offset_mapping = full_enc.pop("offset_mapping")[0]  # (T, 2)
+
+        with torch.no_grad():
+            output = model(**full_enc)
+        # token_embeddings: (1, T, H) → (T, H)
+        token_embeddings = output.last_hidden_state[0]
+        hidden_size = token_embeddings.shape[-1]
+
+        # Xác định vị trí char của từng chunk trong full_text
+        chunk_embeddings = []
+        search_start = 0
+        for chunk in chunk_texts:
+            # Tìm vị trí char của chunk trong full_text
+            char_start = full_text.find(chunk, search_start)
+            if char_start == -1:
+                # Không tìm thấy → fallback zero vector
+                chunk_embeddings.append([0.0] * hidden_size)
+                continue
+            char_end = char_start + len(chunk)
+            search_start = char_end
+
+            # Map char span → token span (offset_mapping)
+            token_mask = [
+                (int(s) >= char_start and int(e) <= char_end and s != e)
+                for s, e in offset_mapping.tolist()
+            ]
+            if not any(token_mask):
+                chunk_embeddings.append([0.0] * hidden_size)
+                continue
+
+            # Mean-pool các token trong span
+            indices = torch.tensor(
+                [i for i, m in enumerate(token_mask) if m], dtype=torch.long
+            )
+            span_emb = token_embeddings[indices].mean(dim=0)
+            chunk_embeddings.append(span_emb.tolist())
+
+        return chunk_embeddings
+
+    # ---------------------------------------------------------------------------
     # Load model 1 lần để dùng chung cho các batch
-    logging.info("Đang khởi tạo model embedding trên CPU...")
+    # ---------------------------------------------------------------------------
+    logging.info("Đang khởi tạo model embedding trên CPU (late chunking)...")
+    tokenizer = None
+    model = None
     try:
         model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
-        encoder = SentenceTransformer(model_name, device="cpu")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        model.eval()
+        logging.info(f"Đã tải model: {model_name}")
     except Exception as e:
         logging.error(f"Không thể tải model embedding: {e}")
-        encoder = None
 
     for i in range(0, len(valid_results), batch_size):
         batch_items = valid_results[i : i + batch_size]
         processed_batch = []
 
         for item in batch_items:
-            # Bước 0: Chuẩn hóa văn bản, xóa \n, \t, giữ lại chữ (loại bỏ khoảng trắng thừa)
-            title = item.get("title", "")
-            content = item.get("content", "")
-
-            title = re.sub(r"[\n\t\r]+", " ", title)
-            title = re.sub(r"\s+", " ", title).strip()
-
-            content = re.sub(r"[\n\t\r]+", " ", content)
-            content = re.sub(r"\s+", " ", content).strip()
+            # Bước 0: Chuẩn hóa văn bản
+            title = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("title", ""))
+            ).strip()
+            content = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("content", ""))
+            ).strip()
 
             if not content:
                 continue
 
-            # Bước 1: Chuẩn hóa độ dài content
-            content_chunks = []
-            if len(content) <= 200:
-                content_chunks.append(content)
+            # Bước 1: Xác định ranh giới chunk (câu / nhóm câu)
+            chunk_texts = _split_sentences(content) if len(content) > 200 else [content]
+
+            # Bước 2: Late chunking — tạo full_text để tokenize 1 lần
+            # Ghép title + content để ngữ cảnh title lan tỏa vào token embeddings
+            full_text = f"{title} {content}".strip() if title else content
+
+            # Bước 3: Tính late-chunk embeddings
+            if tokenizer is not None and model is not None:
+                try:
+                    chunk_embeddings = late_chunk_embed(
+                        tokenizer, model, full_text, chunk_texts
+                    )
+                except Exception as e:
+                    logging.error(f"Lỗi late_chunk_embed: {e}")
+                    chunk_embeddings = [[]] * len(chunk_texts)
             else:
-                # Tách câu dựa trên dấu . ! ?
-                sentences = [
-                    s.strip() for s in re.split(r"(?<=[.!?])\s+", content) if s.strip()
-                ]
-                if not sentences:
-                    content_chunks.append(content)
-                else:
-                    current = ""
-                    for sentence in sentences:
-                        if not current:
-                            current = sentence
-                            if len(current) >= 200:
-                                content_chunks.append(current)
-                                current = ""
-                            continue
+                chunk_embeddings = [[]] * len(chunk_texts)
 
-                        candidate = f"{current} {sentence}"
-                        if len(candidate) <= 200:
-                            current = candidate
-                        else:
-                            current = candidate
-                            content_chunks.append(current)
-                            current = ""
-
-                    if current:
-                        content_chunks.append(current)
-
-            # Bước 2: Cập nhật lại trường content: title + " " + content_đoạn
-            for chunk_idx, chunk in enumerate(content_chunks):
+            # Bước 4: Tạo document cho mỗi chunk
+            for chunk_idx, (chunk, emb) in enumerate(
+                zip(chunk_texts, chunk_embeddings)
+            ):
                 new_item = item.copy()
                 new_item["title"] = title
-                new_item["content"] = f"{title} {chunk}".strip()
+                new_item["content"] = f"{title} {chunk}".strip() if title else chunk
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
+                if emb:
+                    new_item["embedding"] = emb
                 processed_batch.append(new_item)
-
-        # Tạo embedding cho cả batch mới xử lý xong
-        if processed_batch and encoder is not None:
-            try:
-                texts = [it["content"] for it in processed_batch]
-                embeddings = encoder.encode(texts)
-                for idx, r in enumerate(processed_batch):
-                    r["embedding"] = embeddings[idx].tolist()
-            except Exception as e:
-                logging.error(f"Lỗi khi block tạo embedding cho batch: {e}")
 
         kb.insert_many(processed_batch)
 
         processed_count += len(processed_batch)
         logging.info(
-            f"Đã xử lý và tạo mã nhúng xong batch có {len(processed_batch)} đoạn dữ liệu nhỏ."
+            f"Đã xử lý và tạo mã nhúng (late chunking) xong batch có {len(processed_batch)} đoạn."
         )
 
     logging.info(
