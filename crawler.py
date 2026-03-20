@@ -217,90 +217,106 @@ async def process_url(context, url, semaphore, results):
 
 
 async def fetch_article_content(session, item, semaphore):
-    """Lấy nội dung chi tiết bài viết bỏ qua lỗi chứng chỉ."""
+    """Lấy nội dung chi tiết bài viết, có retry 3 lần khi bị lỗi mạng."""
     async with semaphore:
-        try:
-            async with session.get(item["article_url"], timeout=15) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
+        for attempt in range(3):  # Fix (3): retry 3 lần
+            try:
+                async with session.get(item["article_url"], timeout=15) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        soup = BeautifulSoup(html, "html.parser")
 
-                    # Tìm thẻ chứa nội dung chính
-                    article = soup.find("article")
-                    if not article:
-                        article = soup.find(
-                            "div",
-                            class_=lambda c: (
-                                c and ("content" in c.lower() or "detail" in c.lower())
-                            ),
+                        # Tìm thẻ chứa nội dung chính
+                        article = soup.find("article")
+                        if not article:
+                            article = soup.find(
+                                "div",
+                                class_=lambda c: (
+                                    c
+                                    and (
+                                        "content" in c.lower() or "detail" in c.lower()
+                                    )
+                                ),
+                            )
+                        if not article:
+                            article = soup
+
+                        paragraphs = article.find_all("p")
+                        raw_text = [p.get_text(strip=True) for p in paragraphs]
+                        content = "\n".join(
+                            [text for text in raw_text if len(text) > 30]
                         )
-                    if not article:
-                        article = soup
+                        item["content"] = content
 
-                    paragraphs = article.find_all("p")
-                    raw_text = [p.get_text(strip=True) for p in paragraphs]
-                    # Lọc các đoạn quá ngắn
-                    content = "\n".join([text for text in raw_text if len(text) > 30])
-                    item["content"] = content
-
-                    # Trích xuất published_at
-                    published_at = None
-                    meta_pub = (
-                        soup.find("meta", attrs={"property": "article:published_time"})
-                        or soup.find("meta", attrs={"name": "article:published_time"})
-                        or soup.find("meta", attrs={"name": "pubdate"})
-                    )
-
-                    if meta_pub and meta_pub.get("content"):
-                        published_at = meta_pub["content"].strip()
-                    else:
-                        scripts = soup.find_all(
-                            "script",
-                            attrs={"type": re.compile(r"application/ld\+json", re.I)},
+                        # Trích xuất published_at
+                        published_at = None
+                        meta_pub = (
+                            soup.find(
+                                "meta", attrs={"property": "article:published_time"}
+                            )
+                            or soup.find(
+                                "meta", attrs={"name": "article:published_time"}
+                            )
+                            or soup.find("meta", attrs={"name": "pubdate"})
                         )
-                        for sc in scripts:
-                            try:
-                                data = json.loads(
-                                    sc.string if sc.string else sc.get_text(strip=False)
-                                )
-                                if isinstance(data, dict):
-                                    if "datePublished" in data:
-                                        published_at = data["datePublished"]
+
+                        if meta_pub and meta_pub.get("content"):
+                            published_at = meta_pub["content"].strip()
+                        else:
+                            scripts = soup.find_all(
+                                "script",
+                                attrs={
+                                    "type": re.compile(r"application/ld\+json", re.I)
+                                },
+                            )
+                            for sc in scripts:
+                                try:
+                                    data = json.loads(
+                                        sc.string
+                                        if sc.string
+                                        else sc.get_text(strip=False)
+                                    )
+                                    if isinstance(data, dict):
+                                        if "datePublished" in data:
+                                            published_at = data["datePublished"]
+                                            break
+                                        if "@graph" in data and isinstance(
+                                            data["@graph"], list
+                                        ):
+                                            for g in data["@graph"]:
+                                                if (
+                                                    isinstance(g, dict)
+                                                    and "datePublished" in g
+                                                ):
+                                                    published_at = g["datePublished"]
+                                                    break
+                                    if published_at:
                                         break
-                                    if "@graph" in data and isinstance(
-                                        data["@graph"], list
-                                    ):
-                                        for g in data["@graph"]:
-                                            if (
-                                                isinstance(g, dict)
-                                                and "datePublished" in g
-                                            ):
-                                                published_at = g["datePublished"]
-                                                break
-                                if published_at:
-                                    break
+                                except Exception:
+                                    pass
+
+                        if published_at:
+                            try:
+                                dt = dtparser.parse(published_at)
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                item["published_at"] = dt.astimezone(
+                                    timezone.utc
+                                ).isoformat()
                             except Exception:
-                                pass
-
-                    if published_at:
-                        try:
-                            dt = dtparser.parse(published_at)
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            item["published_at"] = dt.astimezone(
-                                timezone.utc
-                            ).isoformat()
-                        except Exception:
-                            item["published_at"] = published_at
+                                item["published_at"] = published_at
+                        else:
+                            item["published_at"] = None
                     else:
+                        item["content"] = ""
                         item["published_at"] = None
-
+                    return  # thành công → thoát retry loop
+            except Exception:
+                if attempt < 2:
+                    await asyncio.sleep(1)
                 else:
                     item["content"] = ""
                     item["published_at"] = None
-        except Exception:
-            item["content"] = ""
-            item["published_at"] = None
 
 
 async def main(args):
@@ -400,6 +416,20 @@ async def main(args):
 
         valid_results.append(item)
 
+    # Fix (4): Deduplicate theo article_url (nhiều nguồn có thể trỏ cùng bài)
+    seen_article_urls: set[str] = set()
+    deduped_results = []
+    for item in valid_results:
+        url = item.get("article_url", "")
+        if url not in seen_article_urls:
+            seen_article_urls.add(url)
+            deduped_results.append(item)
+    if len(deduped_results) < len(valid_results):
+        logging.info(
+            f"Đã loại bỏ {len(valid_results) - len(deduped_results)} bài viết trùng article_url."
+        )
+    valid_results = deduped_results
+
     logging.info(
         f"Đã lọc bỏ {len(results) - len(valid_results) - filtered_by_time} bài viết không có nội dung hoặc quá ngắn."
     )
@@ -445,7 +475,15 @@ async def main(args):
     # ---------------------------------------------------------------------------
     def _split_sentences(text: str, chunk_size: int = 200) -> list[str]:
         """Tách văn bản thành các câu, gộp câu ngắn lại cho đến khi đủ chunk_size."""
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        # Fix (6): Không tách sau viết tắt dạng "TP.", "TS.", "PGS.", "GS.", v.v.
+        sentences = [
+            s.strip()
+            for s in re.split(
+                r"(?<!\b[A-ZĐÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴ][.])(?<=[.!?])\s+",
+                text,
+            )
+            if s.strip()
+        ]
         if not sentences:
             return [text]
         chunks, current = [], ""
@@ -476,13 +514,37 @@ async def main(args):
         """
         Late Chunking:
         1. Tokenize toàn bộ tài liệu, lấy token embeddings (contextualized).
-        2. Với mỗi chunk, tìm span token tương ứng trong full_text và
-           mean-pool token embeddings của span đó.
+        2. Với mỗi chunk, map char span → token span rồi mean-pool.
 
-        Nếu full_text vượt max_length token, phần thừa bị cắt bỏ — các chunk
-        nằm ngoài phạm vi sẽ fallback về zero vector.
+        Fix (1): Nếu full_text vượt max_length token → fallback sang
+        encode từng chunk riêng (tránh zero vector hàng loạt do truncate).
         """
-        # Tokenize full document
+        # Tokenize để check độ dài, chưa truncate
+        probe = tokenizer(
+            full_text,
+            return_tensors="pt",
+            truncation=False,
+            return_offsets_mapping=False,
+        )
+        n_tokens = probe["input_ids"].shape[1]
+
+        # Fix (1): fallback nếu vượt max_length
+        if n_tokens >= max_length:
+            logging.warning(
+                f"Text quá dài ({n_tokens} tokens >= {max_length}), fallback sang encode từng chunk."
+            )
+            fallback = []
+            for c in chunk_texts:
+                enc = tokenizer(
+                    c, return_tensors="pt", truncation=True, max_length=max_length
+                )
+                with torch.no_grad():
+                    out = model(**enc)
+                emb = out.last_hidden_state.mean(dim=1)[0]
+                fallback.append(emb.tolist())
+            return fallback
+
+        # Tokenize full document với offset_mapping
         full_enc = tokenizer(
             full_text,
             return_tensors="pt",
@@ -502,19 +564,16 @@ async def main(args):
         chunk_embeddings = []
         search_start = 0
         for chunk in chunk_texts:
-            # Tìm vị trí char của chunk trong full_text
             char_start = full_text.find(chunk, search_start)
             if char_start == -1:
-                # Không tìm thấy → fallback zero vector
                 chunk_embeddings.append([0.0] * hidden_size)
                 continue
             char_end = char_start + len(chunk)
             search_start = char_end
 
-            # Map char span → token span (offset_mapping)
+            # Fix (2): dùng overlap condition thay vì strict containment
             token_mask = [
-                (int(s) >= char_start and int(e) <= char_end and s != e)
-                for s, e in offset_mapping.tolist()
+                (s < char_end and e > char_start) for s, e in offset_mapping.tolist()
             ]
             if not any(token_mask):
                 chunk_embeddings.append([0.0] * hidden_size)
@@ -588,8 +647,13 @@ async def main(args):
                 new_item["content"] = f"{title} {chunk}".strip() if title else chunk
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
-                if emb:
+                # Fix (5): chỉ gán embedding nếu dim khớp với kb.embedding_dim
+                if emb and len(emb) == kb.embedding_dim:
                     new_item["embedding"] = emb
+                elif emb:
+                    logging.warning(
+                        f"Embedding dim sai: got {len(emb)}, expected {kb.embedding_dim}. Bỏ qua chunk."
+                    )
                 processed_batch.append(new_item)
 
         kb.insert_many(processed_batch)
