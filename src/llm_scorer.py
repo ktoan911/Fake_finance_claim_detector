@@ -95,17 +95,15 @@ class LLMScorer:
                 )
 
         def _load_causal_lm(model_path: str):
-            import os
 
-            # CPU path: use bfloat16 to halve RAM usage (e.g. 7GB instead of 14GB for 7B models)
-            # Use low_cpu_mem_usage=True to avoid the 2x peak RAM spike during loading!
+            # IMPORTANT: Must use torch_dtype= (NOT dtype=) — from_pretrained silently ignores
+            # unknown kwargs, so passing dtype= causes the model to load in fp32 (2x RAM!) with no error.
+            # CPU: bfloat16 halves RAM (8GB for 4B model). float32 = 16GB = instant OOM on 16GB machines.
             dtype = torch.float16 if use_cuda else torch.bfloat16
-            if os.getenv("LLM_CPU_FORCE_FP32") == "1":
-                dtype = torch.float32
 
             kwargs = {
                 "trust_remote_code": False,
-                "low_cpu_mem_usage": True,
+                "low_cpu_mem_usage": True,  # Avoids 2x peak spike during weight loading.
             }
             if use_cuda:
                 kwargs["device_map"] = "auto"
@@ -115,39 +113,15 @@ class LLMScorer:
                 kwargs["device_map"] = None
             try:
                 return AutoModelForCausalLM.from_pretrained(
-                    model_path, dtype=dtype, **kwargs
+                    model_path, torch_dtype=dtype, **kwargs
                 )
-            except TypeError:
-                # Backward compatibility for older transformers versions
-                try:
-                    return AutoModelForCausalLM.from_pretrained(
-                        model_path, torch_dtype=dtype, **kwargs
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"Model online load failed ({exc}). Retrying with local cache only."
-                    )
-                    return AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        local_files_only=True,
-                        **kwargs,
-                    )
             except Exception as exc:
                 logger.warning(
-                    f"Model online load failed ({exc}). Retrying with local cache only."
+                    f"Model load failed ({exc}). Retrying with local cache only."
                 )
-                try:
-                    return AutoModelForCausalLM.from_pretrained(
-                        model_path, dtype=dtype, local_files_only=True, **kwargs
-                    )
-                except TypeError:
-                    return AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        torch_dtype=dtype,
-                        local_files_only=True,
-                        **kwargs,
-                    )
+                return AutoModelForCausalLM.from_pretrained(
+                    model_path, torch_dtype=dtype, local_files_only=True, **kwargs
+                )
 
         def _strip_accelerate_offload_state(model) -> None:
             """
@@ -218,6 +192,10 @@ class LLMScorer:
                     )
                 else:
                     raise
+            if not use_cuda:
+                # Strip any accelerate offload hooks that PeftModel may have attached.
+                # These prevent proper CPU inference and cause .to('cpu') to re-allocate tensors.
+                _strip_accelerate_offload_state(self.model)
         else:
             logger.info(f"Loading standard model: {model_name}")
             resolved_model = _resolve_model_source(model_name)
@@ -225,7 +203,48 @@ class LLMScorer:
             self.model = _load_causal_lm(resolved_model)
 
         if not use_cuda:
-            self.model.to("cpu")
+            # Strategy: keep model in mmap'd bf16 (almost no RAM), add forward hooks that
+            # temporarily upcast each Linear to fp32 just for the matmul, then restore the
+            # original bf16 tensor.  Peak extra RAM ≈ 72MB (one fp32 layer), not 10GB+.
+            # This gives AVX2 fp32 speed while keeping model memory at near-zero.
+
+            def _pre_hook(module: torch.nn.Module, args: tuple) -> tuple:
+                if module.weight.dtype in (torch.float16, torch.bfloat16):
+                    # Keep the original (possibly mmap'd) bf16 tensor so we can restore it.
+                    module._weight_bf16 = module.weight.data
+                    module.weight.data = module._weight_bf16.to(torch.float32)
+                    if module.bias is not None:
+                        module._bias_bf16 = module.bias.data
+                        module.bias.data = module._bias_bf16.to(torch.float32)
+                # Upcast input so matmul stays fp32.
+                inp = (
+                    args[0].to(torch.float32)
+                    if args[0].dtype != torch.float32
+                    else args[0]
+                )
+                return (inp,) + args[1:]
+
+            def _post_hook(
+                module: torch.nn.Module, args: tuple, output: torch.Tensor
+            ) -> torch.Tensor:
+                if hasattr(module, "_weight_bf16"):
+                    module.weight.data = module._weight_bf16
+                    del module._weight_bf16
+                if hasattr(module, "_bias_bf16"):
+                    module.bias.data = module._bias_bf16
+                    del module._bias_bf16
+                return output
+
+            n_hooked = 0
+            for mod in self.model.modules():
+                if isinstance(mod, torch.nn.Linear):
+                    mod.register_forward_pre_hook(_pre_hook)
+                    mod.register_forward_hook(_post_hook)
+                    n_hooked += 1
+            logger.info(
+                f"CPU fp32-compute hooks registered on {n_hooked} Linear modules. "
+                "Weights stay bf16 in mmap; fp32 upcast happens per-layer during inference."
+            )
 
         import gc
 

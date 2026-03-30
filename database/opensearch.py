@@ -263,6 +263,13 @@ class OpenSearchKB:
             return []
 
         tokens = re.findall(r"\w+", normalized_query)
+        # Prevent "Query contains too many nested clauses; maxClauseCount is set to 1024"
+        # Each query can generate tokens * num_fields (4) clauses per multi_match block.
+        # With 3 multi_match query arrays, max limit should be <= 70 to stay under 1024.
+        if len(tokens) > 60:
+            tokens = tokens[:60]
+            normalized_query = " ".join(tokens)
+
         token_count = len(tokens)
         phrase_query = (
             normalized_query if token_count <= 32 else " ".join(tokens[:32]).strip()
@@ -385,18 +392,6 @@ class OpenSearchKB:
                 f"query_vector dim mismatch: got {len(query_vector)} expected {self.embedding_dim}"
             )
 
-        # kNN part
-        num_candidates = max(k * 8, 200)
-        knn_query: JsonDict = {
-            "knn": {
-                "embedding": {
-                    "vector": query_vector,
-                    "k": k,
-                    "num_candidates": num_candidates,
-                }
-            }
-        }
-        # filters
         filter_clauses = []
         if filters:
             if "term" in filters or "range" in filters or "bool" in filters:
@@ -413,36 +408,33 @@ class OpenSearchKB:
                 range_body["lte"] = max_timestamp
             filter_clauses.append({"range": {"timestamp": range_body}})
 
-        # If you need filtering with knn, typical approach is to wrap in bool.
-        # Some OpenSearch versions require knn at top-level query; others allow bool.
-        # We'll use bool wrapping (works in many DO-managed OpenSearch setups).
+        # OpenSearch embeddings were inserted without normalization
+        # So we must use script_score with exact cosinesimil instead of L2 HNSW algorithm
+        # which fails horribly on unnormalized vectors.
         body: JsonDict = {
             "size": k,
             "query": {
-                "bool": {
-                    "must": [knn_query],
-                    "filter": filter_clauses if filter_clauses else [],
+                "script_score": {
+                    "query": {
+                        "bool": {"filter": filter_clauses if filter_clauses else []}
+                    },
+                    "script": {
+                        "source": "knn_score",
+                        "lang": "knn",
+                        "params": {
+                            "field": "embedding",
+                            "query_value": query_vector,
+                            "space_type": "cosinesimil",
+                        },
+                    },
                 }
             },
         }
 
-        from opensearchpy.exceptions import RequestError
-
         try:
             resp = self.client.search(index=self.index, body=body)
-        except RequestError as exc:
-            # Older OpenSearch versions may not support `num_candidates`.
-            if "num_candidates" in str(exc).lower():
-                knn_query["knn"]["embedding"].pop("num_candidates", None)
-                resp = self.client.search(index=self.index, body=body)
-            else:
-                raise
-        except Exception as exc:
-            if "num_candidates" in str(exc).lower():
-                knn_query["knn"]["embedding"].pop("num_candidates", None)
-                resp = self.client.search(index=self.index, body=body)
-            else:
-                raise
+        except Exception:
+            raise
 
         hits = resp.get("hits", {}).get("hits", [])
         return [

@@ -104,11 +104,10 @@ def _is_verbatim_query(query: str) -> bool:
     token_count = len(_tokenize_for_overlap(normalized))
     if not normalized:
         return False
-    if "\n" in str(query):
+    # Only treat as verbatim whole-article dump if it's exceptionally long
+    if len(normalized) >= 1200:
         return True
-    if len(normalized) >= 120:
-        return True
-    return token_count >= 20
+    return token_count >= 200
 
 
 def _token_overlap_ratio(query_text: str, doc_text: str) -> float:
@@ -176,14 +175,15 @@ class OpenSearchHybridRetriever:
 
     def _get_search_pool_size(self, rrf_top_k: int) -> int:
         """
-        Match train-time "rank over all docs" behavior as closely as OpenSearch allows.
+        Fetch a sufficiently large pool for RRF ranking without fetching the entire DB.
+        During inference, fetching 10k full documents takes >100 seconds over HTTP.
         """
-        pool = max(rrf_top_k, 100)
+        pool = max(rrf_top_k * 5, 200)
         try:
             count = int(self.kb.client.count(index=self.kb.index).get("count", pool))
             if count > 0:
-                # OpenSearch default result window is usually 10k.
-                pool = min(count, 10000)
+                # Cap the inference search pool at 500 to keep retrieval < 2 seconds.
+                pool = min(count, max(rrf_top_k * 5, 500))
         except Exception as exc:
             pool = max(pool, 300)
             logger.warning(
@@ -202,7 +202,7 @@ class OpenSearchHybridRetriever:
 
     def _encode_query(self, query: str) -> List[float]:
         vector = self.encoder.encode(
-            [query], convert_to_numpy=True, normalize_embeddings=True
+            [query], convert_to_numpy=True, normalize_embeddings=False
         )[0]
         return vector.astype(np.float32).tolist()
 
@@ -663,6 +663,84 @@ class FusionClaimVerifier:
             evidence=llm_evidence,
         )
 
+    def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
+        t0 = perf_counter()
+        if not claims:
+            return []
+
+        now_utc = datetime.now(timezone.utc)
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] start predict_batch | batch_size={len(claims)} | now_utc={now_utc.isoformat()}"
+            )
+
+        all_retrieval_features = []
+        all_llm_evidences = []
+        valid_indices = []
+        valid_claims = []
+        results: List[Optional[ClaimPrediction]] = [None] * len(claims)
+
+        for i, claim in enumerate(claims):
+            text = str(claim).strip()
+            if not text:
+                continue
+
+            valid_indices.append(i)
+            valid_claims.append(text)
+
+            feat, retrieved_evidence, _ = _build_retrieval_features_train_compatible(
+                self.retriever, text, self.top_k
+            )
+            all_retrieval_features.append(feat)
+            all_llm_evidences.append(retrieved_evidence[: self.llm_evidence_top_k])
+
+        if not valid_claims:
+            return []
+
+        retrieval_features = torch.tensor(
+            np.stack(all_retrieval_features), dtype=torch.float32, device=self.device
+        )
+
+        with torch.inference_mode():
+            t_llm0 = perf_counter()
+            llm_logits = self.llm.score_logits(valid_claims, all_llm_evidences).to(
+                self.device
+            )
+            t_llm1 = perf_counter()
+
+            if self.debug:
+                logger.info(
+                    f"[fusion_inference] batch llm_done | elapsed_ms={1000.0 * (t_llm1 - t_llm0):.2f}"
+                )
+
+            retrieval_encoded = self.retrieval_encoder(retrieval_features)
+            fusion_output = self.fusion(llm_logits, retrieval_encoded)
+
+            probs_batch = fusion_output.final_probs
+            pred_ids = torch.argmax(probs_batch, dim=-1).cpu().numpy()
+            confidences = torch.max(probs_batch, dim=-1)[0].cpu().numpy()
+
+        for v_idx, text, llm_ev, pred_id, conf in zip(
+            valid_indices, valid_claims, all_llm_evidences, pred_ids, confidences
+        ):
+            pred_label = self.label_list[pred_id]
+            verdict = "Đúng" if pred_id == 0 else "Sai"
+            results[v_idx] = ClaimPrediction(
+                claim=text,
+                verdict=verdict,
+                label=pred_label,
+                label_id=int(pred_id),
+                confidence=float(conf),
+                evidence=llm_ev,
+            )
+
+        if self.debug:
+            logger.info(
+                f"[fusion_inference] batch done | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
+            )
+
+        return [r for r in results if r is not None]
+
 
 _VERIFIER_CACHE: Dict[str, FusionClaimVerifier] = {}
 
@@ -719,3 +797,67 @@ def verify_claim_true_false(
 
     prediction = verifier.predict(claim)
     return prediction.verdict
+
+
+def verify_claims_true_false(
+    claims: List[str],
+    fusion_model_path: str = "artifacts/fusion_model.pt",
+    opensearch_index: Optional[str] = None,
+    llm_model_path: Optional[str] = None,
+    retriever_model_path: Optional[str] = None,
+    device: Optional[str] = None,
+    use_cache: bool = True,
+    llm_evidence_top_k: Optional[int] = None,
+    debug: Optional[bool] = None,
+    batch_size: int = 4,
+) -> List[str]:
+    """
+    Batch convenience function requested:
+      input: list of claim texts
+      output: list of "Đúng" hoặc "Sai"
+    """
+    effective_debug = (
+        _env_flag("FUSION_INFERENCE_DEBUG", default=False)
+        if debug is None
+        else bool(debug)
+    )
+    cache_key = "|".join(
+        [
+            fusion_model_path,
+            opensearch_index or "",
+            llm_model_path or "",
+            retriever_model_path or "",
+            device or "",
+            str(llm_evidence_top_k or ""),
+            f"debug={int(effective_debug)}",
+        ]
+    )
+
+    verifier = None
+    if use_cache:
+        verifier = _VERIFIER_CACHE.get(cache_key)
+
+    if verifier is None:
+        verifier = FusionClaimVerifier(
+            fusion_model_path=fusion_model_path,
+            opensearch_index=opensearch_index,
+            llm_model_path=llm_model_path,
+            retriever_model_path=retriever_model_path,
+            device=device,
+            llm_evidence_top_k=llm_evidence_top_k,
+            debug=effective_debug,
+        )
+        if use_cache:
+            _VERIFIER_CACHE[cache_key] = verifier
+
+    all_verdicts = []
+    for i in range(0, len(claims), batch_size):
+        if effective_debug:
+            logger.info(
+                f"[verify_claims_true_false] Processing batch {i // batch_size + 1} (size: {min(batch_size, len(claims) - i)})"
+            )
+        batch_claims = claims[i : i + batch_size]
+        predictions = verifier.predict_batch(batch_claims)
+        all_verdicts.extend([p.verdict for p in predictions])
+
+    return all_verdicts
