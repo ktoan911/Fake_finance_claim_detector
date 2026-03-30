@@ -8,11 +8,12 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+import torch
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparser
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 
 from database.opensearch import OpenSearchKB
 
@@ -74,6 +75,301 @@ URLS_TO_CRAWL = [
 ]
 
 
+STATIC_FILE_EXTENSIONS = {
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".zip",
+    ".rar",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".mp4",
+    ".mp3",
+}
+BLOCKED_URL_HINTS = [
+    "/lien-he",
+    "/gioi-thieu",
+    "/about",
+    "/careers",
+    "/tuyen-dung",
+    "/privacy",
+    "/dieu-khoan",
+    "/tag/",
+    "/video/",
+    "/podcast/",
+    "/rss",
+    "/search",
+]
+ARTICLE_URL_HINTS = [
+    "tin",
+    "news",
+    "article",
+    "chi-tiet",
+    "su-kien",
+    "ngan-hang",
+    "tai-chinh",
+    "kinh-doanh",
+]
+BLOCKED_CONTENT_HINTS = [
+    "access denied",
+    "forbidden",
+    "just a moment",
+    "captcha",
+    "cloudflare",
+    "verify you are human",
+]
+
+
+def normalize_domain(netloc: str) -> str:
+    """Chuẩn hóa domain để so sánh ổn định giữa www/non-www."""
+    host = netloc.split("@")[-1].split(":")[0].lower().strip()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_same_domain(base_netloc: str, candidate_netloc: str) -> bool:
+    base_host = normalize_domain(base_netloc)
+    candidate_host = normalize_domain(candidate_netloc)
+    if not base_host or not candidate_host:
+        return False
+    return candidate_host == base_host or candidate_host.endswith(f".{base_host}")
+
+
+def normalize_article_url(raw_url: str) -> str:
+    """Chuẩn hóa URL bài viết để giảm trùng lặp do fragment."""
+    parsed = urlparse(raw_url)
+    cleaned = parsed._replace(fragment="")
+    return cleaned.geturl()
+
+
+def should_skip_href(href: str) -> bool:
+    href_lower = href.lower().strip()
+    if not href_lower:
+        return True
+    return href_lower.startswith(("mailto:", "tel:", "#"))
+
+
+def extract_link_candidates(link, base_url: str) -> list[str]:
+    """Lấy các URL tiềm năng từ href/data-attrs/onclick."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw_url: str):
+        if not raw_url:
+            return
+        raw = raw_url.strip()
+        if not raw:
+            return
+        raw_lower = raw.lower()
+        if raw_lower.startswith(("mailto:", "tel:", "#")):
+            return
+        if raw.startswith("//"):
+            raw = f"https:{raw}"
+
+        full_url = normalize_article_url(urljoin(base_url, raw))
+        parsed = urlparse(full_url)
+        if parsed.scheme not in ("http", "https"):
+            return
+        if full_url in seen:
+            return
+        seen.add(full_url)
+        candidates.append(full_url)
+
+    href = link.get("href", "")
+    if href and not href.lower().strip().startswith("javascript:"):
+        _add(href)
+
+    for attr in ("data-href", "data-url", "data-link", "data-redirect-url"):
+        _add(link.get(attr, ""))
+
+    inline_scripts = [link.get("onclick", ""), link.get("href", "")]
+    for script_text in inline_scripts:
+        if not script_text:
+            continue
+        for match in re.findall(r"""['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""", script_text):
+            _add(match)
+
+    return candidates
+
+
+def looks_like_article_url(full_url: str, title: str) -> bool:
+    parsed = urlparse(full_url)
+    path = parsed.path.lower()
+    full_url_lower = full_url.lower()
+
+    if not path or path == "/":
+        return False
+    if any(path.endswith(ext) for ext in STATIC_FILE_EXTENSIONS):
+        return False
+    if any(hint in full_url_lower for hint in BLOCKED_URL_HINTS):
+        return False
+
+    score = 0
+    if re.search(r"(?:^|[/-])20\d{2}(?:[/-]|$)", full_url_lower):
+        score += 2
+    if path.endswith((".html", ".htm", ".chn", ".aspx", ".cms")):
+        score += 2
+    if any(hint in full_url_lower for hint in ARTICLE_URL_HINTS):
+        score += 1
+    if path.count("/") >= 2:
+        score += 1
+    if len(title) >= 20:
+        score += 1
+
+    return score >= 2
+
+
+def parse_published_at(soup: BeautifulSoup) -> str | None:
+    published_at = None
+    meta_pub = (
+        soup.find("meta", attrs={"property": "article:published_time"})
+        or soup.find("meta", attrs={"name": "article:published_time"})
+        or soup.find("meta", attrs={"name": "pubdate"})
+        or soup.find("meta", attrs={"name": "publishdate"})
+        or soup.find("meta", attrs={"property": "og:published_time"})
+    )
+    if meta_pub and meta_pub.get("content"):
+        published_at = meta_pub["content"].strip()
+    else:
+        scripts = soup.find_all(
+            "script",
+            attrs={"type": re.compile(r"application/ld\+json", re.I)},
+        )
+        for sc in scripts:
+            try:
+                raw = sc.string if sc.string else sc.get_text(strip=False)
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            nodes = data if isinstance(data, list) else [data]
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("datePublished"):
+                    published_at = node["datePublished"]
+                    break
+                graph = node.get("@graph")
+                if isinstance(graph, list):
+                    for g in graph:
+                        if isinstance(g, dict) and g.get("datePublished"):
+                            published_at = g["datePublished"]
+                            break
+                if published_at:
+                    break
+            if published_at:
+                break
+
+    if not published_at:
+        return None
+
+    try:
+        dt = dtparser.parse(published_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return published_at
+
+
+def extract_article_text(soup: BeautifulSoup) -> str:
+    """Ưu tiên vùng article/content; fallback toàn trang nếu cần."""
+    for tag in soup(
+        ["script", "style", "noscript", "iframe", "header", "footer", "nav", "form"]
+    ):
+        tag.decompose()
+
+    selectors = [
+        "article",
+        "[itemprop='articleBody']",
+        ".article-content",
+        ".article__body",
+        ".news-content",
+        ".news-detail",
+        ".detail-content",
+        ".content-detail",
+        ".entry-content",
+        ".fck_detail",
+        ".ck-content",
+        ".td-post-content",
+        ".detail__content",
+        ".main-detail-body",
+        ".box-content-detail",
+        ".article-body",
+        "main",
+    ]
+
+    candidate = None
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node:
+            candidate = node
+            break
+
+    if candidate is None:
+        best_len = 0
+        for node in soup.find_all(["article", "section", "main", "div"], limit=500):
+            paras = node.find_all("p")
+            if len(paras) < 2:
+                continue
+            total_len = sum(len(p.get_text(" ", strip=True)) for p in paras)
+            if total_len > best_len:
+                best_len = total_len
+                candidate = node
+
+    scope = candidate if candidate is not None else soup
+    raw_lines = [
+        p.get_text(" ", strip=True)
+        for p in scope.find_all(["p", "li", "h2", "h3"])
+        if p.get_text(" ", strip=True)
+    ]
+    cleaned_lines = [line for line in raw_lines if len(line) >= 20]
+    content = "\n".join(cleaned_lines)
+
+    if len(content) >= 120:
+        return content
+
+    fallback_lines = [
+        line.strip()
+        for line in scope.get_text("\n", strip=True).splitlines()
+        if len(line.strip()) >= 40
+    ]
+    return "\n".join(fallback_lines[:200])
+
+
+def parse_article_html(html: str) -> tuple[str, str | None]:
+    soup = BeautifulSoup(html, "html.parser")
+    content = extract_article_text(soup)
+    content_lower = content.lower()
+    if any(hint in content_lower for hint in BLOCKED_CONTENT_HINTS) and len(content) < 2500:
+        content = ""
+    published_at = parse_published_at(soup)
+    return content, published_at
+
+
+def build_url_variants(url: str) -> list[str]:
+    """Sinh biến thể www/non-www để tăng tỷ lệ truy cập thành công."""
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return [url]
+    variants = [url]
+    host = parsed.netloc
+    if host.startswith("www."):
+        alt_host = host[4:]
+    else:
+        alt_host = f"www.{host}"
+    if alt_host != host:
+        variants.append(parsed._replace(netloc=alt_host).geturl())
+    return variants
+
+
 async def extract_links_and_data(page, url):
     """Trích xuất các liên kết bài viết và dữ liệu cơ bản từ trang chuyên mục."""
     try:
@@ -84,9 +380,11 @@ async def extract_links_and_data(page, url):
         links = []
 
         # Tiên quyết tìm thẻ bài báo hoặc các thẻ bao bọc (tránh menu, footer, v.v)
-        containers = soup.find_all(["article"])
+        containers = soup.find_all(["article", "section"])
         if not containers:
-            containers = soup.select("h2, h3, h4, div.news-item, li.news-item")
+            containers = soup.select(
+                "h1, h2, h3, h4, div.news-item, li.news-item, div.post-item, div.item-news, .list-news"
+            )
 
         if containers:
             for c in containers:
@@ -99,45 +397,66 @@ async def extract_links_and_data(page, url):
         seen_urls = set()
         base_domain = urlparse(url).netloc
 
-        valid_keywords = [
-            "tin",
-            "news",
-            "article",
-            "202",
-            "ngan-hang",
-            ".html",
-            "-",
-            "chi-tiet",
-            "su-kien",
-            "tai-chinh",
-        ]
-
         for link in links:
-            href = link["href"]
-            text = link.get_text(strip=True)
+            text = re.sub(r"\s+", " ", link.get_text(strip=True))
+            if not text:
+                text = re.sub(r"\s+", " ", link.get("title", "").strip())
 
             # Lọc các link rỗng hoặc quá ngắn
-            if not href or len(text) < 15:
+            if len(text) < 8:
                 continue
 
-            full_url = urljoin(url, href)
+            candidate_urls = extract_link_candidates(link, url)
+            for full_url in candidate_urls:
+                parsed = urlparse(full_url)
 
-            # 1. Lọc bằng domain: loại bỏ link trỏ ra ngoài
-            if urlparse(full_url).netloc != base_domain:
-                continue
+                # 1. Lọc bằng domain: loại bỏ link trỏ ra ngoài
+                if not is_same_domain(base_domain, parsed.netloc):
+                    continue
 
-            # 2. Lọc link rác (không có chứa keyword liên quan tin tức)
-            full_url_lower = full_url.lower()
-            if not any(word in full_url_lower for word in valid_keywords):
-                continue
+                # 2. Lọc link rác bằng heuristic (ưu tiên link giống bài viết)
+                if not looks_like_article_url(full_url, text):
+                    continue
 
-            if full_url in seen_urls:
-                continue
-            seen_urls.add(full_url)
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
 
-            articles_data.append(
-                {"source_url": url, "article_url": full_url, "title": text}
-            )
+                articles_data.append(
+                    {"source_url": url, "article_url": full_url, "title": text}
+                )
+
+        # Fallback nới lỏng: nếu heuristic chưa bắt được link bài, lấy link nội bộ có title đủ dài
+        if not articles_data:
+            for link in links:
+                text = re.sub(r"\s+", " ", link.get_text(strip=True))
+                if not text:
+                    text = re.sub(r"\s+", " ", link.get("title", "").strip())
+                if len(text) < 12:
+                    continue
+
+                candidate_urls = extract_link_candidates(link, url)
+                for full_url in candidate_urls:
+                    parsed = urlparse(full_url)
+                    if not is_same_domain(base_domain, parsed.netloc):
+                        continue
+                    if any(
+                        parsed.path.lower().endswith(ext)
+                        for ext in STATIC_FILE_EXTENSIONS
+                    ):
+                        continue
+                    if any(hint in full_url.lower() for hint in BLOCKED_URL_HINTS):
+                        continue
+                    if full_url in seen_urls:
+                        continue
+                    seen_urls.add(full_url)
+                    articles_data.append(
+                        {"source_url": url, "article_url": full_url, "title": text}
+                    )
+                    if len(articles_data) >= 60:
+                        break
+                if len(articles_data) >= 60:
+                    break
 
         return articles_data
     except Exception as e:
@@ -163,29 +482,49 @@ async def process_url(context, url, semaphore, results):
                 ),
             )
 
-            # Cố gắng đi tới URL và bắt toàn bộ ngoại lệ (Kể cả Timeout)
-            try:
-                response = await page.goto(
-                    url, wait_until="domcontentloaded", timeout=45000
-                )
-                if response and response.status >= 400:
-                    logging.warning(f"Lỗi HTTP {response.status} khi truy cập {url}")
-                    # Đối với HTTP 403/406, trang vẫn có thể trả về thông báo lỗi dạng HTML, ta dừng tại đây
-                    return
-            except Exception as nav_err:
-                err_str = str(nav_err)
-                if "Timeout" in err_str:
-                    logging.warning(
-                        f"Timeout 45s tại {url}. Bỏ qua chờ thêm, bắt đầu bóc tách HTML hiện có..."
+            # Cố gắng đi tới URL; nếu lỗi DNS thì thử biến thể www/non-www
+            response = None
+            last_error = None
+            reached_url = url
+            timeout_fallback = False
+            for candidate_url in build_url_variants(url):
+                response = None
+                try:
+                    response = await page.goto(
+                        candidate_url, wait_until="domcontentloaded", timeout=45000
                     )
-                elif "ERR_NAME_NOT_RESOLVED" in err_str:
+                    reached_url = candidate_url
+                    if response and response.status >= 400:
+                        logging.warning(
+                            f"Lỗi HTTP {response.status} khi truy cập {candidate_url}"
+                        )
+                        continue
+                    break
+                except Exception as nav_err:
+                    last_error = nav_err
+                    err_str = str(nav_err)
+                    if "Timeout" in err_str:
+                        logging.warning(
+                            f"Timeout 45s tại {candidate_url}. Bỏ qua chờ thêm, bắt đầu bóc tách HTML hiện có..."
+                        )
+                        reached_url = candidate_url
+                        timeout_fallback = True
+                        break
+                    logging.warning(f"Lỗi khi truy cập {candidate_url}: {err_str}")
+                    continue
+
+            if response is None and last_error is not None and not timeout_fallback:
+                err_str = str(last_error)
+                if "ERR_NAME_NOT_RESOLVED" in err_str:
                     logging.warning(
                         f"Không thể phân giải tên miền (Web sập hoặc sai URL): {url}"
                     )
-                    return
                 else:
                     logging.error(f"Lỗi mạng khi điều hướng đến {url}: {err_str}")
-                    return
+                return
+            if response is not None and response.status >= 400:
+                # Tất cả biến thể URL đều trả mã lỗi HTTP.
+                return
 
             # Chờ để load các trang render bằng JS (VD: vietcombank load bằng API)
             # Chờ một lúc để các trang SPA (React/Vue/API) kịp gọi XMLHttpRequest và render HTML ra cây DOM
@@ -199,8 +538,12 @@ async def process_url(context, url, semaphore, results):
                 pass  # Bỏ qua nếu cuộn trang lỗi
 
             # Trích xuất dữ liệu
-            extracted_data = await extract_links_and_data(page, url)
+            effective_url = page.url if page.url else reached_url
+            extracted_data = await extract_links_and_data(page, effective_url)
             if extracted_data:
+                for item in extracted_data:
+                    # Giữ nguồn gốc là URL gốc user khai báo để báo cáo cuối kỳ.
+                    item["source_url"] = url
                 results.extend(extracted_data)
                 logging.info(
                     f"Đã tìm thấy {len(extracted_data)} liên kết tiềm năng từ {url}"
@@ -216,90 +559,85 @@ async def process_url(context, url, semaphore, results):
 
 
 async def fetch_article_content(session, item, semaphore):
-    """Lấy nội dung chi tiết bài viết bỏ qua lỗi chứng chỉ."""
+    """Lấy nội dung chi tiết bài viết, có retry 3 lần khi bị lỗi mạng."""
     async with semaphore:
+        candidate_urls = build_url_variants(item["article_url"])
+        for candidate_url in candidate_urls:
+            for attempt in range(3):  # retry 3 lần mỗi candidate
+                try:
+                    async with session.get(candidate_url, timeout=15) as response:
+                        if response.status == 200:
+                            html = await response.text(errors="ignore")
+                            content, published_at = parse_article_html(html)
+                            if content:
+                                item["content"] = content
+                                item["published_at"] = published_at
+                                item["article_url"] = normalize_article_url(str(response.url))
+                                return
+                        elif response.status in (403, 406, 429):
+                            break
+                        else:
+                            await asyncio.sleep(0.2)
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                    else:
+                        logging.debug(
+                            f"Lỗi lấy nội dung bằng aiohttp ({candidate_url}): {e}"
+                        )
+
+        item["content"] = ""
+        item["published_at"] = None
+
+
+async def fetch_article_content_playwright(context, item, semaphore):
+    """Fallback lấy nội dung bằng Playwright cho các URL bị chặn/JS-render."""
+    async with semaphore:
+        page = None
         try:
-            async with session.get(item["article_url"], timeout=15) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
+            page = await context.new_page()
+            await page.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in ["image", "font", "media"]
+                    else route.continue_()
+                ),
+            )
+            for candidate_url in build_url_variants(item["article_url"]):
+                response = await page.goto(
+                    candidate_url, wait_until="domcontentloaded", timeout=45000
+                )
+                if response and response.status >= 400:
+                    continue
 
-                    # Tìm thẻ chứa nội dung chính
-                    article = soup.find("article")
-                    if not article:
-                        article = soup.find(
-                            "div",
-                            class_=lambda c: (
-                                c and ("content" in c.lower() or "detail" in c.lower())
-                            ),
-                        )
-                    if not article:
-                        article = soup
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
 
-                    paragraphs = article.find_all("p")
-                    raw_text = [p.get_text(strip=True) for p in paragraphs]
-                    # Lọc các đoạn quá ngắn
-                    content = "\n".join([text for text in raw_text if len(text) > 30])
+                await asyncio.sleep(1.5)
+                try:
+                    await page.evaluate("window.scrollBy(0, 1400)")
+                    await asyncio.sleep(1)
+                except Exception:
+                    pass
+
+                html = await page.content()
+                content, published_at = parse_article_html(html)
+                if content:
                     item["content"] = content
-
-                    # Trích xuất published_at
-                    published_at = None
-                    meta_pub = (
-                        soup.find("meta", attrs={"property": "article:published_time"})
-                        or soup.find("meta", attrs={"name": "article:published_time"})
-                        or soup.find("meta", attrs={"name": "pubdate"})
-                    )
-
-                    if meta_pub and meta_pub.get("content"):
-                        published_at = meta_pub["content"].strip()
-                    else:
-                        scripts = soup.find_all(
-                            "script",
-                            attrs={"type": re.compile(r"application/ld\+json", re.I)},
-                        )
-                        for sc in scripts:
-                            try:
-                                data = json.loads(
-                                    sc.string if sc.string else sc.get_text(strip=False)
-                                )
-                                if isinstance(data, dict):
-                                    if "datePublished" in data:
-                                        published_at = data["datePublished"]
-                                        break
-                                    if "@graph" in data and isinstance(
-                                        data["@graph"], list
-                                    ):
-                                        for g in data["@graph"]:
-                                            if (
-                                                isinstance(g, dict)
-                                                and "datePublished" in g
-                                            ):
-                                                published_at = g["datePublished"]
-                                                break
-                                if published_at:
-                                    break
-                            except Exception:
-                                pass
-
-                    if published_at:
-                        try:
-                            dt = dtparser.parse(published_at)
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            item["published_at"] = dt.astimezone(
-                                timezone.utc
-                            ).isoformat()
-                        except Exception:
-                            item["published_at"] = published_at
-                    else:
-                        item["published_at"] = None
-
-                else:
-                    item["content"] = ""
-                    item["published_at"] = None
-        except Exception:
-            item["content"] = ""
-            item["published_at"] = None
+                    if not item.get("published_at"):
+                        item["published_at"] = published_at
+                    item["article_url"] = normalize_article_url(page.url or candidate_url)
+                    return
+        except Exception as e:
+            logging.debug(
+                f"Fallback Playwright thất bại cho {item.get('article_url')}: {e}"
+            )
+        finally:
+            if page:
+                await page.close()
 
 
 async def main(args):
@@ -355,28 +693,46 @@ async def main(args):
         tasks = [process_url(context, url, semaphore, results) for url in URLS_TO_CRAWL]
         await asyncio.gather(*tasks)
 
+        if results:
+            logging.info(
+                f"Đã thu thập {len(results)} liên kết. Bắt đầu tải nội dung bài viết..."
+            )
+            content_semaphore = asyncio.Semaphore(15)
+            connector = aiohttp.TCPConnector(ssl=False)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://www.google.com/",
+            }
+            async with aiohttp.ClientSession(
+                connector=connector, headers=headers
+            ) as session:
+                fetch_tasks = [
+                    fetch_article_content(session, item, content_semaphore)
+                    for item in results
+                ]
+                await asyncio.gather(*fetch_tasks)
+
+            missing_items = [
+                item
+                for item in results
+                if not item.get("content", "").strip()
+            ]
+            if missing_items:
+                logging.info(
+                    f"Còn {len(missing_items)} bài chưa có nội dung sau aiohttp. Thử fallback bằng Playwright..."
+                )
+                fallback_semaphore = asyncio.Semaphore(4)
+                fallback_tasks = [
+                    fetch_article_content_playwright(context, item, fallback_semaphore)
+                    for item in missing_items
+                ]
+                await asyncio.gather(*fallback_tasks)
+
         await context.close()
         await browser.close()
 
-    if results:
-        logging.info(
-            f"Đã thu thập {len(results)} liên kết. Bắt đầu tải nội dung bài viết..."
-        )
-        content_semaphore = asyncio.Semaphore(15)
-        connector = aiohttp.TCPConnector(ssl=False)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-        async with aiohttp.ClientSession(
-            connector=connector, headers=headers
-        ) as session:
-            fetch_tasks = [
-                fetch_article_content(session, item, content_semaphore)
-                for item in results
-            ]
-            await asyncio.gather(*fetch_tasks)
-
-    # Lọc bài viết
     valid_results = []
     cutoff_time = None
     if args.timestamp:
@@ -384,7 +740,7 @@ async def main(args):
 
     filtered_by_time = 0
     for item in results:
-        if not item.get("content") or len(item["content"]) <= 10:
+        if not item.get("content", "").strip():
             continue
 
         if cutoff_time and item.get("published_at"):
@@ -400,13 +756,63 @@ async def main(args):
 
         valid_results.append(item)
 
+    # Fix (4): Deduplicate theo article_url (nhiều nguồn có thể trỏ cùng bài)
+    seen_article_urls: set[str] = set()
+    deduped_results = []
+    for item in valid_results:
+        url = item.get("article_url", "")
+        if url not in seen_article_urls:
+            seen_article_urls.add(url)
+            deduped_results.append(item)
+    if len(deduped_results) < len(valid_results):
+        logging.info(
+            f"Đã loại bỏ {len(valid_results) - len(deduped_results)} bài viết trùng article_url."
+        )
+    valid_results = deduped_results
+
     logging.info(
-        f"Đã lọc bỏ {len(results) - len(valid_results) - filtered_by_time} bài viết không có nội dung hoặc quá ngắn."
+        f"Đã lọc bỏ {len(results) - len(valid_results) - filtered_by_time} bài viết không có nội dung."
     )
     if args.timestamp:
         logging.info(
             f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()}."
         )
+
+    # --- Thống kê số bài có nội dung hợp lệ theo từng nguồn ---
+    source_content_counts = {source_url: 0 for source_url in URLS_TO_CRAWL}
+    for item in valid_results:
+        src = item.get("source_url")
+        if not src:
+            continue
+        source_content_counts[src] = source_content_counts.get(src, 0) + 1
+
+    logging.info("[THỐNG KÊ NGUỒN] Số bài có nội dung hợp lệ theo từng nguồn:")
+    for source_url in URLS_TO_CRAWL:
+        logging.info(f"  - {source_url}: {source_content_counts.get(source_url, 0)} bài")
+
+    # --- Báo cáo nguồn không cào được bài viết nào ---
+    sources_with_links = {item["source_url"] for item in results}
+    sources_with_content = {item["source_url"] for item in valid_results}
+
+    no_links = [u for u in URLS_TO_CRAWL if u not in sources_with_links]
+    links_but_no_content = [
+        u
+        for u in URLS_TO_CRAWL
+        if u in sources_with_links and u not in sources_with_content
+    ]
+
+    if no_links:
+        logging.warning(
+            f"[NGUỒN TRẮNG - không tìm được link nào] ({len(no_links)} nguồn):\n"
+            + "\n".join(f"  - {u}" for u in no_links)
+        )
+    if links_but_no_content:
+        logging.warning(
+            f"[NGUỒN RỖNG - có link nhưng không có nội dung hợp lệ] ({len(links_but_no_content)} nguồn):\n"
+            + "\n".join(f"  - {u}" for u in links_but_no_content)
+        )
+    if not no_links and not links_but_no_content:
+        logging.info("Tất cả nguồn đều cào được ít nhất 1 bài viết hợp lệ.")
 
     # --- Xử lý dữ liệu định kỳ theo batch ---
     batch_size = args.batch_size
@@ -416,89 +822,188 @@ async def main(args):
         embedding_dim=int(os.getenv("RETRIEVER_EMBEDDING_DIM")),
     )
 
+    # ---------------------------------------------------------------------------
+    # Late Chunking helpers
+    # ---------------------------------------------------------------------------
+    def _split_sentences(text: str, chunk_size: int = 200) -> list[str]:
+        """Tách văn bản thành các câu, gộp câu ngắn lại cho đến khi đủ chunk_size."""
+        # Fix (6): Không tách sau viết tắt dạng "TP.", "TS.", "PGS.", "GS.", v.v.
+        sentences = [
+            s.strip()
+            for s in re.split(
+                r"(?<!\b[A-ZĐÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÉÈẺẼẸÊẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÚÙỦŨỤƯỨỪỬỮỰÝỲỶỸỴ][.])(?<=[.!?])\s+",
+                text,
+            )
+            if s.strip()
+        ]
+        if not sentences:
+            return [text]
+        chunks, current = [], ""
+        for sent in sentences:
+            if not current:
+                current = sent
+                if len(current) >= chunk_size:
+                    chunks.append(current)
+                    current = ""
+                continue
+            candidate = f"{current} {sent}"
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                chunks.append(current)
+                current = sent
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def late_chunk_embed(
+        tokenizer,
+        model,
+        full_text: str,
+        chunk_texts: list[str],
+        max_length: int = 2048,
+    ) -> list[list[float]]:
+        probe = tokenizer(
+            full_text,
+            return_tensors="pt",
+            truncation=False,
+            return_offsets_mapping=False,
+        )
+        n_tokens = probe["input_ids"].shape[1]
+
+        # Fix (1): fallback nếu vượt max_length
+        if n_tokens >= max_length:
+            logging.warning(
+                f"Text quá dài ({n_tokens} tokens >= {max_length}), fallback sang encode từng chunk."
+            )
+            fallback = []
+            for c in chunk_texts:
+                enc = tokenizer(
+                    c, return_tensors="pt", truncation=True, max_length=max_length
+                )
+                with torch.no_grad():
+                    out = model(**enc)
+                emb = out.last_hidden_state.mean(dim=1)[0]
+                fallback.append(emb.tolist())
+            return fallback
+
+        # Tokenize full document với offset_mapping
+        full_enc = tokenizer(
+            full_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            return_offsets_mapping=True,
+        )
+        offset_mapping = full_enc.pop("offset_mapping")[0]  # (T, 2)
+
+        with torch.no_grad():
+            output = model(**full_enc)
+        # token_embeddings: (1, T, H) → (T, H)
+        token_embeddings = output.last_hidden_state[0]
+        hidden_size = token_embeddings.shape[-1]
+
+        # Xác định vị trí char của từng chunk trong full_text
+        chunk_embeddings = []
+        search_start = 0
+        for chunk in chunk_texts:
+            char_start = full_text.find(chunk, search_start)
+            if char_start == -1:
+                chunk_embeddings.append([0.0] * hidden_size)
+                continue
+            char_end = char_start + len(chunk)
+            search_start = char_end
+
+            # Fix (2): dùng overlap condition thay vì strict containment
+            token_mask = [
+                (s < char_end and e > char_start) for s, e in offset_mapping.tolist()
+            ]
+            if not any(token_mask):
+                chunk_embeddings.append([0.0] * hidden_size)
+                continue
+
+            # Mean-pool các token trong span
+            indices = torch.tensor(
+                [i for i, m in enumerate(token_mask) if m], dtype=torch.long
+            )
+            span_emb = token_embeddings[indices].mean(dim=0)
+            chunk_embeddings.append(span_emb.tolist())
+
+        return chunk_embeddings
+
+    # ---------------------------------------------------------------------------
     # Load model 1 lần để dùng chung cho các batch
-    logging.info("Đang khởi tạo model embedding trên CPU...")
+    # ---------------------------------------------------------------------------
+    logging.info("Đang khởi tạo model embedding trên CPU (late chunking)...")
+    tokenizer = None
+    model = None
     try:
         model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
-        encoder = SentenceTransformer(model_name, device="cpu")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+        model.eval()
+        logging.info(f"Đã tải model: {model_name}")
     except Exception as e:
         logging.error(f"Không thể tải model embedding: {e}")
-        encoder = None
 
     for i in range(0, len(valid_results), batch_size):
         batch_items = valid_results[i : i + batch_size]
         processed_batch = []
 
         for item in batch_items:
-            # Bước 0: Chuẩn hóa văn bản, xóa \n, \t, giữ lại chữ (loại bỏ khoảng trắng thừa)
-            title = item.get("title", "")
-            content = item.get("content", "")
-
-            title = re.sub(r"[\n\t\r]+", " ", title)
-            title = re.sub(r"\s+", " ", title).strip()
-
-            content = re.sub(r"[\n\t\r]+", " ", content)
-            content = re.sub(r"\s+", " ", content).strip()
+            # Bước 0: Chuẩn hóa văn bản
+            title = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("title", ""))
+            ).strip()
+            content = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("content", ""))
+            ).strip()
 
             if not content:
                 continue
 
-            # Bước 1: Chuẩn hóa độ dài content
-            content_chunks = []
-            if len(content) <= 200:
-                content_chunks.append(content)
+            # Bước 1: Xác định ranh giới chunk (câu / nhóm câu)
+            chunk_texts = _split_sentences(content) if len(content) > 200 else [content]
+
+            # Bước 2: Late chunking — tạo full_text để tokenize 1 lần
+            # Ghép title + content để ngữ cảnh title lan tỏa vào token embeddings
+            full_text = f"{title} {content}".strip() if title else content
+
+            # Bước 3: Tính late-chunk embeddings
+            if tokenizer is not None and model is not None:
+                try:
+                    chunk_embeddings = late_chunk_embed(
+                        tokenizer, model, full_text, chunk_texts
+                    )
+                except Exception as e:
+                    logging.error(f"Lỗi late_chunk_embed: {e}")
+                    chunk_embeddings = [[]] * len(chunk_texts)
             else:
-                # Tách câu dựa trên dấu . ! ?
-                sentences = [
-                    s.strip() for s in re.split(r"(?<=[.!?])\s+", content) if s.strip()
-                ]
-                if not sentences:
-                    content_chunks.append(content)
-                else:
-                    current = ""
-                    for sentence in sentences:
-                        if not current:
-                            current = sentence
-                            if len(current) >= 200:
-                                content_chunks.append(current)
-                                current = ""
-                            continue
+                chunk_embeddings = [[]] * len(chunk_texts)
 
-                        candidate = f"{current} {sentence}"
-                        if len(candidate) <= 200:
-                            current = candidate
-                        else:
-                            current = candidate
-                            content_chunks.append(current)
-                            current = ""
-
-                    if current:
-                        content_chunks.append(current)
-
-            # Bước 2: Cập nhật lại trường content: title + " " + content_đoạn
-            for chunk_idx, chunk in enumerate(content_chunks):
+            # Bước 4: Tạo document cho mỗi chunk
+            for chunk_idx, (chunk, emb) in enumerate(
+                zip(chunk_texts, chunk_embeddings)
+            ):
                 new_item = item.copy()
                 new_item["title"] = title
-                new_item["content"] = f"{title} {chunk}".strip()
+                new_item["content"] = f"{title} {chunk}".strip() if title else chunk
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
+                # Fix (5): chỉ gán embedding nếu dim khớp với kb.embedding_dim
+                if emb and len(emb) == kb.embedding_dim:
+                    new_item["embedding"] = emb
+                elif emb:
+                    logging.warning(
+                        f"Embedding dim sai: got {len(emb)}, expected {kb.embedding_dim}. Bỏ qua chunk."
+                    )
                 processed_batch.append(new_item)
-
-        # Tạo embedding cho cả batch mới xử lý xong
-        if processed_batch and encoder is not None:
-            try:
-                texts = [it["content"] for it in processed_batch]
-                embeddings = encoder.encode(texts)
-                for idx, r in enumerate(processed_batch):
-                    r["embedding"] = embeddings[idx].tolist()
-            except Exception as e:
-                logging.error(f"Lỗi khi block tạo embedding cho batch: {e}")
 
         kb.insert_many(processed_batch)
 
         processed_count += len(processed_batch)
         logging.info(
-            f"Đã xử lý và tạo mã nhúng xong batch có {len(processed_batch)} đoạn dữ liệu nhỏ."
+            f"Đã xử lý và tạo mã nhúng (late chunking) xong batch có {len(processed_batch)} đoạn."
         )
 
     logging.info(
