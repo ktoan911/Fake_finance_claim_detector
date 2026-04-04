@@ -1,6 +1,17 @@
-# Data files
+# Datasets & crawled data
 data/
-artifacts/
+results/
+
+# Model weights
+models/lora_llm/
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+*.pt
+*.pth
+*.bin
+*.safetensors
 
 # Python
 __pycache__/
@@ -12,6 +23,8 @@ __pycache__/
 venv/
 .venv/
 env/
+
+# Environment variables
 .env
 
 # IDE
@@ -23,13 +36,6 @@ env/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# Model files (large files)
-*.pt
-*.pth
-*.bin
-*.safetensors
-models/lora_llm/
-
 # Logs
 *.log
 
@@ -37,5 +43,5 @@ models/lora_llm/
 .DS_Store
 Thumbs.db
 
-#file 
+# Temp/test files
 test.py

@@ -4,7 +4,7 @@ from typing import Any, List, Optional
 
 from loguru import logger
 
-from .config import LABEL_LIST, PROMPT_TEMPLATE
+from src.config import LABEL_LIST, PROMPT_TEMPLATE
 
 try:
     import torch
