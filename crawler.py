@@ -193,7 +193,9 @@ def extract_link_candidates(link, base_url: str) -> list[str]:
     for script_text in inline_scripts:
         if not script_text:
             continue
-        for match in re.findall(r"""['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""", script_text):
+        for match in re.findall(
+            r"""['"]((?:https?:)?//[^'"]+|/[^'"]+)['"]""", script_text
+        ):
             _add(match)
 
     return candidates
@@ -348,7 +350,10 @@ def parse_article_html(html: str) -> tuple[str, str | None]:
     soup = BeautifulSoup(html, "html.parser")
     content = extract_article_text(soup)
     content_lower = content.lower()
-    if any(hint in content_lower for hint in BLOCKED_CONTENT_HINTS) and len(content) < 2500:
+    if (
+        any(hint in content_lower for hint in BLOCKED_CONTENT_HINTS)
+        and len(content) < 2500
+    ):
         content = ""
     published_at = parse_published_at(soup)
     return content, published_at
@@ -527,13 +532,13 @@ async def process_url(context, url, semaphore, results):
                 return
 
             # Chờ để load các trang render bằng JS (VD: vietcombank load bằng API)
-            # Chờ một lúc để các trang SPA (React/Vue/API) kịp gọi XMLHttpRequest và render HTML ra cây DOM
-            await asyncio.sleep(3)
+            # Giảm từ 3s → 1.5s; đủ cho hầu hết SPA render lần đầu
+            await asyncio.sleep(1.5)
 
             # Thử cuộn trang xuống để kích hoạt lazy-loading (Bọc trong try-except phòng khi trang bị treo JS)
             try:
                 await page.evaluate("window.scrollBy(0, 1000)")
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.5)
             except Exception:
                 pass  # Bỏ qua nếu cuộn trang lỗi
 
@@ -558,8 +563,12 @@ async def process_url(context, url, semaphore, results):
                 await page.close()
 
 
-async def fetch_article_content(session, item, semaphore):
-    """Lấy nội dung chi tiết bài viết, có retry 3 lần khi bị lỗi mạng."""
+async def fetch_article_content(session, item, semaphore, cutoff_time=None):
+    """Lấy nội dung chi tiết bài viết, có retry 3 lần khi bị lỗi mạng.
+
+    Nếu cutoff_time được truyền vào, bài viết có published_at trước cutoff_time
+    sẽ bị bỏ qua ngay lập tức (early-exit) mà không cần xử lý tiếp.
+    """
     async with semaphore:
         candidate_urls = build_url_variants(item["article_url"])
         for candidate_url in candidate_urls:
@@ -569,10 +578,27 @@ async def fetch_article_content(session, item, semaphore):
                         if response.status == 200:
                             html = await response.text(errors="ignore")
                             content, published_at = parse_article_html(html)
+
+                            # --- Early timestamp filter ---
+                            if cutoff_time and published_at:
+                                try:
+                                    pub_dt = dtparser.parse(published_at)
+                                    if pub_dt.tzinfo is None:
+                                        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                                    if pub_dt < cutoff_time:
+                                        item["content"] = ""
+                                        item["published_at"] = published_at
+                                        item["_skipped_old"] = True
+                                        return
+                                except Exception:
+                                    pass
+
                             if content:
                                 item["content"] = content
                                 item["published_at"] = published_at
-                                item["article_url"] = normalize_article_url(str(response.url))
+                                item["article_url"] = normalize_article_url(
+                                    str(response.url)
+                                )
                                 return
                         elif response.status in (403, 406, 429):
                             break
@@ -590,8 +616,12 @@ async def fetch_article_content(session, item, semaphore):
         item["published_at"] = None
 
 
-async def fetch_article_content_playwright(context, item, semaphore):
-    """Fallback lấy nội dung bằng Playwright cho các URL bị chặn/JS-render."""
+async def fetch_article_content_playwright(context, item, semaphore, cutoff_time=None):
+    """Fallback lấy nội dung bằng Playwright cho các URL bị chặn/JS-render.
+
+    Nếu cutoff_time được truyền vào, bài viết có published_at trước cutoff_time
+    sẽ bị bỏ qua ngay lập tức (early-exit).
+    """
     async with semaphore:
         page = None
         try:
@@ -616,20 +646,35 @@ async def fetch_article_content_playwright(context, item, semaphore):
                 except Exception:
                     pass
 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 try:
                     await page.evaluate("window.scrollBy(0, 1400)")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                 except Exception:
                     pass
 
                 html = await page.content()
                 content, published_at = parse_article_html(html)
+
+                # --- Early timestamp filter ---
+                if cutoff_time and published_at:
+                    try:
+                        pub_dt = dtparser.parse(published_at)
+                        if pub_dt.tzinfo is None:
+                            pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+                        if pub_dt < cutoff_time:
+                            item["_skipped_old"] = True
+                            return
+                    except Exception:
+                        pass
+
                 if content:
                     item["content"] = content
                     if not item.get("published_at"):
                         item["published_at"] = published_at
-                    item["article_url"] = normalize_article_url(page.url or candidate_url)
+                    item["article_url"] = normalize_article_url(
+                        page.url or candidate_url
+                    )
                     return
         except Exception as e:
             logging.debug(
@@ -642,8 +687,13 @@ async def fetch_article_content_playwright(context, item, semaphore):
 
 async def main(args):
     results = []
-    concurrency_limit = 5
+    concurrency_limit = 10  # tăng từ 5 → 10 để crawl danh sách nhanh hơn
     semaphore = asyncio.Semaphore(concurrency_limit)
+
+    # Tính cutoff_time sớm để truyền vào các hàm fetch (early-exit)
+    cutoff_time = None
+    if args.timestamp:
+        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=args.timestamp)
 
     logging.info("Bắt đầu quá trình cào dữ liệu...")
 
@@ -697,8 +747,8 @@ async def main(args):
             logging.info(
                 f"Đã thu thập {len(results)} liên kết. Bắt đầu tải nội dung bài viết..."
             )
-            content_semaphore = asyncio.Semaphore(15)
-            connector = aiohttp.TCPConnector(ssl=False)
+            content_semaphore = asyncio.Semaphore(30)  # tăng từ 15 → 30
+            connector = aiohttp.TCPConnector(ssl=False, limit=60)
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -709,23 +759,26 @@ async def main(args):
                 connector=connector, headers=headers
             ) as session:
                 fetch_tasks = [
-                    fetch_article_content(session, item, content_semaphore)
+                    fetch_article_content(session, item, content_semaphore, cutoff_time)
                     for item in results
                 ]
                 await asyncio.gather(*fetch_tasks)
 
+            # Bỏ qua bài đã bị đánh dấu _skipped_old (quá cũ) khỏi fallback Playwright
             missing_items = [
                 item
                 for item in results
-                if not item.get("content", "").strip()
+                if not item.get("content", "").strip() and not item.get("_skipped_old")
             ]
             if missing_items:
                 logging.info(
                     f"Còn {len(missing_items)} bài chưa có nội dung sau aiohttp. Thử fallback bằng Playwright..."
                 )
-                fallback_semaphore = asyncio.Semaphore(4)
+                fallback_semaphore = asyncio.Semaphore(6)  # tăng từ 4 → 6
                 fallback_tasks = [
-                    fetch_article_content_playwright(context, item, fallback_semaphore)
+                    fetch_article_content_playwright(
+                        context, item, fallback_semaphore, cutoff_time
+                    )
                     for item in missing_items
                 ]
                 await asyncio.gather(*fallback_tasks)
@@ -733,16 +786,17 @@ async def main(args):
         await context.close()
         await browser.close()
 
-    valid_results = []
-    cutoff_time = None
-    if args.timestamp:
-        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=args.timestamp)
-
+    # Lọc kết quả cuối: bỏ bài không có nội dung hoặc đã bị early-exit vì quá cũ
     filtered_by_time = 0
+    valid_results = []
     for item in results:
+        if item.get("_skipped_old"):
+            filtered_by_time += 1
+            continue
         if not item.get("content", "").strip():
             continue
 
+        # Safety net: lọc lại timestamp cho bài không có published_at lúc fetch
         if cutoff_time and item.get("published_at"):
             try:
                 pub_dt = dtparser.parse(item["published_at"])
@@ -775,7 +829,7 @@ async def main(args):
     )
     if args.timestamp:
         logging.info(
-            f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()}."
+            f"Đã lọc bỏ {filtered_by_time} bài viết đăng trước thời điểm {cutoff_time.isoformat()} (early-exit + safety net)."
         )
 
     # --- Thống kê số bài có nội dung hợp lệ theo từng nguồn ---
@@ -788,7 +842,9 @@ async def main(args):
 
     logging.info("[THỐNG KÊ NGUỒN] Số bài có nội dung hợp lệ theo từng nguồn:")
     for source_url in URLS_TO_CRAWL:
-        logging.info(f"  - {source_url}: {source_content_counts.get(source_url, 0)} bài")
+        logging.info(
+            f"  - {source_url}: {source_content_counts.get(source_url, 0)} bài"
+        )
 
     # --- Báo cáo nguồn không cào được bài viết nào ---
     sources_with_links = {item["source_url"] for item in results}
@@ -814,18 +870,68 @@ async def main(args):
     if not no_links and not links_but_no_content:
         logging.info("Tất cả nguồn đều cào được ít nhất 1 bài viết hợp lệ.")
 
+    # Giới hạn số bài xử lý nếu có --max-articles
+    if args.max_articles and len(valid_results) > args.max_articles:
+        logging.info(
+            f"Giới hạn xử lý: lấy {args.max_articles}/{len(valid_results)} bài (--max-articles)."
+        )
+        valid_results = valid_results[: args.max_articles]
+
     # --- Xử lý dữ liệu định kỳ theo batch ---
     batch_size = args.batch_size
     processed_count = 0
-    kb = OpenSearchKB(
-        index_name=os.getenv("OP_KB_NAME"),
-        embedding_dim=int(os.getenv("RETRIEVER_EMBEDDING_DIM")),
-    )
+
+    expected_dim = int(os.getenv("RETRIEVER_EMBEDDING_DIM", 768))
+    kb = None
+    all_json_results = []
+
+    if args.save_mode == "opensearch":
+        kb = OpenSearchKB(
+            index_name=os.getenv("OP_KB_NAME"),
+            embedding_dim=expected_dim,
+        )
+
+    # ---------------------------------------------------------------------------
+    # JSON mode: lưu thẳng text, KHÔNG load model embedding (tiết kiệm hàng tiếng)
+    # ---------------------------------------------------------------------------
+    if args.save_mode == "json":
+        logging.info(
+            f"save_mode=json: Bỏ qua bước embedding. Lưu {len(valid_results)} bài thô..."
+        )
+        output_file = "crawler_output.json"
+        json_out = []
+        for item in valid_results:
+            title = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("title", ""))
+            ).strip()
+            content = re.sub(
+                r"\s+", " ", re.sub(r"[\n\t\r]+", " ", item.get("content", ""))
+            ).strip()
+            if not content:
+                continue
+            chunk_id_raw = item.get("article_url", "") + "_0"
+            # Nếu không parse được ngày đăng, dùng thời điểm cào làm fallback
+            pub_at = item.get("published_at") or datetime.now(timezone.utc).isoformat()
+            json_out.append(
+                {
+                    "id": hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest(),
+                    "title": title,
+                    "content": content,
+                    "article_url": item.get("article_url", ""),
+                    "source_url": item.get("source_url", ""),
+                    "published_at": pub_at,
+                }
+            )
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(json_out, f, ensure_ascii=False, indent=2)
+        logging.info(f"Đã lưu {len(json_out)} bài vào {output_file}.")
+        logging.info(f"Hoàn thành! Tổng cộng {len(json_out)} bài hợp lệ.")
+        return
 
     # ---------------------------------------------------------------------------
     # Late Chunking helpers
     # ---------------------------------------------------------------------------
-    def _split_sentences(text: str, chunk_size: int = 200) -> list[str]:
+    def _split_sentences(text: str, chunk_size: int = 1500) -> list[str]:
         """Tách văn bản thành các câu, gộp câu ngắn lại cho đến khi đủ chunk_size."""
         # Fix (6): Không tách sau viết tắt dạng "TP.", "TS.", "PGS.", "GS.", v.v.
         sentences = [
@@ -963,7 +1069,9 @@ async def main(args):
                 continue
 
             # Bước 1: Xác định ranh giới chunk (câu / nhóm câu)
-            chunk_texts = _split_sentences(content) if len(content) > 200 else [content]
+            chunk_texts = (
+                _split_sentences(content) if len(content) > 1500 else [content]
+            )
 
             # Bước 2: Late chunking — tạo full_text để tokenize 1 lần
             # Ghép title + content để ngữ cảnh title lan tỏa vào token embeddings
@@ -988,22 +1096,36 @@ async def main(args):
                 new_item = item.copy()
                 new_item["title"] = title
                 new_item["content"] = f"{title} {chunk}".strip() if title else chunk
+                # Fallback published_at → ngày cào nếu null
+                if not new_item.get("published_at"):
+                    new_item["published_at"] = datetime.now(timezone.utc).isoformat()
                 chunk_id_raw = f"{new_item.get('article_url', '')}_{chunk_idx}"
                 new_item["id"] = hashlib.md5(chunk_id_raw.encode("utf-8")).hexdigest()
-                # Fix (5): chỉ gán embedding nếu dim khớp với kb.embedding_dim
-                if emb and len(emb) == kb.embedding_dim:
+                # Fix (5): chỉ gán embedding nếu dim khớp với expected_dim
+                if emb and len(emb) == expected_dim:
                     new_item["embedding"] = emb
                 elif emb:
                     logging.warning(
-                        f"Embedding dim sai: got {len(emb)}, expected {kb.embedding_dim}. Bỏ qua chunk."
+                        f"Embedding dim sai: got {len(emb)}, expected {expected_dim}. Bỏ qua chunk."
                     )
                 processed_batch.append(new_item)
 
-        kb.insert_many(processed_batch)
+        if args.save_mode == "opensearch":
+            kb.insert_many(processed_batch)
+        elif args.save_mode == "json":
+            all_json_results.extend(processed_batch)
 
         processed_count += len(processed_batch)
         logging.info(
             f"Đã xử lý và tạo mã nhúng (late chunking) xong batch có {len(processed_batch)} đoạn."
+        )
+
+    if args.save_mode == "json":
+        output_file = "crawler_output.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(all_json_results, f, ensure_ascii=False, indent=2)
+        logging.info(
+            f"Đã lưu {len(all_json_results)} đoạn dữ liệu vào tệp {output_file}."
         )
 
     logging.info(
@@ -1027,6 +1149,19 @@ if __name__ == "__main__":
         type=int,
         default=50,
         help="Batch size for processing and embedding generation",
+    )
+    parser.add_argument(
+        "--save-mode",
+        type=str,
+        choices=["opensearch", "json"],
+        default="opensearch",
+        help="Chọn nơi lưu dữ liệu: 'opensearch' hoặc 'json'",
+    )
+    parser.add_argument(
+        "--max-articles",
+        type=int,
+        default=None,
+        help="Giới hạn tối đa số bài viết xử lý (mặc định không giới hạn)",
     )
     args = parser.parse_args()
 
