@@ -1,14 +1,22 @@
 import argparse
 import json
+import os
+import sys
 import time
 
-from crawl_fb import group_post_scraper_v2, post_scraper
-from crawl_fb.group_post_scraper_v2 import fetch_posts as fetch_group_posts
-from crawl_fb.main import (
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.data_process.crawlers.crawl_fb import group_post_scraper_v2, post_scraper
+from src.data_process.crawlers.crawl_fb.group_post_scraper_v2 import (
+    fetch_posts as fetch_group_posts,
+)
+from src.data_process.crawlers.crawl_fb.main import (
     extract_group_id_from_url,
     extract_user_id_from_url,
 )
-from crawl_fb.post_scraper import fetch_posts as fetch_page_posts
+from src.data_process.crawlers.crawl_fb.post_scraper import (
+    fetch_posts as fetch_page_posts,
+)
 from src.models.fusion_inference import verify_claims_true_false
 
 
