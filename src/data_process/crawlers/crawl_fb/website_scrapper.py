@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from crawl_fb.utils.output_handler import Post
+from src.data_process.crawlers.crawl_fb.utils.output_handler import Post
 
 logger = logging.getLogger(__name__)
 

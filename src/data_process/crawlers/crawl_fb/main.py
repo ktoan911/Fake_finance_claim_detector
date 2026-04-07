@@ -11,9 +11,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from crawl_fb.comment_scraper import PROXIES, fetch_comments, fetch_replies
-from crawl_fb.group_post_scraper_v2 import fetch_posts as fetch_group_posts
-from crawl_fb.post_scraper import fetch_posts as fetch_page_posts
+from src.data_process.crawlers.crawl_fb.comment_scraper import (
+    PROXIES,
+    fetch_comments,
+    fetch_replies,
+)
+from src.data_process.crawlers.crawl_fb.group_post_scraper_v2 import (
+    fetch_posts as fetch_group_posts,
+)
+from src.data_process.crawlers.crawl_fb.post_scraper import (
+    fetch_posts as fetch_page_posts,
+)
 
 _EMOJI_PATTERN = re.compile(
     "["

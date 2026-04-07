@@ -77,6 +77,20 @@ URLS_TO_CRAWL = [
     "https://vov.vn/kinh-te/tai-chinh/",
     # --- Cảnh báo ---
     "https://tinnhiemmang.vn/tin-tuc",
+    "https://vnexpress.net/chu-de/lua-dao-4730",
+    "https://nhandan.vn/tu-khoa/Luadao-tag78345.html",
+    "https://tuoitre.vn/lua-dao.html",
+
+
+    #chứng khoản
+    "https://fiingroup.vn/vi/tin-tuc.html",
+    "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/dnhngmcututhumuasmcng",
+    "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/hotngphthnh",
+    "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/hotngkinhdoanhck",
+    "https://www.hsx.vn/vi/tin-tuc",
+    "https://www.hnx.vn/vi-vn/",
+    "https://vsd.vn/vi/tin-tuc",
+    "https://bocongan.gov.vn/chuyen-muc/tin-an-ninh-trat-tu-1753170263"
 ]
 
 

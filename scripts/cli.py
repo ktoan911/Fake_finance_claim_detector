@@ -155,7 +155,19 @@ if __name__ == "__main__":
         help="Số lượng bình luận tối thiểu cần cho mỗi bài",
     )
     args = parser.parse_args()
+    if not args.url:
+        print(
+            "Lỗi: Bạn cần cung cấp URL (trang, nhóm) hoặc file .txt thông qua tham số --url."
+        )
+        sys.exit(1)
+
     posts = crawl_from_file(args.url, args.count, args.min_comments)
+    if not posts:
+        print(
+            "Không có bài viết nào được tìm thấy để kiểm chứng hoặc file không hợp lệ."
+        )
+        sys.exit(1)
+
     texts = [post["message"] for post in posts]
     results = verify_claims_true_false(
         claims=texts,
