@@ -61,7 +61,6 @@ URLS_TO_CRAWL = [
     "https://cafef.vn/tai-chinh-ngan-hang.chn",
     "https://vneconomy.vn/tai-chinh.htm",
     "https://vietnambiz.vn/tai-chinh/ngan-hang.htm",
-    # "https://vietstock.vn/tai-chinh.htm",
     "https://tinnhanhchungkhoan.vn/ngan-hang/",
     "https://tapchikinhtetaichinh.vn/kinh-te",  # Đã cập nhật
     "https://tapchikinhtetaichinh.vn/tai-chinh",  # Đã cập nhật
