@@ -1,3 +1,11 @@
+---
+title: Fake Crypto Claim Detector
+emoji: 🚀
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
 # Fake Crypto Claim Detector
 
 An AI system for detecting fake cryptocurrency claims using RAG + LoRA-finetuned LLM + Confidence-Aware Fusion.

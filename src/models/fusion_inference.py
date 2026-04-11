@@ -14,6 +14,27 @@ from src.config import LABEL_LIST, PROMPT_TEMPLATE
 from src.database.opensearch import OpenSearchKB
 from src.retrieval.retrieval import QueryExpander, RetrievalResult, TemporalScorer
 
+
+def _resolve_fusion_model_path(path_or_repo: str, filename: str = "model.pt") -> str:
+    if os.path.isfile(path_or_repo):
+        return path_or_repo
+    try:
+        from huggingface_hub import hf_hub_download
+
+        print(path_or_repo)
+        print(filename)
+
+        local_path = hf_hub_download(repo_id=path_or_repo, filename=filename)
+        logger.info(
+            f"[fusion_inference] Downloaded {filename} from HF repo '{path_or_repo}' -> {local_path}"
+        )
+        return local_path
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Cannot resolve fusion model path '{path_or_repo}': {exc}"
+        ) from exc
+
+
 try:
     from src.models.fusion import ConfidenceAwareFusion, RetrievalFeatureEncoder
 except ImportError:
@@ -368,6 +389,7 @@ class ClaimPrediction:
     label_id: int
     confidence: float
     evidence: List[str]
+    source_links: List[str]
 
 
 class FusionClaimVerifier:
@@ -651,13 +673,34 @@ class FusionClaimVerifier:
                 )
 
         pred_label = self.label_list[pred_id]
-        # Keep verdict tied to stable label ID convention: 0=Đúng, 1=Sai.
-        verdict = "Đúng" if pred_id == 0 else "Sai"
+        if pred_id == 0:
+            verdict = "Đúng"
+        elif pred_id == 1:
+            verdict = "Sai"
+        else:
+            verdict = "Chưa chắc chắn"
 
         if self.debug:
             logger.info(
                 f"[fusion_inference] done predict | verdict={verdict!r} | label={pred_label!r} | confidence={confidence:.6f} | elapsed_ms={1000.0 * (perf_counter() - t0):.2f}"
             )
+
+        source_links = []
+        for r in retrieval_results[: self.llm_evidence_top_k]:
+            meta = r.metadata or {}
+            # Ưu tiên article_url
+            url = str(
+                meta.get("article_url")
+                or meta.get("url")
+                or meta.get("link")
+                or meta.get("source_url")
+                or ""
+            ).strip()
+            logger.info(
+                f"[fusion_inference:predict] link_debug | url={url} | article_url={meta.get('article_url')} | url={meta.get('url')} | link={meta.get('link')} | source_url={meta.get('source_url')} | all_meta_keys={list(meta.keys())}"
+            )
+            if url and url not in source_links:
+                source_links.append(url)
 
         return ClaimPrediction(
             claim=text,
@@ -666,6 +709,7 @@ class FusionClaimVerifier:
             label_id=pred_id,
             confidence=confidence,
             evidence=llm_evidence,
+            source_links=source_links,
         )
 
     def predict_batch(self, claims: List[str]) -> List[ClaimPrediction]:
@@ -681,6 +725,7 @@ class FusionClaimVerifier:
 
         all_retrieval_features = []
         all_llm_evidences = []
+        all_source_links = []
         valid_indices = []
         valid_claims = []
         results: List[Optional[ClaimPrediction]] = [None] * len(claims)
@@ -693,11 +738,27 @@ class FusionClaimVerifier:
             valid_indices.append(i)
             valid_claims.append(text)
 
-            feat, retrieved_evidence, _ = _build_retrieval_features_train_compatible(
-                self.retriever, text, self.top_k
+            feat, retrieved_evidence, retrieval_results = (
+                _build_retrieval_features_train_compatible(
+                    self.retriever, text, self.top_k
+                )
             )
             all_retrieval_features.append(feat)
             all_llm_evidences.append(retrieved_evidence[: self.llm_evidence_top_k])
+
+            links = []
+            for r in retrieval_results[: self.llm_evidence_top_k]:
+                meta = r.metadata or {}
+                url = str(
+                    meta.get("article_url")
+                    or meta.get("url")
+                    or meta.get("link")
+                    or meta.get("source_url")
+                    or ""
+                ).strip()
+                if url and url not in links:
+                    links.append(url)
+            all_source_links.append(links)
 
         if not valid_claims:
             return []
@@ -725,11 +786,21 @@ class FusionClaimVerifier:
             pred_ids = torch.argmax(probs_batch, dim=-1).cpu().numpy()
             confidences = torch.max(probs_batch, dim=-1)[0].cpu().numpy()
 
-        for v_idx, text, llm_ev, pred_id, conf in zip(
-            valid_indices, valid_claims, all_llm_evidences, pred_ids, confidences
+        for v_idx, text, llm_ev, links, pred_id, conf in zip(
+            valid_indices,
+            valid_claims,
+            all_llm_evidences,
+            all_source_links,
+            pred_ids,
+            confidences,
         ):
             pred_label = self.label_list[pred_id]
-            verdict = "Đúng" if pred_id == 0 else "Sai"
+            if pred_id == 0:
+                verdict = "Đúng"
+            elif pred_id == 1:
+                verdict = "Sai"
+            else:
+                verdict = "Chưa chắc chắn"
             results[v_idx] = ClaimPrediction(
                 claim=text,
                 verdict=verdict,
@@ -737,6 +808,7 @@ class FusionClaimVerifier:
                 label_id=int(pred_id),
                 confidence=float(conf),
                 evidence=llm_ev,
+                source_links=links,
             )
 
         if self.debug:
@@ -752,7 +824,7 @@ _VERIFIER_CACHE: Dict[str, FusionClaimVerifier] = {}
 
 def verify_claim_true_false(
     claim: str,
-    fusion_model_path: str = "models/fusion_model.pt",
+    fusion_model_path: Optional[str] = None,
     opensearch_index: Optional[str] = None,
     llm_model_path: Optional[str] = None,
     retriever_model_path: Optional[str] = None,
@@ -771,9 +843,12 @@ def verify_claim_true_false(
         if debug is None
         else bool(debug)
     )
+
+    logger.info(f"fusion_model_path: {fusion_model_path}")
+
     cache_key = "|".join(
         [
-            fusion_model_path,
+            fusion_model_path or "",
             opensearch_index or "",
             llm_model_path or "",
             retriever_model_path or "",
@@ -783,15 +858,29 @@ def verify_claim_true_false(
         ]
     )
 
+    # Resolve fusion model: env FUSION_MODEL overrides default local path
+    resolved_fusion_path = _resolve_fusion_model_path(
+        os.getenv("FUSION_MODEL", "models/fusion_model.pt")
+    )
+    # Resolve LLM: env LLM_FINETUNE overrides saved config
+    resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
+
+    logger.info(f"resolved_fusion_path: {resolved_fusion_path}")
+    logger.info(f"resolved_llm_path: {resolved_llm_path}")
+    logger.info(f"opensearch_index: {opensearch_index}")
+    logger.info(f"retriever_model_path: {retriever_model_path}")
+    logger.info(f"device: {device}")
+    logger.info(f"use_cache: {use_cache}")
+
     verifier = None
     if use_cache:
         verifier = _VERIFIER_CACHE.get(cache_key)
 
     if verifier is None:
         verifier = FusionClaimVerifier(
-            fusion_model_path=fusion_model_path,
+            fusion_model_path=resolved_fusion_path,
             opensearch_index=opensearch_index,
-            llm_model_path=llm_model_path,
+            llm_model_path=resolved_llm_path,
             retriever_model_path=retriever_model_path,
             device=device,
             llm_evidence_top_k=llm_evidence_top_k,
@@ -806,7 +895,7 @@ def verify_claim_true_false(
 
 def verify_claims_true_false(
     claims: List[str],
-    fusion_model_path: str = "models/fusion_model.pt",
+    fusion_model_path: Optional[str] = None,
     opensearch_index: Optional[str] = None,
     llm_model_path: Optional[str] = None,
     retriever_model_path: Optional[str] = None,
@@ -828,7 +917,7 @@ def verify_claims_true_false(
     )
     cache_key = "|".join(
         [
-            fusion_model_path,
+            fusion_model_path or "",
             opensearch_index or "",
             llm_model_path or "",
             retriever_model_path or "",
@@ -838,15 +927,29 @@ def verify_claims_true_false(
         ]
     )
 
+    # Resolve fusion model: env FUSION_MODEL overrides default local path
+    resolved_fusion_path = _resolve_fusion_model_path(
+        fusion_model_path or os.getenv("FUSION_MODEL", "models/fusion_model.pt")
+    )
+    # Resolve LLM: env LLM_FINETUNE overrides saved config
+    resolved_llm_path = llm_model_path or os.getenv("LLM_FINETUNE")
+
+    logger.info(f"resolved_fusion_path: {resolved_fusion_path}")
+    logger.info(f"resolved_llm_path: {resolved_llm_path}")
+    logger.info(f"opensearch_index: {opensearch_index}")
+    logger.info(f"retriever_model_path: {retriever_model_path}")
+    logger.info(f"device: {device}")
+    logger.info(f"use_cache: {use_cache}")
+
     verifier = None
     if use_cache:
         verifier = _VERIFIER_CACHE.get(cache_key)
 
     if verifier is None:
         verifier = FusionClaimVerifier(
-            fusion_model_path=fusion_model_path,
+            fusion_model_path=resolved_fusion_path,
             opensearch_index=opensearch_index,
-            llm_model_path=llm_model_path,
+            llm_model_path=resolved_llm_path,
             retriever_model_path=retriever_model_path,
             device=device,
             llm_evidence_top_k=llm_evidence_top_k,

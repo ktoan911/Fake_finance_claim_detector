@@ -24,15 +24,6 @@ except ImportError:
     HF_HUB_AVAILABLE = False
     snapshot_download = None  # type: ignore
 
-try:
-    from peft import PeftConfig, PeftModel
-
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
-    PeftConfig = None  # type: ignore
-    PeftModel = None  # type: ignore
-
 
 # Labels are direct output tokens from config (e.g., Đúng/Sai).
 
@@ -109,7 +100,6 @@ class LLMScorer:
                 kwargs["device_map"] = "auto"
             else:
                 # Be explicit to avoid accidental accelerate dispatch metadata on CPU.
-                # PEFT sometimes crashes with CPU offloading index mismatches if device_map is set.
                 kwargs["device_map"] = None
             try:
                 return AutoModelForCausalLM.from_pretrained(
@@ -123,84 +113,10 @@ class LLMScorer:
                     model_path, torch_dtype=dtype, local_files_only=True, **kwargs
                 )
 
-        def _strip_accelerate_offload_state(model) -> None:
-            """
-            Remove accelerate offload metadata/hooks so PEFT does not try to
-            rewrite offload indices in CPU-only inference.
-            """
-            try:
-                from accelerate.hooks import remove_hook_from_submodules
-
-                remove_hook_from_submodules(model)
-            except Exception:
-                pass
-
-            if hasattr(model, "hf_device_map"):
-                try:
-                    delattr(model, "hf_device_map")
-                except Exception:
-                    # Fallback when attribute deletion is blocked.
-                    model.hf_device_map = {}
-
-        # Check if model_name is a LoRA adapter
-        import os
-
-        is_lora = os.path.exists(os.path.join(model_name, "adapter_config.json"))
-
-        if is_lora:
-            if not PEFT_AVAILABLE:
-                raise ImportError(
-                    "peft is required to load LoRA adapters. Install with: pip install peft"
-                )
-            logger.info(
-                f"Detected LoRA adapter at {model_name}. Loading base model + adapter..."
-            )
-            config = PeftConfig.from_pretrained(model_name)
-            base_model_path = config.base_model_name_or_path
-            resolved_base_model_path = _resolve_model_source(base_model_path)
-
-            self.tokenizer = _load_tokenizer(resolved_base_model_path)
-
-            # Load base model
-            self.model = _load_causal_lm(resolved_base_model_path)
-            if not use_cuda:
-                _strip_accelerate_offload_state(self.model)
-
-            # Load adapter
-            try:
-                self.model = PeftModel.from_pretrained(
-                    self.model,
-                    model_name,
-                    torch_device="cpu" if not use_cuda else None,
-                    low_cpu_mem_usage=False,
-                    ephemeral_gpu_offload=False,
-                )
-            except KeyError as exc:
-                # Work around PEFT offload-index key mismatches observed with
-                # some Qwen checkpoints when loaded in CPU-only mode.
-                if not use_cuda and "base_model.model.model.model." in str(exc):
-                    logger.warning(
-                        f"LoRA load hit offload key mismatch ({exc}); retrying after clearing offload metadata."
-                    )
-                    _strip_accelerate_offload_state(self.model)
-                    self.model = PeftModel.from_pretrained(
-                        self.model,
-                        model_name,
-                        torch_device="cpu",
-                        low_cpu_mem_usage=False,
-                        ephemeral_gpu_offload=False,
-                    )
-                else:
-                    raise
-            if not use_cuda:
-                # Strip any accelerate offload hooks that PeftModel may have attached.
-                # These prevent proper CPU inference and cause .to('cpu') to re-allocate tensors.
-                _strip_accelerate_offload_state(self.model)
-        else:
-            logger.info(f"Loading standard model: {model_name}")
-            resolved_model = _resolve_model_source(model_name)
-            self.tokenizer = _load_tokenizer(resolved_model)
-            self.model = _load_causal_lm(resolved_model)
+        logger.info(f"Loading standard model: {model_name}")
+        resolved_model = _resolve_model_source(model_name)
+        self.tokenizer = _load_tokenizer(resolved_model)
+        self.model = _load_causal_lm(resolved_model)
 
         if not use_cuda:
             # Strategy: keep model in mmap'd bf16 (almost no RAM), add forward hooks that

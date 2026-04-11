@@ -6,30 +6,48 @@ chrome.runtime.onInstalled.addListener(() => {
     });
 });
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-    if (info.menuItemId === "checkClaim") {
-        const text = info.selectionText;
-        if (text) {
-            // First, send a message to content script to show a "Loading..." notification
-            chrome.tabs.sendMessage(tab.id, { action: "showLoading" });
+async function ensureContentScript(tabId) {
+    return new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, { action: "ping" }, (response) => {
+            if (chrome.runtime.lastError || !response) {
+                chrome.scripting.executeScript(
+                    { target: { tabId }, files: ["content.js"] },
+                    () => resolve()
+                );
+            } else {
+                resolve();
+            }
+        });
+    });
+}
 
-            // Call the local API
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+    if (info.menuItemId !== "checkClaim") return;
+    const text = info.selectionText;
+    if (!text) return;
+
+    await ensureContentScript(tab.id);
+
+    // Chạy fetch trực tiếp trong tab (page context) thay vì service worker
+    // → tránh bị Chrome terminate SW sau ~30s khi inference đang chạy
+    chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (claim) => {
+            window.__claimShowLoading && window.__claimShowLoading();
+
             fetch("http://localhost:8000/verify", {
                 method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ claim: text })
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ claim })
             })
-                .then(response => response.json())
+                .then(r => r.json())
                 .then(data => {
-                    // Send result to content script
-                    chrome.tabs.sendMessage(tab.id, { action: "showResult", verdict: data.verdict });
+                    window.__claimShowResult && window.__claimShowResult(data);
                 })
-                .catch(error => {
-                    console.error("Error:", error);
-                    chrome.tabs.sendMessage(tab.id, { action: "showResult", verdict: "Lỗi kết nối tới server" });
+                .catch(() => {
+                    window.__claimShowResult && window.__claimShowResult("Lỗi kết nối tới server");
                 });
-        }
-    }
+        },
+        args: [text]
+    });
 });

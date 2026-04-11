@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+from openai import OpenAI
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
@@ -26,17 +27,23 @@ except ImportError as exc:
         "sentence-transformers is required. Install dependencies from requirements.txt."
     ) from exc
 
+client = OpenAI(
+    api_key="D",
+    base_url="https://api-chua.onrender.com/v1",
+)
+
 
 def generate_cluster_content_with_llm(
     cluster_claims: List[str], representative_claim: str
 ) -> str:
-    """
-    TODO: You will implement this function with your own LLM.
-    Input is the list of claims in one cluster + one representative claim.
-    Output should be a short description/title for this cluster.
-    """
-    _ = (cluster_claims, representative_claim)
-    return "TODO: implement LLM cluster content generation."
+
+    cluster_all = ""
+
+    _resp = client.chat.completions.create(
+        model="gemini-3.0-pro",
+        messages=[{"role": "user", "content": cluster_claims}],
+    )
+    return _resp.choices[0].message.content
 
 
 def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
@@ -191,8 +198,7 @@ def load_claims_from_file(path: str) -> List[str]:
 
     if file_path.suffix.lower() == ".txt":
         return [
-            line.strip()
-            for line in file_path.read_text(encoding="utf-8").splitlines()
+            line.strip() for line in file_path.read_text(encoding="utf-8").splitlines()
         ]
 
     if file_path.suffix.lower() == ".json":
