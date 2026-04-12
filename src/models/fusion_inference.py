@@ -509,7 +509,7 @@ class FusionClaimVerifier:
                 "Missing OpenSearch index name. Set OPENSEARCH_INDEX_NAME/OP_KB_NAME or pass opensearch_index."
             )
 
-        kb = OpenSearchKB(index_name=index_name, embedding_dim=768)
+        kb = OpenSearchKB(index_name=index_name)
         self.retriever = OpenSearchHybridRetriever(
             kb=kb,
             embedding_model=retriever_model,

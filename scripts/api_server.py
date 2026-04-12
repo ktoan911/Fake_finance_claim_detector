@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
             or os.getenv("OP_KB_NAME", "news_kb"),
             llm_model_path=os.getenv("LLM_FINETUNE"),
             retriever_model_path=os.getenv(
-                "RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding"
+                "RETRIEVER_MODEL", "Qwen/Qwen3-Embedding-4B"
             ),
             device=os.getenv("DEVICE", "cpu"),
             llm_evidence_top_k=int(os.getenv("FUSION_LLM_EVIDENCE_TOP_K", "3")),

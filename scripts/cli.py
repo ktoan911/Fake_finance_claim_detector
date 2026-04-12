@@ -173,7 +173,7 @@ if __name__ == "__main__":
         claims=texts,
         fusion_model_path="models/fusion_model.pt",
         llm_model_path="models/lora_llm",
-        retriever_model_path="AITeamVN/Vietnamese_Embedding",
+        retriever_model_path="Qwen/Qwen3-Embedding-4B",
         opensearch_index="news_kb",
         llm_evidence_top_k=5,
         debug=True,

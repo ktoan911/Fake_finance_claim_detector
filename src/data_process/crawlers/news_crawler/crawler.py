@@ -79,9 +79,7 @@ URLS_TO_CRAWL = [
     "https://vnexpress.net/chu-de/lua-dao-4730",
     "https://nhandan.vn/tu-khoa/Luadao-tag78345.html",
     "https://tuoitre.vn/lua-dao.html",
-
-
-    #chứng khoản
+    # chứng khoản
     "https://fiingroup.vn/vi/tin-tuc.html",
     "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/dnhngmcututhumuasmcng",
     "https://ssc.gov.vn/webcenter/portal/ubck/pages_r/m/tintc-skin/hotngphthnh",
@@ -89,7 +87,7 @@ URLS_TO_CRAWL = [
     "https://www.hsx.vn/vi/tin-tuc",
     "https://www.hnx.vn/vi-vn/",
     "https://vsd.vn/vi/tin-tuc",
-    "https://bocongan.gov.vn/chuyen-muc/tin-an-ninh-trat-tu-1753170263"
+    "https://bocongan.gov.vn/chuyen-muc/tin-an-ninh-trat-tu-1753170263",
 ]
 
 
@@ -985,7 +983,7 @@ async def main(args):
         model,
         full_text: str,
         chunk_texts: list[str],
-        max_length: int = 2048,
+        max_length: int = 32000,
     ) -> list[list[float]]:
         probe = tokenizer(
             full_text,
@@ -1062,7 +1060,7 @@ async def main(args):
     tokenizer = None
     model = None
     try:
-        model_name = os.getenv("RETRIEVER_MODEL", "AITeamVN/Vietnamese_Embedding")
+        model_name = os.getenv("RETRIEVER_MODEL", "Qwen/Qwen3-Embedding-4B")
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModel.from_pretrained(model_name)
         model.eval()

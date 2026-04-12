@@ -412,7 +412,7 @@ class KnowledgeAugmentedRetriever:
 
     def __init__(
         self,
-        embedding_model: str = "AITeamVN/Vietnamese_Embedding",
+        embedding_model: str = "Qwen/Qwen3-Embedding-4B",
         alpha: float = 0.7,
         lambda_decay: float = 0.1,
         gamma: float = 0.5,
